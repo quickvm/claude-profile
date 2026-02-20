@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-profile"
+version = "0.1.0"
+description = "Launch Claude Code with isolated config directories per profile"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{name = "QuickVM, LLC", email = "team@quickvm.com"}]
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.24.0",
+    "rich>=14.1.0",
+    "pydantic-settings>=2.11.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.2",
+    "ruff==0.15.1",
+    "ty==0.0.17",
+]
+
+[project.scripts]
+claude-profile = "claude_profile:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_profile"]
