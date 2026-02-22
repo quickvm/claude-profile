@@ -29,7 +29,36 @@ uv tool install .
 claude-profile add <name>        # create a new profile
 claude-profile list              # list all profiles and auth status
 claude-profile remove <name>     # delete a profile
+claude-profile links <name>      # inspect or change directory symlinks
 claude-profile <name> [args...]  # launch claude with the given profile
+```
+
+### Creating a profile
+
+`add` copies `settings.json`, `statusline.sh`, and `CLAUDE.md` from `~/.claude` into the new
+profile directory, then prompts whether to symlink `commands/` and `skills/` to your global
+`~/.claude` directories (default: yes). Decline to keep those directories isolated per profile.
+
+```sh
+claude-profile add work
+# Link 'commands' to ~/.claude/commands? [Y/n]:
+# Link 'skills' to ~/.claude/skills? [Y/n]:
+```
+
+### Managing directory links
+
+Use `links` to inspect or change how `commands/` and `skills/` are connected after a profile
+is created:
+
+```sh
+claude-profile links work                   # show link status for all dirs
+claude-profile links work commands          # show link status for commands/ only
+
+claude-profile links work --link            # symlink all dirs to ~/.claude
+claude-profile links work commands --link   # symlink just commands/
+
+claude-profile links work --unlink          # isolate all dirs
+claude-profile links work skills --unlink   # isolate just skills/
 ```
 
 ## Examples

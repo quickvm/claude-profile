@@ -41,6 +41,17 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   process remains — this is intentional for correct TUI behavior.
 - **Settings:** `pydantic-settings` reads `CLAUDE_PROFILE_*` env vars. No config
   file on disk.
+- **Linkable dirs:** `LINKABLE_DIRS = ("commands", "skills")` centralises which
+  directories can be symlinked to `~/.claude`. The `add` command prompts once per
+  dir at creation time. The `links` subcommand manages them afterwards.
+  `_launch_profile()` never creates symlinks implicitly.
+- **`_setup_dir_link(profile_dir, dir_name, link)`:** helper used by `add` — either
+  creates a symlink to the global dir (warns and skips if global dir is absent) or
+  creates an empty isolated directory.
+- **`links` subcommand:** accepts an optional positional `DIR` argument (one of
+  `LINKABLE_DIRS`) and `--link` / `--unlink` bool flags. When `DIR` is omitted the
+  operation applies to all linkable dirs. Shows a status table when neither flag is
+  given.
 
 ## Conventions
 

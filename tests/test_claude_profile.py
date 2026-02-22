@@ -84,7 +84,8 @@ def test_list_multiple_profiles(profiles_base: Path) -> None:
 
 
 def test_add_creates_directory(profiles_base: Path, fake_home: Path) -> None:
-    result = runner.invoke(app, ["add", "work"])
+    # Answer Y to both prompts
+    result = runner.invoke(app, ["add", "work"], input="y\ny\n")
     assert result.exit_code == 0
     assert (profiles_base / "work").is_dir()
 
@@ -96,7 +97,8 @@ def test_add_copies_files_from_claude_dir(profiles_base: Path, fake_home: Path) 
     (claude_dir / "statusline.sh").write_text("#!/bin/sh\necho ok")
     (claude_dir / "CLAUDE.md").write_text("# instructions")
 
-    runner.invoke(app, ["add", "work"])
+    # Answer n to both link prompts (no global dirs exist)
+    runner.invoke(app, ["add", "work"], input="n\nn\n")
 
     profile = profiles_base / "work"
     assert (profile / "settings.json").read_text() == '{"theme": "dark"}'
@@ -106,7 +108,7 @@ def test_add_copies_files_from_claude_dir(profiles_base: Path, fake_home: Path) 
 
 def test_add_skips_missing_source_files(profiles_base: Path, fake_home: Path) -> None:
     (fake_home / ".claude").mkdir()
-    result = runner.invoke(app, ["add", "work"])
+    result = runner.invoke(app, ["add", "work"], input="n\nn\n")
     assert result.exit_code == 0
     profile = profiles_base / "work"
     assert not (profile / "settings.json").exists()
@@ -118,6 +120,59 @@ def test_add_fails_if_profile_exists(profiles_base: Path, fake_home: Path) -> No
     (profiles_base / "work").mkdir(parents=True)
     result = runner.invoke(app, ["add", "work"])
     assert result.exit_code == 1
+
+
+def test_add_default_yes_creates_symlinks(profiles_base: Path, fake_home: Path) -> None:
+    claude_dir = fake_home / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "commands").mkdir()
+    (claude_dir / "skills").mkdir()
+
+    result = runner.invoke(app, ["add", "work"], input="\n\n")
+    assert result.exit_code == 0
+    profile = profiles_base / "work"
+    assert (profile / "commands").is_symlink()
+    assert (profile / "skills").is_symlink()
+
+
+def test_add_decline_both_creates_isolated_dirs(
+    profiles_base: Path, fake_home: Path
+) -> None:
+    (fake_home / ".claude").mkdir()
+    result = runner.invoke(app, ["add", "work"], input="n\nn\n")
+    assert result.exit_code == 0
+    profile = profiles_base / "work"
+    assert (profile / "commands").is_dir()
+    assert not (profile / "commands").is_symlink()
+    assert (profile / "skills").is_dir()
+    assert not (profile / "skills").is_symlink()
+
+
+def test_add_mixed_link_and_isolate(profiles_base: Path, fake_home: Path) -> None:
+    claude_dir = fake_home / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "commands").mkdir()
+
+    # Link commands (Y), isolate skills (n)
+    result = runner.invoke(app, ["add", "work"], input="y\nn\n")
+    assert result.exit_code == 0
+    profile = profiles_base / "work"
+    assert (profile / "commands").is_symlink()
+    assert (profile / "skills").is_dir()
+    assert not (profile / "skills").is_symlink()
+
+
+def test_add_global_dir_absent_skips_symlink(
+    profiles_base: Path, fake_home: Path
+) -> None:
+    (fake_home / ".claude").mkdir()
+    # Request link but global dir doesn't exist — should warn and not crash
+    result = runner.invoke(app, ["add", "work"], input="y\ny\n")
+    assert result.exit_code == 0
+    profile = profiles_base / "work"
+    # Symlinks not created (global dirs absent)
+    assert not (profile / "commands").is_symlink()
+    assert not (profile / "skills").is_symlink()
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +199,231 @@ def test_remove_nonexistent_profile(profiles_base: Path) -> None:
     profiles_base.mkdir(parents=True)
     result = runner.invoke(app, ["remove", "ghost"])
     assert result.exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# links — status table
+# ---------------------------------------------------------------------------
+
+
+def test_links_status_symlinked(profiles_base: Path, fake_home: Path) -> None:
+    claude_dir = fake_home / ".claude"
+    claude_dir.mkdir()
+    global_cmd = claude_dir / "commands"
+    global_cmd.mkdir()
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / "commands").symlink_to(global_cmd)
+
+    result = runner.invoke(app, ["links", "work"])
+    assert result.exit_code == 0
+    assert "linked" in result.output
+
+
+def test_links_status_isolated(profiles_base: Path, fake_home: Path) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / "commands").mkdir()
+
+    result = runner.invoke(app, ["links", "work"])
+    assert result.exit_code == 0
+    assert "isolated" in result.output
+
+
+def test_links_status_not_configured(profiles_base: Path, fake_home: Path) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+
+    result = runner.invoke(app, ["links", "work"])
+    assert result.exit_code == 0
+    assert "not configured" in result.output
+
+
+def test_links_nonexistent_profile(profiles_base: Path) -> None:
+    profiles_base.mkdir(parents=True)
+    result = runner.invoke(app, ["links", "ghost"])
+    assert result.exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# links --link
+# ---------------------------------------------------------------------------
+
+
+def test_links_link_all(profiles_base: Path, fake_home: Path) -> None:
+    claude_dir = fake_home / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "commands").mkdir()
+    (claude_dir / "skills").mkdir()
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+
+    result = runner.invoke(app, ["links", "work", "--link"])
+    assert result.exit_code == 0
+    assert (profile / "commands").is_symlink()
+    assert (profile / "skills").is_symlink()
+
+
+def test_links_link_single_dir(profiles_base: Path, fake_home: Path) -> None:
+    claude_dir = fake_home / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "commands").mkdir()
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+
+    result = runner.invoke(app, ["links", "work", "commands", "--link"])
+    assert result.exit_code == 0
+    assert (profile / "commands").is_symlink()
+    assert not (profile / "skills").exists()
+
+
+def test_links_link_already_symlinked(profiles_base: Path, fake_home: Path) -> None:
+    claude_dir = fake_home / ".claude"
+    claude_dir.mkdir()
+    global_cmd = claude_dir / "commands"
+    global_cmd.mkdir()
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / "commands").symlink_to(global_cmd)
+
+    result = runner.invoke(app, ["links", "work", "commands", "--link"])
+    assert result.exit_code == 0
+    assert "already linked" in result.output
+
+
+def test_links_link_on_regular_dir_exits_1(
+    profiles_base: Path, fake_home: Path
+) -> None:
+    claude_dir = fake_home / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "commands").mkdir()
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / "commands").mkdir()
+
+    result = runner.invoke(app, ["links", "work", "commands", "--link"])
+    assert result.exit_code == 1
+    assert "isolated" in result.output or "manually" in result.output
+
+
+def test_links_link_global_absent_exits_1(profiles_base: Path, fake_home: Path) -> None:
+    (fake_home / ".claude").mkdir()
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+
+    result = runner.invoke(app, ["links", "work", "commands", "--link"])
+    assert result.exit_code == 1
+
+
+def test_links_link_invalid_dir(profiles_base: Path) -> None:
+    profiles_base.mkdir(parents=True)
+    (profiles_base / "work").mkdir()
+
+    result = runner.invoke(app, ["links", "work", "bogus", "--link"])
+    assert result.exit_code == 1
+    assert "bogus" in result.output
+
+
+# ---------------------------------------------------------------------------
+# links --unlink
+# ---------------------------------------------------------------------------
+
+
+def test_links_unlink_all(profiles_base: Path, fake_home: Path) -> None:
+    claude_dir = fake_home / ".claude"
+    claude_dir.mkdir()
+    global_cmd = claude_dir / "commands"
+    global_cmd.mkdir()
+    global_skills = claude_dir / "skills"
+    global_skills.mkdir()
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / "commands").symlink_to(global_cmd)
+    (profile / "skills").symlink_to(global_skills)
+
+    result = runner.invoke(app, ["links", "work", "--unlink"])
+    assert result.exit_code == 0
+    assert (profile / "commands").is_dir()
+    assert not (profile / "commands").is_symlink()
+    assert (profile / "skills").is_dir()
+    assert not (profile / "skills").is_symlink()
+
+
+def test_links_unlink_single_dir(profiles_base: Path, fake_home: Path) -> None:
+    claude_dir = fake_home / ".claude"
+    claude_dir.mkdir()
+    global_skills = claude_dir / "skills"
+    global_skills.mkdir()
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / "skills").symlink_to(global_skills)
+
+    result = runner.invoke(app, ["links", "work", "skills", "--unlink"])
+    assert result.exit_code == 0
+    assert (profile / "skills").is_dir()
+    assert not (profile / "skills").is_symlink()
+
+
+def test_links_unlink_removes_symlink_creates_dir(
+    profiles_base: Path, fake_home: Path
+) -> None:
+    claude_dir = fake_home / ".claude"
+    claude_dir.mkdir()
+    global_cmd = claude_dir / "commands"
+    global_cmd.mkdir()
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / "commands").symlink_to(global_cmd)
+
+    result = runner.invoke(app, ["links", "work", "commands", "--unlink"])
+    assert result.exit_code == 0
+    assert (profile / "commands").is_dir()
+    assert not (profile / "commands").is_symlink()
+
+
+def test_links_unlink_on_regular_dir_noop(profiles_base: Path, fake_home: Path) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / "commands").mkdir()
+
+    result = runner.invoke(app, ["links", "work", "commands", "--unlink"])
+    assert result.exit_code == 0
+    assert "already isolated" in result.output
+    assert (profile / "commands").is_dir()
+
+
+def test_links_unlink_not_configured_creates_dir(
+    profiles_base: Path, fake_home: Path
+) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+
+    result = runner.invoke(app, ["links", "work", "commands", "--unlink"])
+    assert result.exit_code == 0
+    assert (profile / "commands").is_dir()
+
+
+def test_links_unlink_invalid_dir(profiles_base: Path) -> None:
+    profiles_base.mkdir(parents=True)
+    (profiles_base / "work").mkdir()
+
+    result = runner.invoke(app, ["links", "work", "bogus", "--unlink"])
+    assert result.exit_code == 1
+    assert "bogus" in result.output
+
+
+# ---------------------------------------------------------------------------
+# links --link and --unlink together
+# ---------------------------------------------------------------------------
+
+
+def test_links_link_and_unlink_together_exits_1(profiles_base: Path) -> None:
+    profiles_base.mkdir(parents=True)
+    (profiles_base / "work").mkdir()
+
+    result = runner.invoke(app, ["links", "work", "--link", "--unlink"])
+    assert result.exit_code == 1
+    assert "mutually exclusive" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +492,13 @@ def test_main_treats_flags_as_app_args(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_main_no_args_goes_to_app(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "argv", ["claude-profile"])
+    with patch("claude_profile.app") as mock_app:
+        main()
+    mock_app.assert_called_once()
+
+
+def test_main_dispatches_links_to_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["claude-profile", "links", "work"])
     with patch("claude_profile.app") as mock_app:
         main()
     mock_app.assert_called_once()
