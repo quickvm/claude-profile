@@ -3,7 +3,7 @@
 # Extend this file for project-specific tooling, then rebuild.
 FROM fedora:44
 
-RUN dnf install -y git ripgrep fd-find less ca-certificates openssh-clients socat && dnf clean all
+RUN dnf install -y git ripgrep fd-find jq less ca-certificates openssh-clients socat && dnf clean all
 
 RUN useradd -m -u 1000 -U appuser
 
