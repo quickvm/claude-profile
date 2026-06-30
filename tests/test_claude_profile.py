@@ -2,16 +2,28 @@
 
 from __future__ import annotations
 
+import base64
+import subprocess
 import sys
 from pathlib import Path
 from typing import Generator
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from typer.testing import CliRunner
 
 import claude_profile
-from claude_profile import _launch_profile, app, main
+from claude_profile import (
+    SANDBOX_MARKER,
+    SKIP_PERMISSIONS_FLAG,
+    _build_sandbox_argv,
+    _git_common_dir,
+    _launch_profile,
+    _parse_env_file,
+    _sandbox_mounts,
+    app,
+    main,
+)
 
 runner = CliRunner()
 
@@ -29,6 +41,14 @@ def fake_home(tmp_path: Path) -> Generator[Path, None, None]:
     home.mkdir()
     with patch("pathlib.Path.home", return_value=home):
         yield home
+
+
+@pytest.fixture(autouse=True)
+def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the sandbox env overrides off unless a test sets them."""
+    monkeypatch.setattr(claude_profile.settings, "sandbox", None)
+    monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", False)
+    monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", False)
 
 
 # ---------------------------------------------------------------------------
@@ -502,3 +522,935 @@ def test_main_dispatches_links_to_app(monkeypatch: pytest.MonkeyPatch) -> None:
     with patch("claude_profile.app") as mock_app:
         main()
     mock_app.assert_called_once()
+
+
+def test_main_dispatches_env_to_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["claude-profile", "env", "work"])
+    with patch("claude_profile.app") as mock_app:
+        main()
+    mock_app.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _parse_env_file
+# ---------------------------------------------------------------------------
+
+
+def test_parse_env_file_basic(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("FOO=bar\nBAZ=qux\n")
+    result = _parse_env_file(env_file)
+    assert result == {"FOO": "bar", "BAZ": "qux"}
+
+
+def test_parse_env_file_skips_comments_and_blanks(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("# comment\n\nFOO=bar\n  \n# another\nBAZ=qux\n")
+    result = _parse_env_file(env_file)
+    assert result == {"FOO": "bar", "BAZ": "qux"}
+
+
+def test_parse_env_file_strips_quotes(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("SINGLE='hello'\nDOUBLE=\"world\"\n")
+    result = _parse_env_file(env_file)
+    assert result == {"SINGLE": "hello", "DOUBLE": "world"}
+
+
+def test_parse_env_file_value_with_equals(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("TOKEN=abc=def=ghi\n")
+    result = _parse_env_file(env_file)
+    assert result == {"TOKEN": "abc=def=ghi"}
+
+
+def test_parse_env_file_skips_lines_without_equals(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GOOD=value\nBADLINE\n")
+    result = _parse_env_file(env_file)
+    assert result == {"GOOD": "value"}
+
+
+# ---------------------------------------------------------------------------
+# env subcommand
+# ---------------------------------------------------------------------------
+
+
+def test_env_list_empty(profiles_base: Path) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    result = runner.invoke(app, ["env", "work"])
+    assert result.exit_code == 0
+    assert "No environment variables" in result.output
+
+
+def test_env_set_and_list(profiles_base: Path) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    result = runner.invoke(app, ["env", "work", "--set", "TOKEN=abc123"])
+    assert result.exit_code == 0
+    assert "Updated" in result.output
+
+    result = runner.invoke(app, ["env", "work"])
+    assert result.exit_code == 0
+    assert "TOKEN" in result.output
+    assert "abc123" in result.output
+
+
+def test_env_set_multiple(profiles_base: Path) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    result = runner.invoke(app, ["env", "work", "--set", "A=1", "--set", "B=2"])
+    assert result.exit_code == 0
+    env_file = profiles_base / "work" / ".env"
+    parsed = _parse_env_file(env_file)
+    assert parsed == {"A": "1", "B": "2"}
+
+
+def test_env_unset(profiles_base: Path) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text("A=1\nB=2\n")
+
+    result = runner.invoke(app, ["env", "work", "--unset", "A"])
+    assert result.exit_code == 0
+    parsed = _parse_env_file(profile / ".env")
+    assert parsed == {"B": "2"}
+
+
+def test_env_unset_nonexistent_warns(profiles_base: Path) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    result = runner.invoke(app, ["env", "work", "--unset", "NOPE"])
+    assert result.exit_code == 0
+    assert "not set" in result.output
+
+
+def test_env_set_invalid_format(profiles_base: Path) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    result = runner.invoke(app, ["env", "work", "--set", "BADFORMAT"])
+    assert result.exit_code == 1
+    assert "KEY=VALUE" in result.output
+
+
+def test_env_nonexistent_profile(profiles_base: Path) -> None:
+    profiles_base.mkdir(parents=True)
+    result = runner.invoke(app, ["env", "ghost"])
+    assert result.exit_code == 1
+
+
+def test_env_set_overwrites_existing(profiles_base: Path) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text("TOKEN=old\n")
+
+    result = runner.invoke(app, ["env", "work", "--set", "TOKEN=new"])
+    assert result.exit_code == 0
+    parsed = _parse_env_file(profile / ".env")
+    assert parsed == {"TOKEN": "new"}
+
+
+def test_env_value_with_equals_sign(profiles_base: Path) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    result = runner.invoke(app, ["env", "work", "--set", "TOKEN=abc=def=ghi"])
+    assert result.exit_code == 0
+    parsed = _parse_env_file(profiles_base / "work" / ".env")
+    assert parsed == {"TOKEN": "abc=def=ghi"}
+
+
+# ---------------------------------------------------------------------------
+# _launch_profile with .env
+# ---------------------------------------------------------------------------
+
+
+def test_launch_loads_env_file(profiles_base: Path) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text("BUILDKITE_API_TOKEN=secret123\n")
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    env = mock_exec.call_args[0][2]
+    assert env["BUILDKITE_API_TOKEN"] == "secret123"
+    assert env["CLAUDE_CONFIG_DIR"] == str(profile)
+
+
+def test_launch_without_env_file(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Clear any ambient value so the assertion reflects only .env loading.
+    monkeypatch.delenv("BUILDKITE_API_TOKEN", raising=False)
+    (profiles_base / "work").mkdir(parents=True)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    env = mock_exec.call_args[0][2]
+    assert "BUILDKITE_API_TOKEN" not in env
+
+
+# ---------------------------------------------------------------------------
+# build command
+# ---------------------------------------------------------------------------
+
+
+def test_build_invokes_podman(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(
+        cmd: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = runner.invoke(app, ["build"])
+    assert result.exit_code == 0
+    cmd = captured["cmd"]
+    assert cmd[0] == claude_profile.settings.podman_bin
+    assert "build" in cmd
+    assert claude_profile.settings.sandbox_image in cmd
+    assert any(c.endswith("sandbox/Containerfile") for c in cmd)
+
+
+def test_build_reports_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(cmd: list[str], **kwargs: object) -> None:
+        raise subprocess.CalledProcessError(2, cmd)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = runner.invoke(app, ["build"])
+    assert result.exit_code == 1
+    assert "failed" in result.output.lower()
+
+
+def test_build_podman_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(cmd: list[str], **kwargs: object) -> None:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = runner.invoke(app, ["build"])
+    assert result.exit_code == 1
+    assert "not found" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# _sandbox_image_exists
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_image_exists_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0)
+    )
+    assert claude_profile._sandbox_image_exists() is True
+
+
+def test_sandbox_image_exists_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 1)
+    )
+    assert claude_profile._sandbox_image_exists() is False
+
+
+def test_sandbox_image_exists_no_podman(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert claude_profile._sandbox_image_exists() is False
+
+
+# ---------------------------------------------------------------------------
+# _git_common_dir
+# ---------------------------------------------------------------------------
+
+
+def test_git_common_dir_relative(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout=".git\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _git_common_dir(tmp_path) == (tmp_path / ".git").resolve()
+
+
+def test_git_common_dir_not_a_repo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 128, stdout="", stderr="fatal")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _git_common_dir(tmp_path) is None
+
+
+def test_git_common_dir_no_git_binary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert _git_common_dir(tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# _sandbox_mounts
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_mounts_no_git(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cwd = tmp_path / "plain"
+    cwd.mkdir()
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    mounts = _sandbox_mounts(tmp_path / "prof", cwd)
+    assert mounts.count("-v") == 2
+    assert f"{cwd}:{cwd}:z" in mounts
+
+
+def test_sandbox_mounts_includes_external_git_dir(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cwd = tmp_path / "wt" / "feature"
+    cwd.mkdir(parents=True)
+    git_dir = tmp_path / "main" / ".git"
+    git_dir.mkdir(parents=True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: git_dir)
+    mounts = _sandbox_mounts(tmp_path / "prof", cwd)
+    assert mounts.count("-v") == 3
+    assert f"{git_dir}:{git_dir}:z" in mounts
+
+
+def test_sandbox_mounts_skips_git_dir_inside_cwd(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: cwd / ".git")
+    mounts = _sandbox_mounts(tmp_path / "prof", cwd)
+    assert mounts.count("-v") == 2
+
+
+# ---------------------------------------------------------------------------
+# _build_sandbox_argv
+# ---------------------------------------------------------------------------
+
+
+def _make_argv(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    claude_args: list[str],
+    extra_env: dict[str, str] | None = None,
+) -> list[str]:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir(exist_ok=True)
+    cwd = tmp_path / "work"
+    cwd.mkdir(exist_ok=True)
+    return _build_sandbox_argv(profile, cwd, claude_args, extra_env or {})
+
+
+def test_argv_has_krun_runtime_and_image(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    argv = _make_argv(monkeypatch, tmp_path, [])
+    assert argv[0] == claude_profile.settings.podman_bin
+    assert "run" in argv
+    assert "run.oci.handler=krun" in argv
+    assert claude_profile.settings.sandbox_image in argv
+    assert "claude" in argv
+
+
+def test_argv_sizing_from_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_ram_mib", 8192)
+    monkeypatch.setattr(claude_profile.settings, "sandbox_cpus", 6)
+    argv = _make_argv(monkeypatch, tmp_path, [])
+    assert "krun.ram_mib=8192" in argv
+    assert "krun.cpus=6" in argv
+
+
+def test_argv_auto_adds_skip_permissions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    argv = _make_argv(monkeypatch, tmp_path, ["--resume"])
+    assert argv.count(SKIP_PERMISSIONS_FLAG) == 1
+    assert "--resume" in argv
+
+
+def test_argv_does_not_duplicate_skip_permissions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    argv = _make_argv(monkeypatch, tmp_path, [SKIP_PERMISSIONS_FLAG])
+    assert argv.count(SKIP_PERMISSIONS_FLAG) == 1
+
+
+def test_argv_skip_permissions_opt_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_skip_permissions", False)
+    argv = _make_argv(monkeypatch, tmp_path, [])
+    assert SKIP_PERMISSIONS_FLAG not in argv
+
+
+def test_argv_passes_env_vars(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    argv = _make_argv(monkeypatch, tmp_path, [], {"ANTHROPIC_API_KEY": "sk-test"})
+    assert "ANTHROPIC_API_KEY=sk-test" in argv
+
+
+def test_argv_mounts_cwd_at_real_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    argv = _build_sandbox_argv(profile, cwd, [], {})
+    assert f"{cwd}:{cwd}:z" in argv
+    assert f"{profile}:{claude_profile.SANDBOX_CONFIG_DIR}:z" in argv
+    assert "-w" in argv
+    assert str(cwd) in argv
+
+
+# ---------------------------------------------------------------------------
+# add --sandbox
+# ---------------------------------------------------------------------------
+
+
+def test_add_sandbox_creates_marker(
+    profiles_base: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (fake_home / ".claude").mkdir()
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    result = runner.invoke(app, ["add", "work", "--sandbox"], input="n\nn\n")
+    assert result.exit_code == 0
+    assert (profiles_base / "work" / SANDBOX_MARKER).exists()
+
+
+def test_add_without_sandbox_no_marker(profiles_base: Path, fake_home: Path) -> None:
+    (fake_home / ".claude").mkdir()
+    result = runner.invoke(app, ["add", "work"], input="n\nn\n")
+    assert result.exit_code == 0
+    assert not (profiles_base / "work" / SANDBOX_MARKER).exists()
+
+
+def test_add_sandbox_hints_build_when_image_absent(
+    profiles_base: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (fake_home / ".claude").mkdir()
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: False)
+    result = runner.invoke(app, ["add", "work", "--sandbox"], input="n\nn\n")
+    assert result.exit_code == 0
+    assert "claude-profile build" in result.output
+
+
+# ---------------------------------------------------------------------------
+# list sandbox indicator
+# ---------------------------------------------------------------------------
+
+
+def test_list_shows_sandbox_indicator(profiles_base: Path) -> None:
+    boxed = profiles_base / "boxed"
+    boxed.mkdir(parents=True)
+    (boxed / SANDBOX_MARKER).touch()
+    result = runner.invoke(app, ["list"])
+    assert result.exit_code == 0
+    assert "microVM" in result.output
+
+
+# ---------------------------------------------------------------------------
+# _launch_profile sandbox routing
+# ---------------------------------------------------------------------------
+
+
+def test_launch_sandbox_routes_to_podman(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / SANDBOX_MARKER).touch()
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.chdir(tmp_path)
+    expected_cwd = Path.cwd()
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", ["--resume"])
+    binname, argv, _env = mock_exec.call_args[0]
+    assert binname == claude_profile.settings.podman_bin
+    assert argv[0] == claude_profile.settings.podman_bin
+    assert "run" in argv
+    assert claude_profile.settings.sandbox_image in argv
+    assert SKIP_PERMISSIONS_FLAG in argv
+    assert "--resume" in argv
+    assert f"{expected_cwd}:{expected_cwd}:z" in argv
+
+
+def test_launch_sandbox_loads_env_into_argv(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / SANDBOX_MARKER).touch()
+    (profile / ".env").write_text("ANTHROPIC_API_KEY=sk-xyz\n")
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.chdir(tmp_path)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    _binname, argv, _env = mock_exec.call_args[0]
+    assert "ANTHROPIC_API_KEY=sk-xyz" in argv
+
+
+def test_launch_sandbox_missing_image_exits(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / SANDBOX_MARKER).touch()
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: False)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        _launch_profile("work", [])
+    assert exc_info.value.code == 1
+
+
+def test_launch_no_marker_uses_host_claude(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    binname, argv, env = mock_exec.call_args[0]
+    assert binname == claude_profile.settings.claude_bin
+    assert argv[0] == claude_profile.settings.claude_bin
+    assert env["CLAUDE_CONFIG_DIR"] == str(profiles_base / "work")
+
+
+# ---------------------------------------------------------------------------
+# sandbox toggle command
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_on_creates_marker(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    result = runner.invoke(app, ["sandbox", "work", "--on"])
+    assert result.exit_code == 0
+    assert (profiles_base / "work" / SANDBOX_MARKER).exists()
+
+
+def test_sandbox_off_removes_marker(profiles_base: Path) -> None:
+    p = profiles_base / "work"
+    p.mkdir(parents=True)
+    (p / SANDBOX_MARKER).touch()
+    result = runner.invoke(app, ["sandbox", "work", "--off"])
+    assert result.exit_code == 0
+    assert not (p / SANDBOX_MARKER).exists()
+
+
+def test_sandbox_off_idempotent_without_marker(profiles_base: Path) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    result = runner.invoke(app, ["sandbox", "work", "--off"])
+    assert result.exit_code == 0
+
+
+def test_sandbox_status_shows_state(profiles_base: Path) -> None:
+    p = profiles_base / "work"
+    p.mkdir(parents=True)
+    result = runner.invoke(app, ["sandbox", "work"])
+    assert result.exit_code == 0
+    assert "host" in result.output
+    (p / SANDBOX_MARKER).touch()
+    result = runner.invoke(app, ["sandbox", "work"])
+    assert "microVM" in result.output
+
+
+def test_sandbox_toggle_nonexistent_profile(profiles_base: Path) -> None:
+    profiles_base.mkdir(parents=True)
+    result = runner.invoke(app, ["sandbox", "ghost", "--on"])
+    assert result.exit_code == 1
+
+
+def test_sandbox_on_and_off_exits_1(profiles_base: Path) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    result = runner.invoke(app, ["sandbox", "work", "--on", "--off"])
+    assert result.exit_code == 1
+    assert "mutually exclusive" in result.output
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE_PROFILE_SANDBOX per-launch override
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_enabled_uses_marker_when_no_override(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = profiles_base / "work"
+    p.mkdir(parents=True)
+    monkeypatch.setattr(claude_profile.settings, "sandbox", None)
+    assert claude_profile._sandbox_enabled(p) is False
+    (p / SANDBOX_MARKER).touch()
+    assert claude_profile._sandbox_enabled(p) is True
+
+
+def test_sandbox_enabled_override_wins(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = profiles_base / "work"
+    p.mkdir(parents=True)
+    (p / SANDBOX_MARKER).touch()
+    monkeypatch.setattr(claude_profile.settings, "sandbox", False)
+    assert claude_profile._sandbox_enabled(p) is False
+    (p / SANDBOX_MARKER).unlink()
+    monkeypatch.setattr(claude_profile.settings, "sandbox", True)
+    assert claude_profile._sandbox_enabled(p) is True
+
+
+def test_override_forces_host_despite_marker(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    p = profiles_base / "work"
+    p.mkdir(parents=True)
+    (p / SANDBOX_MARKER).touch()
+    monkeypatch.setattr(claude_profile.settings, "sandbox", False)
+    monkeypatch.chdir(tmp_path)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    binname, _argv, env = mock_exec.call_args[0]
+    assert binname == claude_profile.settings.claude_bin
+    assert env["CLAUDE_CONFIG_DIR"] == str(p)
+
+
+def test_override_forces_sandbox_without_marker(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    p = profiles_base / "work"
+    p.mkdir(parents=True)
+    monkeypatch.setattr(claude_profile.settings, "sandbox", True)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.chdir(tmp_path)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    binname, _argv, _env = mock_exec.call_args[0]
+    assert binname == claude_profile.settings.podman_bin
+
+
+# ---------------------------------------------------------------------------
+# linked commands/skills read-only mounts
+# ---------------------------------------------------------------------------
+
+
+def test_linked_dir_mount_for_symlink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    global_skills = tmp_path / "global_skills"
+    global_skills.mkdir()
+    (profile / "skills").symlink_to(global_skills)
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    assert f"{global_skills}:{global_skills}:ro,z" in mounts
+
+
+def test_linked_dir_isolated_dir_not_mounted(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    (profile / "skills").mkdir()  # isolated dir, not a symlink
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    assert all("ro,z" not in m for m in mounts)
+
+
+def test_linked_dir_broken_symlink_skipped(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    (profile / "commands").symlink_to(tmp_path / "missing")
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    assert all("ro,z" not in m for m in mounts)
+
+
+def test_linked_dir_symlink_chain_mounts_real_at_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    intermediate = tmp_path / "intermediate"
+    intermediate.symlink_to(canonical)
+    (profile / "skills").symlink_to(intermediate)
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    # real content mounted at the link's immediate (absolute) target
+    assert f"{canonical}:{intermediate}:ro,z" in mounts
+
+
+def test_sandbox_mounts_includes_gitconfig(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    (fake_home / ".gitconfig").write_text("[user]\n  name = x\n")
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    assert f"{fake_home / '.gitconfig'}:/home/appuser/.gitconfig:ro,z" in mounts
+
+
+def test_sandbox_mounts_no_gitconfig(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    assert not any(".gitconfig" in m for m in mounts)
+
+
+# ---------------------------------------------------------------------------
+# agent forwarding (SSH + GPG)
+# ---------------------------------------------------------------------------
+
+
+def test_free_tcp_port_returns_usable_port() -> None:
+    port = claude_profile._free_tcp_port()
+    assert isinstance(port, int)
+    assert 1024 <= port <= 65535
+
+
+def test_ssh_agent_sockets_includes_auth_and_1password(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    auth = tmp_path / "agent.sock"
+    auth.touch()
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(auth))
+    op_dir = fake_home / ".1password"
+    op_dir.mkdir()
+    (op_dir / "agent.sock").touch()
+    assert claude_profile._ssh_agent_sockets() == [auth, op_dir / "agent.sock"]
+
+
+def test_ssh_agent_sockets_empty_when_none(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    assert claude_profile._ssh_agent_sockets() == []
+
+
+def test_ssh_agent_sockets_skips_missing(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "nope.sock"))
+    assert claude_profile._ssh_agent_sockets() == []
+
+
+def test_forwarding_env_empty() -> None:
+    assert claude_profile._forwarding_env(None) == []
+    assert claude_profile._forwarding_env(claude_profile._Forwarding([])) == []
+
+
+def test_forwarding_env_ssh(tmp_path: Path) -> None:
+    a = tmp_path / "a.sock"
+    fwd = claude_profile._Forwarding([(a, a, 1111)], ssh_auth_sock=a)
+    env = claude_profile._forwarding_env(fwd)
+    assert f"CLAUDE_SANDBOX_FORWARDS={a}=1111" in env
+    assert f"SSH_AUTH_SOCK={a}" in env
+    assert "GNUPGHOME=/home/appuser/.gnupg" not in env
+
+
+def test_forwarding_env_gpg(tmp_path: Path) -> None:
+    host = tmp_path / "S.gpg-agent.extra"
+    guest = Path("/home/appuser/.gnupg/S.gpg-agent")
+    fwd = claude_profile._Forwarding([(host, guest, 2222)], gpg_pubkeys_b64="QUJD")
+    env = claude_profile._forwarding_env(fwd)
+    assert f"CLAUDE_SANDBOX_FORWARDS={guest}=2222" in env
+    assert "GNUPGHOME=/home/appuser/.gnupg" in env
+    assert "CLAUDE_SANDBOX_GPG_PUBKEYS=QUJD" in env
+
+
+def test_gpg_extra_socket_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout="/nope/S.gpg-agent.extra\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert claude_profile._gpg_extra_socket() is None
+
+
+def test_gpg_extra_socket_no_gpgconf(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert claude_profile._gpg_extra_socket() is None
+
+
+def test_export_gpg_pubkeys_b64(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"PUBKEYBYTES")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert claude_profile._export_gpg_pubkeys() == base64.b64encode(
+        b"PUBKEYBYTES"
+    ).decode("ascii")
+
+
+def test_export_gpg_pubkeys_none_when_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert claude_profile._export_gpg_pubkeys() is None
+
+
+def test_build_forwarding_ssh_only(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    auth = tmp_path / "agent.sock"
+    auth.touch()
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(auth))
+    monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", True)
+    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 5000)
+    fwd = claude_profile._build_forwarding()
+    assert fwd.forwards == [(auth, auth, 5000)]
+    assert fwd.ssh_auth_sock == auth
+    assert fwd.gpg_pubkeys_b64 is None
+
+
+def test_build_forwarding_gpg_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    extra = tmp_path / "S.gpg-agent.extra"
+    extra.touch()
+    monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", True)
+    monkeypatch.setattr(claude_profile, "_gpg_extra_socket", lambda: extra)
+    monkeypatch.setattr(claude_profile, "_export_gpg_pubkeys", lambda: "QUJD")
+    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 6000)
+    fwd = claude_profile._build_forwarding()
+    guest = Path(claude_profile.SANDBOX_GNUPGHOME) / "S.gpg-agent"
+    assert fwd.forwards == [(extra, guest, 6000)]
+    assert fwd.ssh_auth_sock is None
+    assert fwd.gpg_pubkeys_b64 == "QUJD"
+
+
+def test_build_forwarding_none_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    fwd = claude_profile._build_forwarding()
+    assert fwd.forwards == []
+    assert fwd.ssh_auth_sock is None
+    assert fwd.gpg_pubkeys_b64 is None
+
+
+def test_argv_forwarding_adds_pasta_and_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    a = tmp_path / "a.sock"
+    fwd = claude_profile._Forwarding([(a, a, 1234)], ssh_auth_sock=a)
+    argv = _build_sandbox_argv(profile, cwd, [], {}, fwd)
+    assert any(arg.startswith("--network=pasta") for arg in argv)
+    assert f"SSH_AUTH_SOCK={a}" in argv
+    assert f"CLAUDE_SANDBOX_FORWARDS={a}=1234" in argv
+
+
+def test_argv_no_forwarding_no_pasta(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    argv = _build_sandbox_argv(profile, cwd, [], {})
+    assert not any(arg.startswith("--network=pasta") for arg in argv)
+    assert not any(arg.startswith("CLAUDE_SANDBOX_FORWARDS") for arg in argv)
+
+
+def test_launch_supervised_when_forwarding(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / SANDBOX_MARKER).touch()
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    sock = Path("/run/x.sock")
+    fwd = claude_profile._Forwarding([(sock, sock, 1234)], ssh_auth_sock=sock)
+    monkeypatch.setattr(claude_profile, "_build_forwarding", lambda: fwd)
+    monkeypatch.setattr(claude_profile.shutil, "which", lambda _: "/usr/bin/socat")
+    started: list[tuple[Path, int]] = []
+
+    def fake_bridge(host: Path, port: int) -> Mock:
+        started.append((host, port))
+        return Mock()
+
+    monkeypatch.setattr(claude_profile, "_start_host_bridge", fake_bridge)
+    monkeypatch.chdir(tmp_path)
+    with (
+        patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run,
+        patch("os.execvpe") as mock_exec,
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        _launch_profile("work", [])
+    assert exc_info.value.code == 0
+    mock_exec.assert_not_called()
+    run.assert_called_once()
+    assert any(arg.startswith("--network=pasta") for arg in run.call_args[0][0])
+    assert started == [(sock, 1234)]
+
+
+def test_launch_agent_no_socat_exits(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / SANDBOX_MARKER).touch()
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    sock = Path("/run/x.sock")
+    fwd = claude_profile._Forwarding([(sock, sock, 1234)])
+    monkeypatch.setattr(claude_profile, "_build_forwarding", lambda: fwd)
+    monkeypatch.setattr(claude_profile.shutil, "which", lambda _: None)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        _launch_profile("work", [])
+    assert exc_info.value.code == 1
+
+
+def test_launch_no_forwards_uses_exec(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / SANDBOX_MARKER).touch()
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.setattr(
+        claude_profile, "_build_forwarding", lambda: claude_profile._Forwarding([])
+    )
+    monkeypatch.chdir(tmp_path)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    binname, argv, _env = mock_exec.call_args[0]
+    assert binname == claude_profile.settings.podman_bin
+    assert not any(arg.startswith("--network=pasta") for arg in argv)
