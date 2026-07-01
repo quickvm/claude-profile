@@ -1454,3 +1454,85 @@ def test_launch_no_forwards_uses_exec(
     binname, argv, _env = mock_exec.call_args[0]
     assert binname == claude_profile.settings.podman_bin
     assert not any(arg.startswith("--network=pasta") for arg in argv)
+
+
+# ---------------------------------------------------------------------------
+# sandbox briefing + sandbox-skill writer
+# ---------------------------------------------------------------------------
+
+
+def test_argv_includes_sandbox_briefing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    argv = _build_sandbox_argv(profile, cwd, [], {})
+    assert "--append-system-prompt" in argv
+    briefing = argv[argv.index("--append-system-prompt") + 1]
+    assert "sandbox" in briefing.lower()
+
+
+def test_argv_respects_user_system_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    argv = _build_sandbox_argv(profile, cwd, ["--append-system-prompt", "mine"], {})
+    assert argv.count("--append-system-prompt") == 1
+    assert argv[argv.index("--append-system-prompt") + 1] == "mine"
+
+
+def test_render_sandbox_skill() -> None:
+    content = claude_profile._render_sandbox_skill(["uv", "jq"])
+    assert "{{INSTALLED_TOOLS}}" not in content
+    assert "- `uv` —" in content
+    assert "- `jq` —" in content
+
+
+def test_sandbox_installed_tools_filters(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout="jq\nuv\nbogus\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert claude_profile._sandbox_installed_tools() == ["uv", "jq"]
+
+
+def test_sandbox_skill_writes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(
+        claude_profile, "_sandbox_installed_tools", lambda: ["uv", "jq"]
+    )
+    dest = tmp_path / "SKILL.md"
+    result = runner.invoke(app, ["sandbox-skill", "--path", str(dest)])
+    assert result.exit_code == 0
+    text = dest.read_text()
+    assert "- `uv` —" in text
+    assert "- `jq` —" in text
+
+
+def test_sandbox_skill_check_stale(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_sandbox_installed_tools", lambda: ["uv"])
+    dest = tmp_path / "SKILL.md"
+    dest.write_text("stale")
+    result = runner.invoke(app, ["sandbox-skill", "--check", "--path", str(dest)])
+    assert result.exit_code == 1
+
+
+def test_sandbox_skill_check_current(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_sandbox_installed_tools", lambda: ["uv"])
+    dest = tmp_path / "SKILL.md"
+    runner.invoke(app, ["sandbox-skill", "--path", str(dest)])
+    result = runner.invoke(app, ["sandbox-skill", "--check", "--path", str(dest)])
+    assert result.exit_code == 0

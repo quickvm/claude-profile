@@ -50,6 +50,37 @@ SANDBOX_GNUPGHOME = "/home/appuser/.gnupg"
 # podman's default host.containers.internal address under pasta; mapping it to the
 # host loopback lets the agent bridge bind to 127.0.0.1 instead of all interfaces.
 SANDBOX_HOST_LOOPBACK = "169.254.1.2"
+SANDBOX_BRIEFING = (
+    "You are running inside the claude-profile microVM sandbox — an ephemeral "
+    "podman/krun VM (confirm with /run/.containerenv). Only the mounted working "
+    "directory and its git dir, plus this profile's Claude config, are visible; the "
+    "rest of the host filesystem is not, which is why --dangerously-skip-permissions is "
+    "safe here. Anything you install is discarded when the session ends, and you have "
+    "passwordless sudo scoped to dnf. To add a missing tool use `sudo dnf install <pkg>` "
+    "or `uv tool install <tool>` (see the sandbox-tools skill). If you need a tool made "
+    "permanent, access outside the mounted paths, or anything the sandbox blocks, ask "
+    "the user instead of working around it."
+)
+# Curated dev tools advertised by the sandbox-tools skill (command name -> description).
+SANDBOX_SKILL_TOOLS: dict[str, str] = {
+    "uv": "Python package/tool manager (uv tool install, uv run)",
+    "python3": "Python 3 (with pyyaml and jinja2)",
+    "jq": "JSON processor",
+    "yq": "YAML processor",
+    "git": "Git",
+    "rg": "ripgrep (fast search)",
+    "fd": "fd (fast file finder)",
+    "make": "make",
+    "gcc": "C compiler",
+    "openssl": "OpenSSL",
+    "trash": "trash-cli (use instead of rm -rf)",
+    "ssh": "OpenSSH client",
+    "gpg": "GnuPG",
+    "socat": "socat",
+    "node": "Node.js",
+    "npm": "npm",
+    "butane": "Butane (Ignition config compiler)",
+}
 
 app = typer.Typer(
     name="claude-profile",
@@ -200,6 +231,65 @@ def build_sandbox() -> None:
         err_console.print(f"[red]Build failed (exit {exc.returncode}).[/red]")
         raise typer.Exit(code=1) from None
     console.print(f"[green]Built {settings.sandbox_image}.[/green]")
+
+
+def _sandbox_installed_tools() -> list[str]:
+    """Return which curated dev tools are present in the sandbox image."""
+    names = " ".join(SANDBOX_SKILL_TOOLS)
+    script = f'for t in {names}; do command -v "$t" >/dev/null 2>&1 && echo "$t"; done'
+    result = subprocess.run(
+        [
+            settings.podman_bin,
+            "run",
+            "--rm",
+            settings.sandbox_image,
+            "sh",
+            "-c",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    present = set(result.stdout.split())
+    return [tool for tool in SANDBOX_SKILL_TOOLS if tool in present]
+
+
+def _render_sandbox_skill(tools: list[str]) -> str:
+    """Render the sandbox-tools SKILL.md with the given installed-tools list."""
+    template = (
+        resources.files("claude_profile") / "sandbox_skill_template.md"
+    ).read_text()
+    listing = "\n".join(f"- `{tool}` — {SANDBOX_SKILL_TOOLS[tool]}" for tool in tools)
+    return template.replace("{{INSTALLED_TOOLS}}", listing)
+
+
+@app.command("sandbox-skill")
+def sandbox_skill(
+    check: bool = typer.Option(
+        False, "--check", help="Verify the skill matches the image; exit 1 if stale."
+    ),
+    path: Optional[Path] = typer.Option(
+        None,
+        "--path",
+        help="SKILL.md path (default ~/.claude/skills/sandbox-tools/SKILL.md).",
+    ),
+) -> None:
+    """Write (or --check) the sandbox-tools skill from the image's installed tools."""
+    dest = path or (Path.home() / ".claude" / "skills" / "sandbox-tools" / "SKILL.md")
+    _ensure_sandbox_image()
+    content = _render_sandbox_skill(_sandbox_installed_tools())
+    if check:
+        current = dest.read_text() if dest.exists() else ""
+        if current != content:
+            err_console.print(
+                f"[red]{dest} is out of date.[/red] Run: claude-profile sandbox-skill"
+            )
+            raise typer.Exit(code=1)
+        console.print(f"[green]{dest} is up to date.[/green]")
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(content)
+    console.print(f"[green]Wrote {dest}[/green]")
 
 
 @app.command("sandbox")
@@ -575,6 +665,8 @@ def _build_sandbox_argv(
     args = list(claude_args)
     if settings.sandbox_skip_permissions and SKIP_PERMISSIONS_FLAG not in args:
         args.append(SKIP_PERMISSIONS_FLAG)
+    if "--append-system-prompt" not in args:
+        args += ["--append-system-prompt", SANDBOX_BRIEFING]
     return argv + args
 
 
@@ -753,7 +845,16 @@ def _launch_profile(name: str, claude_args: list[str]) -> None:
 
 
 def main() -> None:
-    _KNOWN_COMMANDS = {"list", "add", "remove", "links", "env", "build", "sandbox"}
+    _KNOWN_COMMANDS = {
+        "list",
+        "add",
+        "remove",
+        "links",
+        "env",
+        "build",
+        "sandbox",
+        "sandbox-skill",
+    }
     args = sys.argv[1:]
     if args and args[0] not in _KNOWN_COMMANDS and not args[0].startswith("-"):
         _launch_profile(args[0], args[1:])

@@ -3,13 +3,21 @@
 # Extend this file for project-specific tooling, then rebuild.
 FROM fedora:44
 
-RUN dnf install -y git ripgrep fd-find jq less ca-certificates openssh-clients socat && dnf clean all
+RUN dnf install -y \
+      git ripgrep fd-find jq yq less ca-certificates openssh-clients socat \
+      sudo openssl make trash-cli python3-pyyaml python3-jinja2 \
+    && dnf clean all
 
-RUN useradd -m -u 1000 -U appuser
+# Passwordless sudo scoped to the package manager: the agent can install missing
+# system packages ad-hoc, but cannot sudo-write into the bind mounts.
+RUN useradd -m -u 1000 -U appuser \
+    && echo 'appuser ALL=(root) NOPASSWD: /usr/bin/dnf, /usr/bin/dnf5' > /etc/sudoers.d/appuser \
+    && chmod 0440 /etc/sudoers.d/appuser
 
-# Install the native claude binary as the unprivileged user (lands in ~/.local/bin).
+# Install uv + the native claude binary as the unprivileged user (into ~/.local/bin).
 USER appuser
-RUN curl -fsSL https://claude.ai/install.sh | bash
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && curl -fsSL https://claude.ai/install.sh | bash
 USER root
 
 COPY entrypoint.sh /entrypoint.sh
