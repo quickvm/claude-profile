@@ -77,8 +77,17 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   `entrypoint.sh` drops to a host-UID user (`runuser`) before exec'ing claude. Sandbox
   mode auto-appends that flag unless `sandbox_skip_permissions` is false or the user
   already passed it.
-- **Sandbox settings:** `podman_bin`, `sandbox_image`, `sandbox_ram_mib`,
-  `sandbox_cpus`, `sandbox_skip_permissions` (all read from `CLAUDE_PROFILE_*`).
+- **Sandbox settings:** `podman_bin`, `sandbox_image`, `sandbox_ram_mib`, `sandbox_cpus`,
+  `sandbox_skip_permissions`, `sandbox_ssh_agent`, `sandbox_gpg_agent` (all read from
+  `CLAUDE_PROFILE_*`).
+- **Agent self-provisioning:** the image bakes common dev tools (`uv`, jq/yq,
+  python+pyyaml/jinja2, make/openssl/trash) plus `dnf`-scoped passwordless sudo, so the
+  agent installs missing tools ad-hoc (`sudo dnf install`, `uv tool install`; ephemeral).
+  `_build_sandbox_argv` appends `SANDBOX_BRIEFING` via `--append-system-prompt` so the
+  agent knows it is sandboxed. The `sandbox-skill` command generates the `sandbox-tools`
+  SKILL.md from `SANDBOX_SKILL_TOOLS` filtered by what the image actually has (introspected
+  via `podman run … command -v`); `--check` detects drift. Template lives at
+  `src/claude_profile/sandbox_skill_template.md`.
 - **SSH agent forwarding (`sandbox_ssh_agent`):** a microVM can't bind-mount the agent
   socket (separate kernel), so `_ssh_agent_sockets()` lists the active agent + 1Password,
   `_start_host_bridge()` runs a host `socat` (TCP on 127.0.0.1 → the agent socket), and

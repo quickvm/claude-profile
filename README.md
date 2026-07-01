@@ -36,6 +36,7 @@ claude-profile remove <name>         # delete a profile
 claude-profile links <name>          # inspect or change directory symlinks
 claude-profile sandbox <name>        # turn microVM mode on/off for a profile
 claude-profile build                 # build the microVM sandbox image
+claude-profile sandbox-skill         # (re)generate the in-sandbox tools skill
 claude-profile <name> [args...]      # launch claude with the given profile
 ```
 
@@ -99,9 +100,38 @@ claude-profile build               # build the sandbox image
 claude-profile add work --sandbox  # mark a profile as sandboxed
 ```
 
-`build` builds an image (Fedora + claude + git/ripgrep/fd) from a `Containerfile` shipped
-with the tool. Edit it for extra project tooling and rebuild; override the image name with
-`CLAUDE_PROFILE_SANDBOX_IMAGE`.
+`build` builds the image from a `Containerfile` shipped with the tool: Fedora + claude,
+`uv`, git/ripgrep/fd/jq/yq, python (pyyaml/jinja2), openssl/make/trash, and `dnf`-scoped
+passwordless sudo. Edit it for more baked-in tooling and rebuild; override the image name
+with `CLAUDE_PROFILE_SANDBOX_IMAGE`.
+
+### Tools & installing more
+
+On launch the agent is told (via the system prompt) that it's in the sandbox, and the
+bundled `sandbox-tools` skill explains how to self-provision. Inside the VM it can:
+
+- `sudo dnf install -y <pkg>` — passwordless sudo is scoped to `dnf`, so it can't `sudo` a
+  write into your mounted repo
+- `uv tool install <tool>` / `uv run --with <lib> …` — no root needed
+
+Installs are per-session (the VM is ephemeral). For a tool you need every time, add it to
+the `Containerfile` and rebuild, or build a derived image:
+
+```dockerfile
+# ~/qvm-sandbox/Containerfile
+FROM claude-profile-sandbox:latest
+USER root
+RUN dnf install -y butane && dnf clean all
+USER appuser
+RUN uv tool install <your-tool>
+```
+```sh
+podman build -t qvm-sandbox ~/qvm-sandbox
+export CLAUDE_PROFILE_SANDBOX_IMAGE=qvm-sandbox   # claude-profile uses it automatically
+```
+
+The skill's "already installed" list is generated from the image — after changing the
+Containerfile, run `claude-profile sandbox-skill` (or `--check` to catch drift).
 
 ### Launching
 
