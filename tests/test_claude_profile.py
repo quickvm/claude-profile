@@ -20,6 +20,7 @@ from claude_profile import (
     _git_common_dir,
     _launch_profile,
     _parse_env_file,
+    _sandbox_image_user,
     _sandbox_mounts,
     app,
     main,
@@ -49,6 +50,8 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(claude_profile.settings, "sandbox", None)
     monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", False)
+    # Default the image-user check to root so launch tests skip the real podman call.
+    monkeypatch.setattr(claude_profile, "_sandbox_image_user", lambda: "")
 
 
 # ---------------------------------------------------------------------------
@@ -1536,3 +1539,50 @@ def test_sandbox_skill_check_current(
     runner.invoke(app, ["sandbox-skill", "--path", str(dest)])
     result = runner.invoke(app, ["sandbox-skill", "--check", "--path", str(dest)])
     assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# image-user guardrail (non-root image breaks the entrypoint's root block)
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_image_user_appuser(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout="appuser\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _sandbox_image_user() == "appuser"
+
+
+def test_sandbox_image_user_root_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout="\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _sandbox_image_user() == ""
+
+
+def test_sandbox_image_user_no_podman(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert _sandbox_image_user() == ""
+
+
+def test_launch_warns_nonroot_image_but_proceeds(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / SANDBOX_MARKER).touch()
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_user", lambda: "appuser")
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.setattr(
+        claude_profile, "_build_forwarding", lambda: claude_profile._Forwarding([])
+    )
+    monkeypatch.chdir(tmp_path)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    assert mock_exec.called

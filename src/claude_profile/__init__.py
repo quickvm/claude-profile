@@ -205,6 +205,26 @@ def _sandbox_image_exists() -> bool:
     return result.returncode == 0
 
 
+def _sandbox_image_user() -> str:
+    """Return the sandbox image's configured USER (empty string means root)."""
+    try:
+        result = subprocess.run(
+            [
+                settings.podman_bin,
+                "image",
+                "inspect",
+                settings.sandbox_image,
+                "--format",
+                "{{.Config.User}}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
 @app.command("build")
 def build_sandbox() -> None:
     """Build the microVM sandbox image (podman + krun)."""
@@ -772,6 +792,14 @@ def _launch_sandbox(
 ) -> None:
     """Launch a podman krun microVM running claude (optionally bridging agents)."""
     _ensure_sandbox_image()
+    image_user = _sandbox_image_user()
+    if image_user and image_user not in ("root", "0"):
+        err_console.print(
+            f"[yellow]Warning: sandbox image '{settings.sandbox_image}' runs as "
+            f"'{image_user}', not root — the entrypoint must start as root to map your "
+            f"UID and forward SSH/GPG agents. End your Containerfile with `USER root`."
+            f"[/yellow]"
+        )
     cwd = Path.cwd()
     forwarding = _build_forwarding()
     if forwarding.forwards:

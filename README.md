@@ -124,6 +124,8 @@ USER root
 RUN dnf install -y butane && dnf clean all
 USER appuser
 RUN uv tool install <your-tool>
+USER root   # MUST end as root: the entrypoint starts as root to map your UID and set
+            # up agent-socket dirs. A non-root final USER silently breaks SSH/GPG forwarding.
 ```
 ```sh
 podman build -t qvm-sandbox ~/qvm-sandbox
