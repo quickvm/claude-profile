@@ -601,6 +601,9 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
     gitconfig = Path.home() / ".gitconfig"
     if gitconfig.exists():
         mounts += ["-v", f"{gitconfig}:/home/appuser/.gitconfig:ro,z"]
+    known_hosts = Path.home() / ".ssh" / "known_hosts"
+    if known_hosts.exists():
+        mounts += ["-v", f"{known_hosts}:/home/appuser/.ssh/known_hosts:ro,z"]
     mounts += _linked_dir_mounts(profile_dir)
     return mounts
 

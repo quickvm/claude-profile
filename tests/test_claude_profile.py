@@ -1586,3 +1586,30 @@ def test_launch_warns_nonroot_image_but_proceeds(
     with patch("os.execvpe") as mock_exec:
         _launch_profile("work", [])
     assert mock_exec.called
+
+
+def test_sandbox_mounts_includes_known_hosts(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    ssh = fake_home / ".ssh"
+    ssh.mkdir()
+    (ssh / "known_hosts").write_text("git.example.org ssh-ed25519 AAAA\n")
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    assert f"{ssh / 'known_hosts'}:/home/appuser/.ssh/known_hosts:ro,z" in mounts
+
+
+def test_sandbox_mounts_no_known_hosts(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    assert not any("known_hosts" in m for m in mounts)
