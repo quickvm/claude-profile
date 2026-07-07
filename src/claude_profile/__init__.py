@@ -56,8 +56,10 @@ SANDBOX_BRIEFING = (
     "directory and its git dir, plus this profile's Claude config, are visible; the "
     "rest of the host filesystem is not, which is why --dangerously-skip-permissions is "
     "safe here. Anything you install is discarded when the session ends, and you have "
-    "passwordless sudo scoped to dnf. To add a missing tool use `sudo dnf install <pkg>` "
-    "or `uv tool install <tool>` (see the sandbox-tools skill). If you need a tool made "
+    "passwordless sudo scoped to dnf and podman. To add a missing tool use `sudo dnf "
+    "install <pkg>` or `uv tool install <tool>` (see the sandbox-tools skill). To run "
+    "nested containers use `sudo podman` (rootful — plain `podman` runs rootless and "
+    "can't unpack layers in the VM's user namespace). If you need a tool made "
     "permanent, access outside the mounted paths, or anything the sandbox blocks, ask "
     "the user instead of working around it."
 )
@@ -68,15 +70,18 @@ SANDBOX_SKILL_TOOLS: dict[str, str] = {
     "jq": "JSON processor",
     "yq": "YAML processor",
     "git": "Git",
+    "gh": "GitHub CLI",
     "rg": "ripgrep (fast search)",
     "fd": "fd (fast file finder)",
     "make": "make",
+    "shellcheck": "ShellCheck (shell linter)",
     "gcc": "C compiler",
     "openssl": "OpenSSL",
     "trash": "trash-cli (use instead of rm -rf)",
     "ssh": "OpenSSH client",
     "gpg": "GnuPG",
     "socat": "socat",
+    "podman": "Podman — run nested containers with `sudo podman`",
     "node": "Node.js",
     "npm": "npm",
     "butane": "Butane (Ignition config compiler)",

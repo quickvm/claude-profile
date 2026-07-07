@@ -4,15 +4,26 @@
 FROM fedora:44
 
 RUN dnf install -y \
-      git ripgrep fd-find jq yq less ca-certificates openssh-clients socat \
-      sudo openssl make trash-cli python3-pyyaml python3-jinja2 \
+      git gh ripgrep fd-find jq yq less ca-certificates openssh-clients socat \
+      sudo openssl make patch diffutils ShellCheck trash-cli butane \
+      podman fuse-overlayfs passt \
+      nodejs22 nodejs22-npm python3-pyyaml python3-jinja2 \
     && dnf clean all
 
-# Passwordless sudo scoped to the package manager: the agent can install missing
-# system packages ad-hoc, but cannot sudo-write into the bind mounts.
+# Passwordless sudo scoped to the package manager plus podman: the agent can install
+# missing system packages and run nested containers, but cannot sudo-write into the
+# bind mounts. Podman runs rootful (`sudo podman`) because the guest kernel sees uid 0
+# as real root — rootless podman can't unpack layers in the nested user namespace.
 RUN useradd -m -u 1000 -U appuser \
-    && echo 'appuser ALL=(root) NOPASSWD: /usr/bin/dnf, /usr/bin/dnf5' > /etc/sudoers.d/appuser \
+    && echo 'appuser ALL=(root) NOPASSWD: /usr/bin/dnf, /usr/bin/dnf5, /usr/bin/podman' > /etc/sudoers.d/appuser \
     && chmod 0440 /etc/sudoers.d/appuser
+
+# Rootful podman stores images with fuse-overlayfs: the microVM's virtiofs root can't
+# back a native overlay ("upper fs missing required features"), and vfs copies every
+# layer. fuse-overlayfs gives real layered storage on any backing filesystem.
+RUN mkdir -p /etc/containers \
+    && printf '[storage]\ndriver = "overlay"\n[storage.options.overlay]\nmount_program = "/usr/bin/fuse-overlayfs"\n' \
+       > /etc/containers/storage.conf
 
 # Install uv + the native claude binary as the unprivileged user (into ~/.local/bin).
 USER appuser

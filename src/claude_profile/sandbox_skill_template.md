@@ -7,7 +7,7 @@ description: Provision missing tools inside the claude-profile microVM sandbox. 
 
 You are in the ephemeral claude-profile microVM sandbox when `/run/.containerenv`
 exists (also `$container=oci`). It is a throwaway VM: **anything you install is gone on
-the next launch**, and you have **passwordless `sudo` scoped to `dnf`**.
+the next launch**, and you have **passwordless `sudo` scoped to `dnf` and `podman`**.
 
 ## Already installed
 
