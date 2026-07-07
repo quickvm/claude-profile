@@ -78,8 +78,8 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   mode auto-appends that flag unless `sandbox_skip_permissions` is false or the user
   already passed it.
 - **Sandbox settings:** `podman_bin`, `sandbox_image`, `sandbox_ram_mib`, `sandbox_cpus`,
-  `sandbox_skip_permissions`, `sandbox_ssh_agent`, `sandbox_gpg_agent` (all read from
-  `CLAUDE_PROFILE_*`).
+  `sandbox_skip_permissions`, `sandbox_ssh_agent`, `sandbox_gpg_agent`, `sandbox_clipboard`,
+  `sandbox_gh` (all read from `CLAUDE_PROFILE_*`).
 - **Agent self-provisioning:** the image bakes common dev tools (`uv`, jq/yq,
   python+pyyaml/jinja2, make/openssl/trash) plus `dnf`-scoped passwordless sudo, so the
   agent installs missing tools ad-hoc (`sudo dnf install`, `uv tool install`; ephemeral).
@@ -100,9 +100,27 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   (`gpg --export`, base64 via env, imported by `entrypoint.sh`). Signing runs on the host,
   so secret keys/smartcard never enter the VM. `_sandbox_mounts` also bind-mounts
   `~/.gitconfig` read-only so signing config applies. `_Forwarding` carries
-  `(host_socket, guest_path, port)` tuples shared by both SSH and GPG; the in-VM env
-  (`CLAUDE_SANDBOX_FORWARDS`, `SSH_AUTH_SOCK`, `GNUPGHOME`, `CLAUDE_SANDBOX_GPG_PUBKEYS`)
-  is built by `_forwarding_env`.
+  `(host_socket, guest_path, port)` tuples shared by both SSH and GPG plus a
+  `clipboard_port` for the clipboard bridge; `active()` reports whether any host bridge is
+  needed. The in-VM env (`CLAUDE_SANDBOX_FORWARDS`, `SSH_AUTH_SOCK`, `GNUPGHOME`,
+  `CLAUDE_SANDBOX_GPG_PUBKEYS`, `CLAUDE_SANDBOX_CLIPBOARD_PORT`) is built by `_forwarding_env`.
+- **Clipboard bridge (`sandbox_clipboard`):** Claude Code reads a pasted image on Linux by
+  shelling out to `wl-paste`/`xclip`, but the microVM has no display. Rather than forward the
+  whole Wayland compositor (waypipe would also hand the sandbox screen capture and keystroke
+  injection — a practical escape), a scoped bridge carries only clipboard bytes: an in-VM
+  `wl-paste` shim (`src/claude_profile/sandbox/wl-paste`) relays its args over pasta to a host
+  `socat` that execs `clipboard_host.sh`, which whitelists read-only `wl-paste` invocations and
+  streams the bytes back. `_build_forwarding` allocates the port, `_forwarding_env` exports it as
+  `CLAUDE_SANDBOX_CLIPBOARD_PORT`, and `_start_clipboard_host_bridge` (started/torn down by
+  `_run_sandbox_supervised`, which also verifies the host has `wl-paste`) serves it. Read-only:
+  the sandbox reads the clipboard but cannot write it or reach any other Wayland protocol. No
+  entrypoint or image-package changes — the shim is inert unless the port env is set.
+- **GitHub CLI (`sandbox_gh`):** the image bakes `gh`, and enabling `sandbox_gh` forwards your
+  GitHub login into the VM. `gh` keeps its token in the system keyring (or `hosts.yml`), which a
+  microVM can't reach, so `_with_gh_token` reads it on the host via `gh auth token` and injects it
+  as `GH_TOKEN` (the env var gh reads natively) into the sandbox env — no config mount. A
+  missing/failed token warns and continues (gh stays unauthenticated). The token grants the
+  sandbox whatever the login's scopes allow, so it is opt-in.
 - **`sandbox` subcommand & override:** `sandbox <name> --on/--off` toggles the `.sandbox`
   marker on an existing profile (shows status when no flag). `_sandbox_enabled()` decides
   per launch: the `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state

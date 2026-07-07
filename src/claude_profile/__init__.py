@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     sandbox_skip_permissions: bool = Field(default=True)
     sandbox_ssh_agent: bool = Field(default=False)
     sandbox_gpg_agent: bool = Field(default=False)
+    sandbox_clipboard: bool = Field(default=False)
+    sandbox_gh: bool = Field(default=False)
     # Per-launch override of the .sandbox marker (CLAUDE_PROFILE_SANDBOX). None = use marker.
     sandbox: Optional[bool] = Field(default=None)
 
@@ -47,6 +49,20 @@ SANDBOX_MARKER = ".sandbox"
 SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 SANDBOX_CONFIG_DIR = "/home/appuser/.claude"
 SANDBOX_GNUPGHOME = "/home/appuser/.gnupg"
+# Env var carrying the host clipboard-bridge TCP port to the in-VM wl-paste shim.
+SANDBOX_CLIPBOARD_PORT_ENV = "CLAUDE_SANDBOX_CLIPBOARD_PORT"
+# Deny-rule prefixes stripped from the in-VM settings overlay: host guardrails that
+# are counterproductive inside the isolated microVM (deny beats
+# --dangerously-skip-permissions, so they still apply there). The VM grants OS-level
+# sudo scoped to dnf/podman, and only mounted paths exist inside it, so the host's
+# blanket sudo deny and its ~/.ssh//~/.aws read guards just block the intended
+# workflow (e.g. `sudo podman`, reading the forwarded ssh/known_hosts).
+SANDBOX_STRIP_DENY_PREFIXES: tuple[str, ...] = (
+    "Bash(sudo",
+    "Read(~/.ssh",
+    "Edit(~/.ssh",
+    "Read(~/.aws",
+)
 # podman's default host.containers.internal address under pasta; mapping it to the
 # host loopback lets the agent bridge bind to 127.0.0.1 instead of all interfaces.
 SANDBOX_HOST_LOOPBACK = "169.254.1.2"
@@ -643,6 +659,11 @@ class _Forwarding:
     forwards: list[tuple[Path, Path, int]]  # (host_socket, guest_path, tcp_port)
     ssh_auth_sock: Optional[Path] = None
     gpg_pubkeys_b64: Optional[str] = None
+    clipboard_port: Optional[int] = None  # host TCP port serving the clipboard bridge
+
+    def active(self) -> bool:
+        """True when any host-side bridge (agent socket or clipboard) is needed."""
+        return bool(self.forwards) or self.clipboard_port is not None
 
 
 def _build_sandbox_argv(
@@ -668,7 +689,7 @@ def _build_sandbox_argv(
         "--device",
         "/dev/kvm",
     ]
-    if forwarding and forwarding.forwards:
+    if forwarding and forwarding.active():
         # pasta gives the VM a route to the host (TSI cannot); --map-host-loopback
         # makes host.containers.internal reach the host's loopback, so the agent
         # bridge can bind to 127.0.0.1 rather than every host interface.
@@ -700,10 +721,12 @@ def _build_sandbox_argv(
 
 def _forwarding_env(forwarding: Optional[_Forwarding]) -> list[str]:
     """Env args telling the entrypoint which sockets to bridge and how."""
-    if forwarding is None or not forwarding.forwards:
+    if forwarding is None or not forwarding.active():
         return []
-    spec = ",".join(f"{guest}={port}" for _host, guest, port in forwarding.forwards)
-    env = ["-e", f"CLAUDE_SANDBOX_FORWARDS={spec}"]
+    env: list[str] = []
+    if forwarding.forwards:
+        spec = ",".join(f"{guest}={port}" for _host, guest, port in forwarding.forwards)
+        env += ["-e", f"CLAUDE_SANDBOX_FORWARDS={spec}"]
     if forwarding.ssh_auth_sock is not None:
         env += ["-e", f"SSH_AUTH_SOCK={forwarding.ssh_auth_sock}"]
     if forwarding.gpg_pubkeys_b64 is not None:
@@ -713,6 +736,8 @@ def _forwarding_env(forwarding: Optional[_Forwarding]) -> list[str]:
             "-e",
             f"CLAUDE_SANDBOX_GPG_PUBKEYS={forwarding.gpg_pubkeys_b64}",
         ]
+    if forwarding.clipboard_port is not None:
+        env += ["-e", f"{SANDBOX_CLIPBOARD_PORT_ENV}={forwarding.clipboard_port}"]
     return env
 
 
@@ -779,7 +804,8 @@ def _build_forwarding() -> _Forwarding:
             guest = Path(SANDBOX_GNUPGHOME) / "S.gpg-agent"
             forwards.append((extra, guest, _free_tcp_port()))
             pubkeys = _export_gpg_pubkeys()
-    return _Forwarding(forwards, ssh_auth, pubkeys)
+    clipboard_port = _free_tcp_port() if settings.sandbox_clipboard else None
+    return _Forwarding(forwards, ssh_auth, pubkeys, clipboard_port)
 
 
 def _start_host_bridge(agent_sock: Path, port: int) -> subprocess.Popen[bytes]:
@@ -795,6 +821,70 @@ def _start_host_bridge(agent_sock: Path, port: int) -> subprocess.Popen[bytes]:
     )
 
 
+def _clipboard_host_handler() -> Path:
+    """Path to the packaged host-side clipboard handler script."""
+    return Path(str(resources.files("claude_profile") / "clipboard_host.sh"))
+
+
+def _start_clipboard_host_bridge(port: int) -> subprocess.Popen[bytes]:
+    """Serve the host clipboard to the VM: socat execs a read-only wl-paste handler.
+
+    Each guest connection runs the handler with the socket on stdin/stdout; it reads
+    one request line (whitelisted wl-paste args) and streams the clipboard bytes
+    back. Only clipboard reads cross the boundary — no Wayland access is exposed to
+    the sandbox, unlike forwarding the compositor wholesale.
+    """
+    handler = _clipboard_host_handler()
+    return subprocess.Popen(
+        [
+            "socat",
+            f"TCP-LISTEN:{port},bind=127.0.0.1,reuseaddr,fork",
+            f"EXEC:bash {handler}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _gh_token() -> Optional[str]:
+    """Return the host's GitHub token via ``gh auth token``, or None if unavailable.
+
+    Reads from wherever gh stores it (system keyring or hosts.yml). A short timeout
+    avoids hanging if the keyring needs an interactive unlock.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    token = result.stdout.strip()
+    return token if result.returncode == 0 and token else None
+
+
+def _with_gh_token(extra_env: dict[str, str]) -> dict[str, str]:
+    """Add ``GH_TOKEN`` from the host gh login when ``sandbox_gh`` is enabled.
+
+    gh keeps its token in the keyring or hosts.yml; a microVM can reach neither, so
+    we read it on the host and forward it as the GH_TOKEN env var gh reads natively.
+    Returns extra_env unchanged when disabled or no token is found.
+    """
+    if not settings.sandbox_gh:
+        return extra_env
+    token = _gh_token()
+    if not token:
+        err_console.print(
+            "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_GH is set but no GitHub token "
+            "was found (`gh auth token` failed). gh will be unauthenticated in the "
+            "sandbox.[/yellow]"
+        )
+        return extra_env
+    return {**extra_env, "GH_TOKEN": token}
+
+
 def _launch_sandbox(
     profile_dir: Path, claude_args: list[str], extra_env: dict[str, str]
 ) -> None:
@@ -808,9 +898,10 @@ def _launch_sandbox(
             f"UID and forward SSH/GPG agents. End your Containerfile with `USER root`."
             f"[/yellow]"
         )
+    extra_env = _with_gh_token(extra_env)
     cwd = Path.cwd()
     forwarding = _build_forwarding()
-    if forwarding.forwards:
+    if forwarding.active():
         _run_sandbox_supervised(profile_dir, cwd, claude_args, extra_env, forwarding)
         return
     argv = _build_sandbox_argv(profile_dir, cwd, claude_args, extra_env)
@@ -836,9 +927,17 @@ def _run_sandbox_supervised(
             "or disable the sandbox agent-forwarding settings."
         )
         sys.exit(1)
+    if forwarding.clipboard_port is not None and shutil.which("wl-paste") is None:
+        err_console.print(
+            "[red]'wl-paste' not found on host.[/red] Install wl-clipboard (e.g. "
+            "dnf install wl-clipboard) or unset CLAUDE_PROFILE_SANDBOX_CLIPBOARD."
+        )
+        sys.exit(1)
     bridges = [
         _start_host_bridge(host, port) for host, _guest, port in forwarding.forwards
     ]
+    if forwarding.clipboard_port is not None:
+        bridges.append(_start_clipboard_host_bridge(forwarding.clipboard_port))
     argv = _build_sandbox_argv(profile_dir, cwd, claude_args, extra_env, forwarding)
     try:
         result = subprocess.run(argv, env=os.environ.copy())

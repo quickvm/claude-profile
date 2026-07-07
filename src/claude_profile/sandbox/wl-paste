@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Sandbox clipboard shim, installed as `wl-paste` inside the microVM. Claude Code
+# shells out to `wl-paste` to read the clipboard, but the VM has no display, so we
+# relay the requested arguments to the host clipboard bridge over the pasta network
+# and print whatever bytes come back. When the bridge is not configured (clipboard
+# forwarding disabled) this exits non-zero so Claude Code proceeds as if there were
+# no clipboard tool at all.
+port="${CLAUDE_SANDBOX_CLIPBOARD_PORT:-}"
+[ -n "$port" ] || exit 1
+
+# Use bash's /dev/tcp, not `printf | socat`: closing the write side right after the
+# request makes the host-side socat hit its short default timeout and truncate large
+# images mid-stream. Keeping fd 3 open until the host closes it streams the full
+# response regardless of size.
+exec 3<>"/dev/tcp/host.containers.internal/${port}" 2>/dev/null || exit 1
+printf '%s\n' "$*" >&3
+cat <&3

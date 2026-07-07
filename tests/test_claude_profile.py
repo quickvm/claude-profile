@@ -50,6 +50,8 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(claude_profile.settings, "sandbox", None)
     monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", False)
+    monkeypatch.setattr(claude_profile.settings, "sandbox_clipboard", False)
+    monkeypatch.setattr(claude_profile.settings, "sandbox_gh", False)
     # Default the image-user check to root so launch tests skip the real podman call.
     monkeypatch.setattr(claude_profile, "_sandbox_image_user", lambda: "")
 
@@ -1457,6 +1459,185 @@ def test_launch_no_forwards_uses_exec(
     binname, argv, _env = mock_exec.call_args[0]
     assert binname == claude_profile.settings.podman_bin
     assert not any(arg.startswith("--network=pasta") for arg in argv)
+
+
+# ---------------------------------------------------------------------------
+# clipboard bridge
+# ---------------------------------------------------------------------------
+
+
+def test_build_forwarding_clipboard_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_clipboard", True)
+    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 7777)
+    fwd = claude_profile._build_forwarding()
+    assert fwd.forwards == []
+    assert fwd.clipboard_port == 7777
+    assert fwd.active() is True
+
+
+def test_build_forwarding_no_clipboard_when_disabled() -> None:
+    fwd = claude_profile._build_forwarding()
+    assert fwd.clipboard_port is None
+    assert fwd.active() is False
+
+
+def test_forwarding_env_clipboard_only() -> None:
+    fwd = claude_profile._Forwarding([], clipboard_port=7777)
+    env = claude_profile._forwarding_env(fwd)
+    assert f"{claude_profile.SANDBOX_CLIPBOARD_PORT_ENV}=7777" in env
+    # No agent sockets, so no CLAUDE_SANDBOX_FORWARDS entry is emitted.
+    assert not any(e.startswith("CLAUDE_SANDBOX_FORWARDS") for e in env)
+
+
+def test_argv_clipboard_adds_pasta_and_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    fwd = claude_profile._Forwarding([], clipboard_port=7777)
+    argv = _build_sandbox_argv(profile, cwd, [], {}, fwd)
+    assert any(arg.startswith("--network=pasta") for arg in argv)
+    assert f"{claude_profile.SANDBOX_CLIPBOARD_PORT_ENV}=7777" in argv
+
+
+def test_clipboard_host_handler_is_packaged() -> None:
+    handler = claude_profile._clipboard_host_handler()
+    assert handler.name == "clipboard_host.sh"
+    assert handler.exists()
+
+
+def test_launch_supervised_clipboard_only(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / SANDBOX_MARKER).touch()
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    fwd = claude_profile._Forwarding([], clipboard_port=7777)
+    monkeypatch.setattr(claude_profile, "_build_forwarding", lambda: fwd)
+    monkeypatch.setattr(claude_profile.shutil, "which", lambda _: "/usr/bin/tool")
+    host_bridges: list[tuple[Path, int]] = []
+
+    def fake_host_bridge(host: Path, port: int) -> Mock:
+        host_bridges.append((host, port))
+        return Mock()
+
+    clip_ports: list[int] = []
+
+    def fake_clip_bridge(port: int) -> Mock:
+        clip_ports.append(port)
+        return Mock()
+
+    monkeypatch.setattr(claude_profile, "_start_host_bridge", fake_host_bridge)
+    monkeypatch.setattr(
+        claude_profile, "_start_clipboard_host_bridge", fake_clip_bridge
+    )
+    monkeypatch.chdir(tmp_path)
+    with (
+        patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run,
+        patch("os.execvpe") as mock_exec,
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        _launch_profile("work", [])
+    assert exc_info.value.code == 0
+    mock_exec.assert_not_called()
+    run.assert_called_once()
+    assert any(arg.startswith("--network=pasta") for arg in run.call_args[0][0])
+    assert clip_ports == [7777]
+    assert host_bridges == []
+
+
+def test_launch_clipboard_no_wl_paste_exits(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / SANDBOX_MARKER).touch()
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    fwd = claude_profile._Forwarding([], clipboard_port=7777)
+    monkeypatch.setattr(claude_profile, "_build_forwarding", lambda: fwd)
+    # socat present on host, wl-paste absent.
+    monkeypatch.setattr(
+        claude_profile.shutil,
+        "which",
+        lambda name: None if name == "wl-paste" else "/usr/bin/socat",
+    )
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        _launch_profile("work", [])
+    assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# GitHub token (gh)
+# ---------------------------------------------------------------------------
+
+
+def test_gh_token_returns_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout="gho_abc123\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert claude_profile._gh_token() == "gho_abc123"
+
+
+def test_gh_token_none_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="not logged in")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert claude_profile._gh_token() is None
+
+
+def test_gh_token_none_when_gh_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert claude_profile._gh_token() is None
+
+
+def test_gh_token_none_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise subprocess.TimeoutExpired(cmd="gh", timeout=10)
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert claude_profile._gh_token() is None
+
+
+def test_with_gh_token_disabled_does_not_call_gh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def spy() -> str:
+        nonlocal called
+        called = True
+        return "gho_x"
+
+    monkeypatch.setattr(claude_profile, "_gh_token", spy)
+    assert claude_profile._with_gh_token({"A": "1"}) == {"A": "1"}
+    assert called is False
+
+
+def test_with_gh_token_injects_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_gh", True)
+    monkeypatch.setattr(claude_profile, "_gh_token", lambda: "gho_secret")
+    assert claude_profile._with_gh_token({"A": "1"}) == {
+        "A": "1",
+        "GH_TOKEN": "gho_secret",
+    }
+
+
+def test_with_gh_token_warns_when_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_gh", True)
+    monkeypatch.setattr(claude_profile, "_gh_token", lambda: None)
+    assert claude_profile._with_gh_token({"A": "1"}) == {"A": "1"}
 
 
 # ---------------------------------------------------------------------------

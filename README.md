@@ -234,6 +234,65 @@ prompt. Your `~/.gitconfig` is mounted read-only too, so `commit.gpgsign` and
 `user.signingkey` apply. Note: `gpg --list-secret-keys` looks empty inside the VM (the
 restricted socket hides key listing) — that's expected; signing still works.
 
+### Clipboard (image paste)
+
+Claude Code lets you paste an image (Ctrl+V) into the prompt. It reads the image by shelling
+out to `wl-paste`, which needs the desktop clipboard — something the microVM, with its own
+kernel and no display, can't reach. Enable a scoped clipboard bridge:
+
+```sh
+export CLAUDE_PROFILE_SANDBOX_CLIPBOARD=1
+claude-profile personal
+```
+
+A host `socat` runs your real `wl-paste` on demand and streams only the clipboard bytes into
+the VM over the pasta bridge; an in-VM `wl-paste` shim feeds them to Claude Code. Requires
+`wl-paste` on the host (`dnf install wl-clipboard`) and a Wayland session.
+
+**Security:** deliberately *not* full Wayland forwarding. Proxying the whole compositor (e.g.
+waypipe) would also hand the sandbox screen capture and keystroke injection into your focused
+window — a practical escape. This bridge is **read-only clipboard**: the sandbox can read
+what's on your clipboard while it runs, and nothing else. Like the agent forwards, it
+supervises the VM as a child process (for bridge teardown) instead of exec'ing it.
+
+### GitHub CLI
+
+The image ships `gh`. To let the agent act on your GitHub account (open PRs, comment, `gh api`),
+forward your login:
+
+```sh
+export CLAUDE_PROFILE_SANDBOX_GH=1
+claude-profile personal
+```
+
+`gh` stores its token in your system keyring (or `hosts.yml`), which the microVM can't reach, so
+`claude-profile` reads it on the host with `gh auth token` and passes it in as `GH_TOKEN` — the
+env var `gh` reads natively. No config file is mounted. If no token is found, you get a warning
+and `gh` is simply unauthenticated inside the VM.
+
+**Security:** this hands the sandbox a token with your account's scopes (yours are `repo`,
+`workflow`, `read:org`, `gist`) — the agent can do anything they allow, including pushing code and
+triggering workflows. It is off by default; enable it only when you want the agent working against
+your real GitHub account.
+
+### Nested containers (Podman)
+
+The image includes `podman`, so the agent can build and run containers inside the VM. They run
+**rootful** — use `sudo podman`:
+
+```sh
+sudo podman run --rm docker.io/library/alpine echo hi
+sudo podman build -t myimage .
+```
+
+Rootless podman doesn't work here (the nested user namespace can't be mapped), but the krun guest
+kernel treats uid 0 as real root, so `sudo podman` behaves like podman on a normal Fedora host,
+with fuse-overlayfs storage. Container networking works normally — external DNS and
+container-to-container name resolution both resolve — because the sandbox runs the microVM with a
+real guest network stack (`krun.use_passt=1`) instead of libkrun's default TSI socket
+impersonation. (TSI silently drops socket options like `SO_REUSEADDR`, which breaks gRPC, and
+intercepts container DNS.) This needs `passt` on the host and a recent crun/libkrun.
+
 ### Security
 
 A microVM raises the bar considerably but is not a perfect boundary. Networking stays open
@@ -255,6 +314,8 @@ article [Sandbox AI coding agents with microVMs on Fedora Linux](https://fedoram
 | `CLAUDE_PROFILE_SANDBOX_SKIP_PERMISSIONS` | `true` | Auto-add `--dangerously-skip-permissions` in sandbox mode |
 | `CLAUDE_PROFILE_SANDBOX_SSH_AGENT` | `false` | Forward your SSH agent(s) into the VM via a socat/pasta bridge |
 | `CLAUDE_PROFILE_SANDBOX_GPG_AGENT` | `false` | Forward your gpg-agent (signing) into the VM; seeds public keys, mounts `~/.gitconfig` |
+| `CLAUDE_PROFILE_SANDBOX_CLIPBOARD` | `false` | Bridge your clipboard into the VM (read-only) so image paste works; needs `wl-paste` on the host |
+| `CLAUDE_PROFILE_SANDBOX_GH` | `false` | Forward your GitHub login into the VM as `GH_TOKEN` (read via `gh auth token`) so `gh` acts as you |
 | `CLAUDE_PROFILE_SANDBOX` | _(unset)_ | Per-launch override: `1` forces microVM, `0` forces host; unset uses the profile's setting |
 
 ## License
