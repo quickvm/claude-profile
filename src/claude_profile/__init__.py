@@ -83,6 +83,7 @@ SANDBOX_BRIEFING = (
 # Curated dev tools advertised by the sandbox-tools skill (command name -> description).
 SANDBOX_SKILL_TOOLS: dict[str, str] = {
     "uv": "Python package/tool manager (uv tool install, uv run)",
+    "ty": "ty (Python type checker)",
     "python3": "Python 3 (with pyyaml and jinja2)",
     "jq": "JSON processor",
     "yq": "YAML processor",

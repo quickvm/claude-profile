@@ -25,10 +25,12 @@ RUN mkdir -p /etc/containers \
     && printf '[storage]\ndriver = "overlay"\n[storage.options.overlay]\nmount_program = "/usr/bin/fuse-overlayfs"\n' \
        > /etc/containers/storage.conf
 
-# Install uv + the native claude binary as the unprivileged user (into ~/.local/bin).
+# Install uv, the native claude binary, and ty as the unprivileged user (into
+# ~/.local/bin).
 USER appuser
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
-    && curl -fsSL https://claude.ai/install.sh | bash
+    && curl -fsSL https://claude.ai/install.sh | bash \
+    && /home/appuser/.local/bin/uv tool install ty
 USER root
 
 COPY entrypoint.sh /entrypoint.sh
