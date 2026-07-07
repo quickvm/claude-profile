@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import shutil
 import socket
@@ -602,6 +603,43 @@ def _git_common_dir(cwd: Path) -> Optional[Path]:
     return common.resolve() if common.is_absolute() else (cwd / common).resolve()
 
 
+def _sandbox_settings_overlay(profile_dir: Path) -> Optional[Path]:
+    """Write a sandbox-tuned settings.json (host sudo deny stripped) to mount in the VM.
+
+    The profile's settings.json is copied from the host and carries host-oriented deny
+    rules (e.g. ``Bash(sudo *)``) that still apply inside the VM — deny wins even under
+    --dangerously-skip-permissions. The microVM is the isolation boundary and grants
+    scoped sudo, so we strip those denies into an overlay mounted only in the VM; the
+    profile's real settings.json (used by host launches) is untouched. Returns the
+    overlay path, or None when there is no settings.json or nothing to strip.
+    """
+    src = profile_dir / "settings.json"
+    if not src.exists():
+        return None
+    try:
+        data = json.loads(src.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    perms = data.get("permissions")
+    if not isinstance(perms, dict) or not isinstance(perms.get("deny"), list):
+        return None
+    deny = perms["deny"]
+    kept = [
+        rule
+        for rule in deny
+        if not (isinstance(rule, str) and rule.startswith(SANDBOX_STRIP_DENY_PREFIXES))
+    ]
+    if len(kept) == len(deny):
+        return None
+    perms["deny"] = kept
+    overlay = profile_dir / "settings.sandbox.json"
+    try:
+        overlay.write_text(json.dumps(data, indent=2))
+    except OSError:
+        return None
+    return overlay
+
+
 def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
     """Build podman -v args: profile config, cwd, and the git common dir.
 
@@ -616,6 +654,11 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
         "-v",
         f"{cwd}:{cwd}:z",
     ]
+    overlay = _sandbox_settings_overlay(profile_dir)
+    if overlay is not None:
+        # Override just settings.json inside the VM; writes land in the throwaway
+        # overlay (regenerated each launch), not the profile's real settings.json.
+        mounts += ["-v", f"{overlay}:{SANDBOX_CONFIG_DIR}/settings.json:z"]
     git_dir = _git_common_dir(cwd)
     if git_dir is not None and git_dir != cwd and cwd not in git_dir.parents:
         mounts += ["-v", f"{git_dir}:{git_dir}:z"]

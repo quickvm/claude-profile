@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -830,6 +831,80 @@ def test_sandbox_mounts_skips_git_dir_inside_cwd(
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: cwd / ".git")
     mounts = _sandbox_mounts(tmp_path / "prof", cwd)
     assert mounts.count("-v") == 2
+
+
+# ---------------------------------------------------------------------------
+# _sandbox_settings_overlay
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_settings_overlay_strips_sudo(tmp_path: Path) -> None:
+    prof = tmp_path / "prof"
+    prof.mkdir()
+    (prof / "settings.json").write_text(
+        json.dumps(
+            {
+                "permissions": {
+                    "deny": [
+                        "Bash(sudo *)",
+                        "Read(~/.ssh/**)",
+                        "Edit(~/.ssh/**)",
+                        "Read(~/.aws/**)",
+                        "Bash(rm -rf *)",
+                        "Read(~/.gnupg/**)",
+                    ],
+                    "allow": ["Bash(git status*)"],
+                },
+                "env": {"X": "1"},
+            }
+        )
+    )
+    overlay = claude_profile._sandbox_settings_overlay(prof)
+    assert overlay is not None
+    assert overlay == prof / "settings.sandbox.json"
+    deny = json.loads(overlay.read_text())["permissions"]["deny"]
+    # sudo + ssh/aws guards stripped inside the VM.
+    assert not any(
+        r.startswith(("Bash(sudo", "Read(~/.ssh", "Edit(~/.ssh", "Read(~/.aws"))
+        for r in deny
+    )
+    # unrelated denies kept.
+    assert "Bash(rm -rf *)" in deny
+    assert "Read(~/.gnupg/**)" in deny
+    data = json.loads(overlay.read_text())
+    assert data["permissions"]["allow"] == ["Bash(git status*)"]  # rest preserved
+    assert data["env"] == {"X": "1"}
+
+
+def test_sandbox_settings_overlay_none_when_no_sudo_deny(tmp_path: Path) -> None:
+    prof = tmp_path / "prof"
+    prof.mkdir()
+    (prof / "settings.json").write_text(
+        json.dumps({"permissions": {"deny": ["Bash(rm -rf *)"]}})
+    )
+    assert claude_profile._sandbox_settings_overlay(prof) is None
+
+
+def test_sandbox_settings_overlay_none_when_no_settings(tmp_path: Path) -> None:
+    prof = tmp_path / "prof"
+    prof.mkdir()
+    assert claude_profile._sandbox_settings_overlay(prof) is None
+
+
+def test_sandbox_mounts_adds_settings_overlay(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prof = tmp_path / "prof"
+    prof.mkdir()
+    (prof / "settings.json").write_text(
+        json.dumps({"permissions": {"deny": ["Bash(sudo *)"]}})
+    )
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    mounts = _sandbox_mounts(prof, cwd)
+    overlay = prof / "settings.sandbox.json"
+    assert f"{overlay}:{claude_profile.SANDBOX_CONFIG_DIR}/settings.json:z" in mounts
 
 
 # ---------------------------------------------------------------------------
