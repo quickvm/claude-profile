@@ -15,16 +15,32 @@ the next launch**, and you have **passwordless `sudo` scoped to `dnf` and `podma
 
 ## Install what you need
 
-- **System package:** `sudo dnf install -y <pkg>` — e.g. `butane`, `gcc`, `nodejs`.
+- **System package:** `sudo dnf install -y <pkg>` — e.g. `gcc`, `strace`, `tcpdump`.
 - **Python CLI tool:** `uv tool install <tool>`
 - **Python library for a script:** `uv run --with <lib> python …` (or `uv pip install <lib>`).
 - **Node CLI:** `npx <tool>`, or `npm config set prefix ~/.local && npm i -g <tool>`.
+
+## Nested containers (podman)
+
+Run containers with **`sudo podman`** — they run rootful because the guest kernel treats uid 0 as
+real root; plain rootless `podman` can't unpack layers in the VM's user namespace. `sudo podman
+run`, `build`, and `pull` all work (fuse-overlayfs storage).
+
+Networking is normal: external DNS and container-to-container name resolution both work (the VM
+runs with a real guest netstack). So a multi-container app can use a user-defined network with
+service names as usual:
+
+```sh
+sudo podman network create app
+sudo podman run -d --network app --name db postgres:15
+sudo podman run -d --network app --name web -e DB_HOST=db web-image
+```
 
 ## Rules
 
 - **Never `sudo` a write to a mounted repo path** — a root write lands owned by a
   container subuid on the host and breaks ownership. Edit files as yourself; `sudo` is
-  restricted to `dnf` for exactly this reason.
+  scoped to `dnf` and `podman` for exactly this reason.
 - The VM has outbound network, so downloads work.
 - Use `trash <path>` instead of `rm -rf` (host policy blocks `rm -rf`).
 

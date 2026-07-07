@@ -858,6 +858,7 @@ def test_argv_has_krun_runtime_and_image(
     assert argv[0] == claude_profile.settings.podman_bin
     assert "run" in argv
     assert "run.oci.handler=krun" in argv
+    assert "krun.use_passt=1" in argv  # real guest netstack (not TSI)
     assert claude_profile.settings.sandbox_image in argv
     assert "claude" in argv
 

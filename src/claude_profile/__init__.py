@@ -685,6 +685,14 @@ def _build_sandbox_argv(
         f"krun.ram_mib={settings.sandbox_ram_mib}",
         "--annotation",
         f"krun.cpus={settings.sandbox_cpus}",
+        # passt networking (virtio-net + a real guest kernel netstack) instead of
+        # libkrun's default TSI socket impersonation. TSI stubs setsockopt — SO_REUSEADDR
+        # reads back 0, which aborts gRPC (and any set-then-verify sockopt) — and
+        # intercepts the guest's AF_INET sockets, which breaks nested-container DNS.
+        # passt fixes both. Needs `passt` on the host and a crun/libkrun with passt
+        # support (crun >= 1.21-ish, libkrun >= 1.9); older runtimes ignore it (→ TSI).
+        "--annotation",
+        "krun.use_passt=1",
         "--userns=keep-id",
         "--device",
         "/dev/kvm",

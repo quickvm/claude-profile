@@ -88,6 +88,24 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   SKILL.md from `SANDBOX_SKILL_TOOLS` filtered by what the image actually has (introspected
   via `podman run … command -v`); `--check` detects drift. Template lives at
   `src/claude_profile/sandbox_skill_template.md`.
+- **Nested containers (podman):** the image installs `podman` + `fuse-overlayfs`, scopes
+  passwordless sudo to `/usr/bin/podman`, and ships `/etc/containers/storage.conf` pinning
+  fuse-overlayfs. Containers run **rootful** via `sudo podman` — the krun guest kernel sees uid 0
+  as real root, so layer unpack works; rootless podman can't map the nested user namespace
+  (`newuidmap … Operation not permitted`) and native overlay isn't backable on the virtiofs root.
+  `run`/`build`/`pull`, TCP egress, external DNS, and container-to-container name resolution all
+  work, because `_build_sandbox_argv` runs the microVM with `krun.use_passt=1` (a real virtio-net
+  guest netstack). Without it libkrun defaults to TSI socket impersonation, whose stubbed
+  `setsockopt` reads `SO_REUSEADDR` back as 0 (aborting gRPC) and whose AF_INET interception breaks
+  container DNS — see the passt-networking note on `_build_sandbox_argv`.
+- **Sandbox settings overlay:** the profile's `settings.json` is copied from the host and carries
+  host-oriented deny rules; `deny` wins even under `--dangerously-skip-permissions`, so a blanket
+  `Bash(sudo *)` deny blocks the sandbox's own scoped `sudo dnf`/`sudo podman`.
+  `_sandbox_settings_overlay` writes `settings.sandbox.json` (the profile settings with any deny
+  matching `SANDBOX_STRIP_DENY_PREFIXES` — currently `Bash(sudo` — removed) and `_sandbox_mounts`
+  bind-mounts it over `settings.json` **inside the VM only**, read-write so in-VM setting writes
+  hit the throwaway overlay (regenerated each launch), not the real profile settings. Host launches
+  are untouched and keep the sudo deny.
 - **SSH agent forwarding (`sandbox_ssh_agent`):** a microVM can't bind-mount the agent
   socket (separate kernel), so `_ssh_agent_sockets()` lists the active agent + 1Password,
   `_start_host_bridge()` runs a host `socat` (TCP on 127.0.0.1 → the agent socket), and
