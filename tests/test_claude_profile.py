@@ -6,6 +6,7 @@ import base64
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Generator
 from unittest.mock import Mock, patch
@@ -53,6 +54,7 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_clipboard", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_gh", False)
+    monkeypatch.setattr(claude_profile.settings, "sandbox_infisical", "")
     # Default the image-user check to root so launch tests skip the real podman call.
     monkeypatch.setattr(claude_profile, "_sandbox_image_user", lambda: "")
 
@@ -1714,6 +1716,256 @@ def test_with_gh_token_warns_when_no_token(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(claude_profile.settings, "sandbox_gh", True)
     monkeypatch.setattr(claude_profile, "_gh_token", lambda: None)
     assert claude_profile._with_gh_token({"A": "1"}) == {"A": "1"}
+
+
+# ---------------------------------------------------------------------------
+# infisical login forwarding
+# ---------------------------------------------------------------------------
+
+
+def _make_jwt(exp: int) -> str:
+    """Minimal JWT whose payload carries the given exp (only the payload matters)."""
+    header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+    body = (
+        base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode())
+        .rstrip(b"=")
+        .decode()
+    )
+    return f"{header}.{body}.sig"
+
+
+def _keyring_blob(jwt: str) -> str:
+    return json.dumps(
+        {"JTWToken": jwt, "RefreshToken": "r", "email": "e@x", "privateKey": "p"}
+    )
+
+
+INFISICAL_USERS = [
+    {"email": "joe@quickvm.com", "domain": "https://infisical.quickvm.example/api"},
+    {"email": "alice@corp.example", "domain": "https://secrets.corp.example/api"},
+    {"email": "alice@home.example", "domain": "https://infisical.home.example/api"},
+]
+
+
+def _setup_infisical(
+    monkeypatch: pytest.MonkeyPatch, allowlist: str, tokens: dict[str, str | None]
+) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_infisical", allowlist)
+    monkeypatch.setattr(
+        claude_profile.shutil, "which", lambda _c: "/usr/bin/secret-tool"
+    )
+    monkeypatch.setattr(
+        claude_profile,
+        "_infisical_config",
+        lambda: {
+            "loggedInUsers": INFISICAL_USERS,
+            "loggedInUserEmail": "alice@corp.example",
+        },
+    )
+    monkeypatch.setattr(
+        claude_profile, "_infisical_token", lambda email: tokens.get(email)
+    )
+
+
+def test_jwt_expired_future_is_valid() -> None:
+    assert claude_profile._jwt_expired(_make_jwt(int(time.time()) + 10_000)) is False
+
+
+def test_jwt_expired_past_is_expired() -> None:
+    assert claude_profile._jwt_expired(_make_jwt(int(time.time()) - 10)) is True
+
+
+def test_jwt_expired_malformed() -> None:
+    assert claude_profile._jwt_expired("not-a-jwt") is True
+    assert claude_profile._jwt_expired("a.b") is True
+
+
+def test_jwt_expired_no_exp_claim() -> None:
+    header = base64.urlsafe_b64encode(b"{}").rstrip(b"=").decode()
+    body = base64.urlsafe_b64encode(b"{}").rstrip(b"=").decode()
+    assert claude_profile._jwt_expired(f"{header}.{body}.s") is True
+
+
+def test_infisical_token_returns_live_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    jwt = _make_jwt(int(time.time()) + 10_000)
+
+    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout=_keyring_blob(jwt))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert claude_profile._infisical_token("e@x") == jwt
+
+
+def test_infisical_token_none_when_expired(monkeypatch: pytest.MonkeyPatch) -> None:
+    jwt = _make_jwt(int(time.time()) - 10)
+
+    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout=_keyring_blob(jwt))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert claude_profile._infisical_token("e@x") is None
+
+
+def test_infisical_token_none_when_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 1, stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert claude_profile._infisical_token("e@x") is None
+
+
+def test_infisical_token_none_when_secret_tool_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert claude_profile._infisical_token("e@x") is None
+
+
+def test_infisical_login_matches() -> None:
+    user = {"email": "joe@quickvm.com", "domain": "https://infisical.quickvm.example/api"}
+    assert claude_profile._infisical_login_matches("joe@quickvm.com", user) is True
+    assert claude_profile._infisical_login_matches("quickvm.com", user) is True
+    assert claude_profile._infisical_login_matches("quickvm.example", user) is True
+    assert claude_profile._infisical_login_matches("corp.example", user) is False
+
+
+def test_infisical_logins_allowlist_and_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_infisical(
+        monkeypatch,
+        "corp.example,quickvm.com",
+        {"alice@corp.example": "tok-corp", "joe@quickvm.com": "tok-qvm"},
+    )
+    by_email = {login.email: login for login in claude_profile._infisical_logins()}
+    assert set(by_email) == {"alice@corp.example", "joe@quickvm.com"}
+    assert by_email["alice@corp.example"].active is True
+    assert by_email["joe@quickvm.com"].active is False
+    assert by_email["alice@corp.example"].token == "tok-corp"
+
+
+def test_infisical_logins_skips_expired(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_infisical(
+        monkeypatch,
+        "corp.example,quickvm.com",
+        {"alice@corp.example": "tok-corp", "joe@quickvm.com": None},
+    )
+    logins = claude_profile._infisical_logins()
+    assert [login.email for login in logins] == ["alice@corp.example"]
+
+
+def test_infisical_logins_no_match_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_infisical(monkeypatch, "nope.example", {})
+    assert claude_profile._infisical_logins() == []
+
+
+def test_infisical_logins_disabled_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_infisical", "")
+    assert claude_profile._infisical_logins() == []
+
+
+def test_infisical_logins_no_secret_tool_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_infisical", "corp.example")
+    monkeypatch.setattr(claude_profile.shutil, "which", lambda _c: None)
+    assert claude_profile._infisical_logins() == []
+
+
+def test_with_infisical_env_disabled_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_infisical", "")
+    assert claude_profile._with_infisical_env({"A": "1"}) == {"A": "1"}
+
+
+def test_with_infisical_env_forwards_primary_and_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_infisical(
+        monkeypatch,
+        "quickvm.com,corp.example",
+        {"joe@quickvm.com": "tok-qvm", "alice@corp.example": "tok-corp"},
+    )
+    env = claude_profile._with_infisical_env({"A": "1"})
+    assert env["A"] == "1"
+    # active login (corp.example) is primary even though quickvm is listed first
+    assert env["INFISICAL_TOKEN"] == "tok-corp"
+    assert env["INFISICAL_API_URL"] == "https://secrets.corp.example/api"
+    assert env["INFISICAL_DOMAIN"] == "https://secrets.corp.example/api"
+    profiles = json.loads(env["CLAUDE_SANDBOX_INFISICAL"])
+    assert {p["email"] for p in profiles} == {"joe@quickvm.com", "alice@corp.example"}
+    assert all({"email", "domain", "token"} <= set(p) for p in profiles)
+
+
+def test_with_infisical_env_primary_falls_back_to_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # allowlist excludes the active login; primary falls back to the first match
+    _setup_infisical(
+        monkeypatch,
+        "quickvm.com,home.example",
+        {"joe@quickvm.com": "tok-qvm", "alice@home.example": "tok-home"},
+    )
+    env = claude_profile._with_infisical_env({})
+    assert env["INFISICAL_TOKEN"] == "tok-qvm"
+    assert env["INFISICAL_DOMAIN"] == "https://infisical.quickvm.example/api"
+
+
+def test_with_infisical_env_all_expired_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_infisical(monkeypatch, "corp.example", {"alice@corp.example": None})
+    assert claude_profile._with_infisical_env({"A": "1"}) == {"A": "1"}
+
+
+def test_infisical_briefing_from_env() -> None:
+    extra = {
+        "INFISICAL_DOMAIN": "https://secrets.corp.example/api",
+        "CLAUDE_SANDBOX_INFISICAL": json.dumps(
+            [
+                {
+                    "email": "alice@corp.example",
+                    "domain": "https://secrets.corp.example/api",
+                    "token": "t",
+                }
+            ]
+        ),
+    }
+    note = claude_profile._infisical_briefing(extra)
+    assert "alice@corp.example" in note
+    assert "--domain" in note
+
+
+def test_infisical_briefing_empty_when_absent() -> None:
+    assert claude_profile._infisical_briefing({"A": "1"}) == ""
+
+
+def test_argv_includes_infisical_briefing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    extra = {
+        "INFISICAL_DOMAIN": "https://secrets.corp.example/api",
+        "CLAUDE_SANDBOX_INFISICAL": json.dumps(
+            [
+                {
+                    "email": "alice@corp.example",
+                    "domain": "https://secrets.corp.example/api",
+                    "token": "t",
+                }
+            ]
+        ),
+    }
+    argv = _build_sandbox_argv(profile, cwd, [], extra)
+    briefing = argv[argv.index("--append-system-prompt") + 1]
+    assert "infisical" in briefing.lower()
+    assert "alice@corp.example" in briefing
 
 
 # ---------------------------------------------------------------------------

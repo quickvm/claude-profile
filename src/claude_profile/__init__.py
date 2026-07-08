@@ -9,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -37,6 +38,9 @@ class Settings(BaseSettings):
     sandbox_gpg_agent: bool = Field(default=False)
     sandbox_clipboard: bool = Field(default=False)
     sandbox_gh: bool = Field(default=False)
+    # Allowlist of infisical logins to forward into the sandbox: comma-separated
+    # emails or domain substrings (e.g. "corp.example,quickvm.com"). Empty = disabled.
+    sandbox_infisical: str = Field(default="")
     # Per-launch override of the .sandbox marker (CLAUDE_PROFILE_SANDBOX). None = use marker.
     sandbox: Optional[bool] = Field(default=None)
 
@@ -89,6 +93,7 @@ SANDBOX_SKILL_TOOLS: dict[str, str] = {
     "yq": "YAML processor",
     "git": "Git",
     "gh": "GitHub CLI",
+    "infisical": "Infisical CLI (secrets management)",
     "rg": "ripgrep (fast search)",
     "fd": "fd (fast file finder)",
     "make": "make",
@@ -767,7 +772,10 @@ def _build_sandbox_argv(
     if settings.sandbox_skip_permissions and SKIP_PERMISSIONS_FLAG not in args:
         args.append(SKIP_PERMISSIONS_FLAG)
     if "--append-system-prompt" not in args:
-        args += ["--append-system-prompt", SANDBOX_BRIEFING]
+        args += [
+            "--append-system-prompt",
+            SANDBOX_BRIEFING + _infisical_briefing(extra_env),
+        ]
     return argv + args
 
 
@@ -937,6 +945,179 @@ def _with_gh_token(extra_env: dict[str, str]) -> dict[str, str]:
     return {**extra_env, "GH_TOKEN": token}
 
 
+@dataclass
+class _InfisicalLogin:
+    email: str
+    domain: str
+    token: str
+    active: bool
+
+
+def _jwt_expired(token: str) -> bool:
+    """True if a JWT is malformed or past its exp (30s buffer, matching the CLI)."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return True
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+    except (ValueError, json.JSONDecodeError):
+        return True
+    exp = payload.get("exp")
+    if not isinstance(exp, (int, float)):
+        return True
+    return exp <= time.time() + 30
+
+
+def _infisical_token(email: str) -> Optional[str]:
+    """Return the live access token for an infisical login from the OS keyring.
+
+    The CLI stores each login as a JSON ``UserCredentials`` blob under the keyring
+    service ``infisical-cli`` keyed by email. Returns the access JWT only when it is
+    present and unexpired — the CLI cannot refresh, so an expired token is dead.
+    """
+    try:
+        result = subprocess.run(
+            ["secret-tool", "lookup", "service", "infisical-cli", "username", email],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    try:
+        blob = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    token = blob.get("JTWToken")
+    if not isinstance(token, str) or _jwt_expired(token):
+        return None
+    return token
+
+
+def _infisical_config() -> dict:
+    """Parse the host infisical config, or an empty dict if absent/unreadable."""
+    path = Path.home() / ".infisical" / "infisical-config.json"
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _infisical_login_matches(entry: str, user: dict) -> bool:
+    """True if an allowlist entry matches a login by email or domain substring."""
+    email = (user.get("email") or "").lower()
+    domain = (user.get("domain") or "").lower()
+    return entry == email or entry in email or entry in domain
+
+
+def _infisical_logins() -> list[_InfisicalLogin]:
+    """Resolve the allowlisted, still-valid infisical logins to forward.
+
+    ``sandbox_infisical`` is a comma-separated allowlist of emails or domain
+    substrings. Each entry is matched against the host's logged-in infisical users;
+    matches whose keyring token is live are returned. Entries matching nothing, and
+    matched logins whose token has expired, are warned about and skipped.
+    """
+    allow = [
+        a.strip().lower() for a in settings.sandbox_infisical.split(",") if a.strip()
+    ]
+    if not allow:
+        return []
+    if shutil.which("secret-tool") is None:
+        err_console.print(
+            "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_INFISICAL is set but 'secret-tool' "
+            "is not installed, so infisical tokens can't be read from the keyring. "
+            "Install libsecret (provides secret-tool).[/yellow]"
+        )
+        return []
+    config = _infisical_config()
+    users = config.get("loggedInUsers") or []
+    active_email = config.get("loggedInUserEmail") or ""
+    logins: list[_InfisicalLogin] = []
+    seen: set[str] = set()
+    for entry in allow:
+        matches = [u for u in users if _infisical_login_matches(entry, u)]
+        if not matches:
+            err_console.print(
+                f"[yellow]Warning: no logged-in infisical user matches '{entry}' "
+                f"(from CLAUDE_PROFILE_SANDBOX_INFISICAL).[/yellow]"
+            )
+            continue
+        for user in matches:
+            email = user.get("email", "")
+            if not email or email in seen:
+                continue
+            token = _infisical_token(email)
+            if token is None:
+                err_console.print(
+                    f"[yellow]Warning: infisical login '{email}' has no valid token "
+                    f"(expired — run `infisical login` on the host); skipping.[/yellow]"
+                )
+                continue
+            seen.add(email)
+            logins.append(
+                _InfisicalLogin(
+                    email, user.get("domain", ""), token, email == active_email
+                )
+            )
+    return logins
+
+
+def _with_infisical_env(extra_env: dict[str, str]) -> dict[str, str]:
+    """Forward allowlisted infisical logins into the sandbox as env vars.
+
+    infisical keeps login tokens in the OS keyring, which a microVM can't reach, so
+    we read them on the host and forward: the primary (the active login if it is
+    allowlisted, else the first match) as INFISICAL_TOKEN plus INFISICAL_API_URL/
+    INFISICAL_DOMAIN so infisical works with no extra flags, and every allowlisted
+    login as CLAUDE_SANDBOX_INFISICAL (JSON) so the agent can target a specific one
+    with --token/--domain. The host keyring is left untouched.
+    """
+    if not settings.sandbox_infisical:
+        return extra_env
+    logins = _infisical_logins()
+    if not logins:
+        return extra_env
+    primary = next((login for login in logins if login.active), logins[0])
+    profiles = [
+        {"email": login.email, "domain": login.domain, "token": login.token}
+        for login in logins
+    ]
+    return {
+        **extra_env,
+        "INFISICAL_TOKEN": primary.token,
+        "INFISICAL_API_URL": primary.domain,
+        "INFISICAL_DOMAIN": primary.domain,
+        "CLAUDE_SANDBOX_INFISICAL": json.dumps(profiles),
+    }
+
+
+def _infisical_briefing(extra_env: dict[str, str]) -> str:
+    """System-prompt note describing the forwarded infisical logins, or ''."""
+    raw = extra_env.get("CLAUDE_SANDBOX_INFISICAL")
+    if not raw:
+        return ""
+    try:
+        profiles = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    listing = ", ".join(f"{p['email']} ({p['domain']})" for p in profiles)
+    primary_domain = extra_env.get("INFISICAL_DOMAIN", "")
+    return (
+        " The infisical CLI is authenticated: INFISICAL_TOKEN and INFISICAL_API_URL "
+        f"point at your primary org ({primary_domain}), so `infisical secrets "
+        "--projectId … --env …` works as-is. Allowlisted logins (JSON in "
+        f"$CLAUDE_SANDBOX_INFISICAL): {listing}. To use a non-primary org, pass its "
+        "--token and --domain from that JSON — the env domain overrides any repo "
+        ".infisical.json, so always pass --domain for non-primary orgs. Forwarded "
+        "tokens expire in ~10 days and the keyring stays on the host, so re-launch to "
+        "refresh them."
+    )
+
+
 def _launch_sandbox(
     profile_dir: Path, claude_args: list[str], extra_env: dict[str, str]
 ) -> None:
@@ -951,6 +1132,7 @@ def _launch_sandbox(
             f"[/yellow]"
         )
     extra_env = _with_gh_token(extra_env)
+    extra_env = _with_infisical_env(extra_env)
     cwd = Path.cwd()
     forwarding = _build_forwarding()
     if forwarding.active():
