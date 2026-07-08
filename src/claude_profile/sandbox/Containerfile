@@ -10,6 +10,14 @@ RUN dnf install -y \
       nodejs22 nodejs22-npm python3-pyyaml python3-jinja2 \
     && dnf clean all
 
+# Infisical CLI (secrets management), from Infisical's own package host — Cloudsmith
+# is being retired. The setup script configures the dnf repo; the binary is a static
+# Go executable. claude-profile forwards your infisical login token into the VM via
+# env (CLAUDE_PROFILE_SANDBOX_INFISICAL); this provides the CLI that consumes it.
+RUN curl -1sLf https://artifacts-cli.infisical.com/setup.rpm.sh | bash \
+    && dnf install -y infisical \
+    && dnf clean all
+
 # Passwordless sudo scoped to the package manager plus podman: the agent can install
 # missing system packages and run nested containers, but cannot sudo-write into the
 # bind mounts. Podman runs rootful (`sudo podman`) because the guest kernel sees uid 0
