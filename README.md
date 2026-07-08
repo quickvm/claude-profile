@@ -275,6 +275,32 @@ and `gh` is simply unauthenticated inside the VM.
 triggering workflows. It is off by default; enable it only when you want the agent working against
 your real GitHub account.
 
+### Infisical
+
+The image ships the `infisical` CLI. To let the agent read your secrets, allowlist which of your
+infisical logins to forward — by email or a domain substring, comma-separated:
+
+```sh
+export CLAUDE_PROFILE_SANDBOX_INFISICAL="corp.example,quickvm.com"
+claude-profile personal
+```
+
+`infisical` keeps its login token in your system keyring, which the microVM can't reach. For each
+allowlisted, non-expired login, `claude-profile` reads the token on the host and forwards it as
+env: the primary (your active login if it's allowlisted, else the first match) becomes
+`INFISICAL_TOKEN` + `INFISICAL_API_URL`, so `infisical secrets --projectId … --env …` works with no
+extra flags; every allowlisted login is also placed in `CLAUDE_SANDBOX_INFISICAL` (JSON) so the
+agent can target a non-primary org with `--token`/`--domain`. The keyring is never modified and
+nothing is written to disk.
+
+Only currently-valid logins are forwarded — the CLI can't refresh, so an expired login is skipped
+with a warning until you re-run `infisical login` on the host. Forwarded tokens are good for ~10
+days. The primary domain is set globally, which **overrides any repo's `.infisical.json`**, so for
+a non-primary org always pass `--domain` explicitly.
+
+**Security:** each forwarded token grants the sandbox that login's full access to your secrets. It
+is off by default and takes an explicit allowlist — no login is forwarded unless you name it.
+
 ### Nested containers (Podman)
 
 The image includes `podman`, so the agent can build and run containers inside the VM. They run
@@ -316,6 +342,7 @@ article [Sandbox AI coding agents with microVMs on Fedora Linux](https://fedoram
 | `CLAUDE_PROFILE_SANDBOX_GPG_AGENT` | `false` | Forward your gpg-agent (signing) into the VM; seeds public keys, mounts `~/.gitconfig` |
 | `CLAUDE_PROFILE_SANDBOX_CLIPBOARD` | `false` | Bridge your clipboard into the VM (read-only) so image paste works; needs `wl-paste` on the host |
 | `CLAUDE_PROFILE_SANDBOX_GH` | `false` | Forward your GitHub login into the VM as `GH_TOKEN` (read via `gh auth token`) so `gh` acts as you |
+| `CLAUDE_PROFILE_SANDBOX_INFISICAL` | _(empty)_ | Allowlist (comma-separated emails/domains) of infisical logins to forward into the VM as `INFISICAL_TOKEN`/`--token` |
 | `CLAUDE_PROFILE_SANDBOX` | _(unset)_ | Per-launch override: `1` forces microVM, `0` forces host; unset uses the profile's setting |
 
 ## License

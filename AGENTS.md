@@ -79,7 +79,7 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   already passed it.
 - **Sandbox settings:** `podman_bin`, `sandbox_image`, `sandbox_ram_mib`, `sandbox_cpus`,
   `sandbox_skip_permissions`, `sandbox_ssh_agent`, `sandbox_gpg_agent`, `sandbox_clipboard`,
-  `sandbox_gh` (all read from `CLAUDE_PROFILE_*`).
+  `sandbox_gh`, `sandbox_infisical` (all read from `CLAUDE_PROFILE_*`).
 - **Agent self-provisioning:** the image bakes common dev tools (`uv`, jq/yq,
   python+pyyaml/jinja2, make/openssl/trash) plus `dnf`-scoped passwordless sudo, so the
   agent installs missing tools ad-hoc (`sudo dnf install`, `uv tool install`; ephemeral).
@@ -139,6 +139,20 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   as `GH_TOKEN` (the env var gh reads natively) into the sandbox env — no config mount. A
   missing/failed token warns and continues (gh stays unauthenticated). The token grants the
   sandbox whatever the login's scopes allow, so it is opt-in.
+- **Infisical (`sandbox_infisical`):** the image bakes the `infisical` CLI; `sandbox_infisical` is
+  an allowlist (comma-separated emails or domain substrings) of infisical logins to forward. The
+  CLI stores each login as a JSON `UserCredentials` blob in the OS keyring (service `infisical-cli`,
+  keyed by email), which a microVM can't reach. `_infisical_logins()` matches the allowlist against
+  the host's `~/.infisical/infisical-config.json` `loggedInUsers`, reads each match's token from the
+  keyring via `secret-tool`, and drops any whose access JWT is expired (the CLI can't refresh, so an
+  expired login is dead until `infisical login`). `_with_infisical_env` forwards the primary (active
+  login if allowlisted, else first) as `INFISICAL_TOKEN` + `INFISICAL_API_URL`/`INFISICAL_DOMAIN` (so
+  zero-flag use works) and all matches as `CLAUDE_SANDBOX_INFISICAL` (JSON) for `--token`/`--domain`
+  targeting; `_infisical_briefing` appends a usage note to the system prompt. Env-only, keyring
+  untouched. `INFISICAL_API_URL` (not the newer `INFISICAL_DOMAIN`, unsupported on older CLIs) is the
+  reliable domain override, and it beats a repo's `.infisical.json`, so non-primary orgs need an
+  explicit `--domain`. Each token grants full access to that login's secrets, so it is opt-in via
+  explicit allowlist.
 - **`sandbox` subcommand & override:** `sandbox <name> --on/--off` toggles the `.sandbox`
   marker on an existing profile (shows status when no flag). `_sandbox_enabled()` decides
   per launch: the `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state
