@@ -56,6 +56,7 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(claude_profile.settings, "sandbox_gh", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_infisical", "")
     monkeypatch.setattr(claude_profile.settings, "sandbox_pulumi", False)
+    monkeypatch.setattr(claude_profile.settings, "sandbox_forward_env", "")
     # Default the image-user check to root so launch tests skip the real podman call.
     monkeypatch.setattr(claude_profile, "_sandbox_image_user", lambda: "")
 
@@ -2038,6 +2039,39 @@ def test_with_pulumi_token_warns_when_no_token(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(claude_profile.settings, "sandbox_pulumi", True)
     monkeypatch.setattr(claude_profile, "_pulumi_token", lambda: None)
     assert claude_profile._with_pulumi_token({"A": "1"}) == {"A": "1"}
+
+
+# ---------------------------------------------------------------------------
+# host env-var forwarding
+# ---------------------------------------------------------------------------
+
+
+def test_with_forwarded_env_disabled_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_forward_env", "")
+    monkeypatch.setenv("SOME_TOKEN", "x")
+    assert claude_profile._with_forwarded_env({"A": "1"}) == {"A": "1"}
+
+
+def test_with_forwarded_env_forwards_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        claude_profile.settings, "sandbox_forward_env", "FOO_TOKEN, BAR_TOKEN"
+    )
+    monkeypatch.setenv("FOO_TOKEN", "foo-val")
+    monkeypatch.setenv("BAR_TOKEN", "bar-val")
+    assert claude_profile._with_forwarded_env({"A": "1"}) == {
+        "A": "1",
+        "FOO_TOKEN": "foo-val",
+        "BAR_TOKEN": "bar-val",
+    }
+
+
+def test_with_forwarded_env_skips_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        claude_profile.settings, "sandbox_forward_env", "PRESENT_V,MISSING_V"
+    )
+    monkeypatch.setenv("PRESENT_V", "here")
+    monkeypatch.delenv("MISSING_V", raising=False)
+    assert claude_profile._with_forwarded_env({}) == {"PRESENT_V": "here"}
 
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     # emails or domain substrings (e.g. "corp.example,quickvm.com"). Empty = disabled.
     sandbox_infisical: str = Field(default="")
     sandbox_pulumi: bool = Field(default=False)
+    # Comma-separated names of host env vars to copy into the sandbox (e.g. tokens that
+    # host-oriented MCP servers pass through as `-e VAR`). Empty = none forwarded.
+    sandbox_forward_env: str = Field(default="")
     # Per-launch override of the .sandbox marker (CLAUDE_PROFILE_SANDBOX). None = use marker.
     sandbox: Optional[bool] = Field(default=None)
 
@@ -79,9 +82,9 @@ SANDBOX_BRIEFING = (
     "rest of the host filesystem is not, which is why --dangerously-skip-permissions is "
     "safe here. Anything you install is discarded when the session ends, and you have "
     "passwordless sudo scoped to dnf and podman. To add a missing tool use `sudo dnf "
-    "install <pkg>` or `uv tool install <tool>` (see the sandbox-tools skill). To run "
-    "nested containers use `sudo podman` (rootful — plain `podman` runs rootless and "
-    "can't unpack layers in the VM's user namespace). If you need a tool made "
+    "install <pkg>` or `uv tool install <tool>` (see the sandbox-tools skill). Nested "
+    "containers run rootful automatically — just use `podman` (it is wrapped to sudo "
+    "because rootless can't unpack layers in the VM's user namespace). If you need a tool made "
     "permanent, access outside the mounted paths, or anything the sandbox blocks, ask "
     "the user instead of working around it."
 )
@@ -106,7 +109,7 @@ SANDBOX_SKILL_TOOLS: dict[str, str] = {
     "ssh": "OpenSSH client",
     "gpg": "GnuPG",
     "socat": "socat",
-    "podman": "Podman — run nested containers with `sudo podman`",
+    "podman": "Podman — run nested containers (runs rootful automatically)",
     "node": "Node.js",
     "npm": "npm",
     "butane": "Butane (Ignition config compiler)",
@@ -1159,6 +1162,30 @@ def _with_pulumi_token(extra_env: dict[str, str]) -> dict[str, str]:
     return {**extra_env, "PULUMI_ACCESS_TOKEN": token}
 
 
+def _with_forwarded_env(extra_env: dict[str, str]) -> dict[str, str]:
+    """Forward named host env vars into the sandbox (sandbox_forward_env).
+
+    A comma-separated list of variable names; each one present in the host environment
+    is copied into the VM. Lets host-oriented MCP servers that pass secrets through as
+    ``-e VAR`` (e.g. BUILDKITE_API_TOKEN, GITHUB_PERSONAL_ACCESS_TOKEN) find them inside
+    the VM. Names not set on the host are warned about and skipped.
+    """
+    names = [n.strip() for n in settings.sandbox_forward_env.split(",") if n.strip()]
+    if not names:
+        return extra_env
+    forwarded = dict(extra_env)
+    for name in names:
+        value = os.environ.get(name)
+        if value is None:
+            err_console.print(
+                f"[yellow]Warning: CLAUDE_PROFILE_SANDBOX_FORWARD_ENV lists '{name}' but "
+                f"it is not set in the environment; skipping.[/yellow]"
+            )
+            continue
+        forwarded[name] = value
+    return forwarded
+
+
 def _launch_sandbox(
     profile_dir: Path, claude_args: list[str], extra_env: dict[str, str]
 ) -> None:
@@ -1175,6 +1202,7 @@ def _launch_sandbox(
     extra_env = _with_gh_token(extra_env)
     extra_env = _with_infisical_env(extra_env)
     extra_env = _with_pulumi_token(extra_env)
+    extra_env = _with_forwarded_env(extra_env)
     cwd = Path.cwd()
     forwarding = _build_forwarding()
     if forwarding.active():
