@@ -58,6 +58,8 @@ SANDBOX_MARKER = ".sandbox"
 SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 SANDBOX_CONFIG_DIR = "/home/appuser/.claude"
 SANDBOX_GNUPGHOME = "/home/appuser/.gnupg"
+# In-VM path where the shared, read-only MCP image store is mounted (additionalimagestore).
+SANDBOX_IMAGE_STORE = "/var/lib/shared-mcp-store"
 # Env var carrying the host clipboard-bridge TCP port to the in-VM wl-paste shim.
 SANDBOX_CLIPBOARD_PORT_ENV = "CLAUDE_SANDBOX_CLIPBOARD_PORT"
 # Deny-rule prefixes stripped from the in-VM settings overlay: host guardrails that
@@ -119,6 +121,23 @@ app = typer.Typer(
     name="claude-profile",
     help="Launch Claude Code with isolated config directories per profile.",
     no_args_is_help=True,
+)
+
+# First-arg tokens that are subcommands, not profile names: main() treats any other
+# non-flag first arg as a profile to launch, so every @app.command must be listed here
+# (a test enforces this).
+KNOWN_COMMANDS: frozenset[str] = frozenset(
+    {
+        "list",
+        "add",
+        "remove",
+        "links",
+        "env",
+        "build",
+        "sandbox",
+        "sandbox-skill",
+        "sandbox-cache",
+    }
 )
 
 
@@ -343,6 +362,151 @@ def sandbox_skill(
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(content)
     console.print(f"[green]Wrote {dest}[/green]")
+
+
+def _image_cache_dir() -> Path:
+    """Host directory holding the shared, read-only MCP image store (XDG data)."""
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "claude-profile" / "image-store"
+
+
+def _image_ref_from_args(args: list) -> Optional[str]:
+    """Pick the container image ref out of a podman/docker ``run`` arg list.
+
+    The image is the first arg that is not a flag or path and whose first path segment
+    looks like a registry host (has a ``.`` or ``:``), which distinguishes a
+    fully-qualified ref like ``ghcr.io/o/i:tag`` from ``-v``/``-e`` flag values.
+    """
+    for arg in args:
+        if not isinstance(arg, str) or arg.startswith(("-", "/")) or "/" not in arg:
+            continue
+        host = arg.split("/", 1)[0]
+        if "." in host or ":" in host:
+            return arg
+    return None
+
+
+def _mcp_container_images(profile_dir: Path) -> list[str]:
+    """Return the image refs used by the profile's podman/docker MCP servers.
+
+    Reads the profile's ``.claude.json`` (user-scope and per-project ``mcpServers``)
+    and extracts the image from each stdio server run via podman/docker. De-duplicated.
+    """
+    config = profile_dir / ".claude.json"
+    try:
+        data = json.loads(config.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    blocks = [data.get("mcpServers")]
+    projects = data.get("projects")
+    if isinstance(projects, dict):
+        blocks += [
+            p.get("mcpServers") for p in projects.values() if isinstance(p, dict)
+        ]
+    images: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        for server in block.values():
+            if not isinstance(server, dict) or server.get("command") not in (
+                "podman",
+                "docker",
+            ):
+                continue
+            image = _image_ref_from_args(server.get("args") or [])
+            if image and image not in images:
+                images.append(image)
+    return images
+
+
+def _image_store_populated(store: Path) -> bool:
+    """True if the host image store has been populated with images."""
+    return (store / "overlay-images").is_dir()
+
+
+def _run_checked(cmd: list[str]) -> None:
+    """Run a command, exiting with a clear message on failure."""
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError:
+        err_console.print(f"[red]'{cmd[0]}' not found.[/red]")
+        raise typer.Exit(code=1) from None
+    except subprocess.CalledProcessError as exc:
+        err_console.print(f"[red]{cmd[0]} failed (exit {exc.returncode}).[/red]")
+        raise typer.Exit(code=1) from None
+
+
+def _cache_driver_args(fuse: str) -> list[str]:
+    return [
+        "--storage-driver",
+        "overlay",
+        "--storage-opt",
+        f"overlay.mount_program={fuse}",
+    ]
+
+
+def _cache_pull(store: Path, fuse: str, images: list[str]) -> None:
+    """Pull images into the store and make it readable by the VM's mapped root."""
+    store.mkdir(parents=True, exist_ok=True)
+    console.print(f"Caching {len(images)} image(s) into [cyan]{store}[/cyan] ...")
+    for image in images:
+        console.print(f"  pulling {image}")
+        _run_checked(
+            [
+                settings.podman_bin,
+                "--root",
+                str(store),
+                *_cache_driver_args(fuse),
+                "pull",
+                image,
+            ]
+        )
+    # The VM's rootful podman runs as a mapped uid, so the store must be world-readable.
+    _run_checked([settings.podman_bin, "unshare", "chmod", "-R", "a+rX", str(store)])
+    console.print(
+        f"[green]Cached {len(images)} image(s); the sandbox mounts them read-only.[/green]"
+    )
+
+
+@app.command("sandbox-cache")
+def sandbox_cache(
+    name: str = typer.Argument(..., help="Profile whose MCP images to cache"),
+    clear: bool = typer.Option(False, "--clear", help="Empty the image cache instead."),
+) -> None:
+    """Pre-pull a profile's podman-run MCP images into a shared store the sandbox mounts
+    read-only, so they are not re-pulled on every microVM launch."""
+    store = _image_cache_dir()
+    fuse = shutil.which("fuse-overlayfs")
+    if fuse is None:
+        err_console.print(
+            "[red]'fuse-overlayfs' not found on host.[/red] Install it "
+            "(dnf install fuse-overlayfs)."
+        )
+        raise typer.Exit(code=1)
+    if clear:
+        if store.exists():
+            _run_checked(
+                [
+                    settings.podman_bin,
+                    "--root",
+                    str(store),
+                    *_cache_driver_args(fuse),
+                    "system",
+                    "reset",
+                    "--force",
+                ]
+            )
+        console.print(f"[green]Image cache cleared ({store}).[/green]")
+        return
+    profile_dir = settings.profiles_base / name
+    if not profile_dir.exists():
+        err_console.print(f"[red]Profile '{name}' does not exist.[/red]")
+        raise typer.Exit(code=1)
+    images = _mcp_container_images(profile_dir)
+    if not images:
+        console.print(f"No podman/docker MCP images found in profile '{name}'.")
+        return
+    _cache_pull(store, fuse, images)
 
 
 @app.command("sandbox")
@@ -651,6 +815,43 @@ def _sandbox_settings_overlay(profile_dir: Path) -> Optional[Path]:
     return overlay
 
 
+def _storage_cache_conf(profile_dir: Path) -> Path:
+    """Write the storage.conf overlay adding the mounted store as a read-only
+    additionalimagestore (regenerated each launch), and return its path."""
+    conf = profile_dir / "storage.sandbox.conf"
+    conf.write_text(
+        "[storage]\n"
+        'driver = "overlay"\n'
+        'graphroot = "/var/lib/containers/storage"\n'
+        'runroot = "/run/containers/storage"\n'
+        "[storage.options]\n"
+        f'additionalimagestores = ["{SANDBOX_IMAGE_STORE}"]\n'
+        "[storage.options.overlay]\n"
+        'mount_program = "/usr/bin/fuse-overlayfs"\n'
+    )
+    return conf
+
+
+def _image_cache_mounts(profile_dir: Path) -> list[str]:
+    """Mounts exposing the shared MCP image store to the VM, when it is populated.
+
+    Bind-mounts the host store read-only at the additionalimagestore path and a
+    storage.conf overlay pointing podman at it, so podman/MCP servers find images
+    locally instead of pulling. Returns [] when the store is empty/absent, leaving
+    the image's default storage config (pull-on-demand) in place.
+    """
+    store = _image_cache_dir()
+    if not _image_store_populated(store):
+        return []
+    conf = _storage_cache_conf(profile_dir)
+    return [
+        "-v",
+        f"{store}:{SANDBOX_IMAGE_STORE}:ro,z",
+        "-v",
+        f"{conf}:/etc/containers/storage.conf:ro,z",
+    ]
+
+
 def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
     """Build podman -v args: profile config, cwd, and the git common dir.
 
@@ -680,6 +881,7 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
     if known_hosts.exists():
         mounts += ["-v", f"{known_hosts}:/home/appuser/.ssh/known_hosts:ro,z"]
     mounts += _linked_dir_mounts(profile_dir)
+    mounts += _image_cache_mounts(profile_dir)
     return mounts
 
 
@@ -1284,18 +1486,8 @@ def _launch_profile(name: str, claude_args: list[str]) -> None:
 
 
 def main() -> None:
-    _KNOWN_COMMANDS = {
-        "list",
-        "add",
-        "remove",
-        "links",
-        "env",
-        "build",
-        "sandbox",
-        "sandbox-skill",
-    }
     args = sys.argv[1:]
-    if args and args[0] not in _KNOWN_COMMANDS and not args[0].startswith("-"):
+    if args and args[0] not in KNOWN_COMMANDS and not args[0].startswith("-"):
         _launch_profile(args[0], args[1:])
     else:
         app()

@@ -2075,6 +2075,124 @@ def test_with_forwarded_env_skips_missing(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 # ---------------------------------------------------------------------------
+# MCP image cache
+# ---------------------------------------------------------------------------
+
+
+def test_image_ref_from_args_picks_registry_ref() -> None:
+    f = claude_profile._image_ref_from_args
+    assert (
+        f(["run", "-i", "--rm", "-e", "TOKEN", "ghcr.io/org/img:latest", "stdio"])
+        == "ghcr.io/org/img:latest"
+    )
+    # a -v path and an -e value must not be mistaken for the image
+    assert (
+        f(
+            [
+                "run",
+                "--rm",
+                "-v",
+                "/home/u:/home/u:ro",
+                "-e",
+                "HOME=/tmp",
+                "docker.io/mcp/x:1",
+            ]
+        )
+        == "docker.io/mcp/x:1"
+    )
+    assert f(["run", "--rm", "alpine"]) is None  # no registry host segment
+    assert f(["run", "--rm"]) is None
+
+
+def test_mcp_container_images_discovers(tmp_path: Path) -> None:
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    (profile / ".claude.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "github": {
+                        "command": "podman",
+                        "args": ["run", "-i", "--rm", "-e", "GH", "ghcr.io/github/mcp"],
+                    },
+                    "windmill": {"type": "http", "url": "https://w.example/mcp"},
+                    "local": {"command": "node", "args": ["/home/u/x.js"]},
+                },
+                "projects": {
+                    "/some/proj": {
+                        "mcpServers": {
+                            "bk": {
+                                "command": "podman",
+                                "args": [
+                                    "run",
+                                    "--rm",
+                                    "ghcr.io/buildkite/mcp:v1",
+                                    "stdio",
+                                ],
+                            }
+                        }
+                    }
+                },
+            }
+        )
+    )
+    assert claude_profile._mcp_container_images(profile) == [
+        "ghcr.io/github/mcp",
+        "ghcr.io/buildkite/mcp:v1",
+    ]
+
+
+def test_mcp_container_images_missing_config(tmp_path: Path) -> None:
+    assert claude_profile._mcp_container_images(tmp_path) == []
+
+
+def test_image_cache_dir_respects_xdg(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", "/x/data")
+    assert claude_profile._image_cache_dir() == Path(
+        "/x/data/claude-profile/image-store"
+    )
+
+
+def test_storage_cache_conf_written(tmp_path: Path) -> None:
+    conf = claude_profile._storage_cache_conf(tmp_path)
+    assert conf == tmp_path / "storage.sandbox.conf"
+    text = conf.read_text()
+    assert claude_profile.SANDBOX_IMAGE_STORE in text
+    assert "additionalimagestores" in text
+    assert "fuse-overlayfs" in text
+
+
+def test_image_cache_mounts_when_populated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = tmp_path / "store"
+    (store / "overlay-images").mkdir(parents=True)
+    monkeypatch.setattr(claude_profile, "_image_cache_dir", lambda: store)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    mounts = claude_profile._image_cache_mounts(profile)
+    assert f"{store}:{claude_profile.SANDBOX_IMAGE_STORE}:ro,z" in mounts
+    assert any(
+        "storage.sandbox.conf:/etc/containers/storage.conf:ro,z" in m for m in mounts
+    )
+
+
+def test_image_cache_mounts_empty_when_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_image_cache_dir", lambda: tmp_path / "nope")
+    assert claude_profile._image_cache_mounts(tmp_path) == []
+
+
+def test_all_commands_registered_in_known_commands() -> None:
+    # main() dispatches any unknown first arg to _launch_profile as a profile name, so
+    # every typer subcommand must be listed in KNOWN_COMMANDS or it gets shadowed.
+    registered = {c.name for c in claude_profile.app.registered_commands if c.name}
+    missing = registered - claude_profile.KNOWN_COMMANDS
+    assert not missing, f"commands missing from KNOWN_COMMANDS: {missing}"
+
+
+# ---------------------------------------------------------------------------
 # sandbox briefing + sandbox-skill writer
 # ---------------------------------------------------------------------------
 
