@@ -18,6 +18,15 @@ RUN curl -1sLf https://artifacts-cli.infisical.com/setup.rpm.sh | bash \
     && dnf install -y infisical \
     && dnf clean all
 
+# Buildkite CLI (bk) — no dnf repo exists, so install the release RPM. It authenticates
+# from the BUILDKITE_API_TOKEN env var, which you forward with
+# CLAUDE_PROFILE_SANDBOX_FORWARD_ENV (the same token the buildkite MCP uses).
+RUN curl -fsSL -o /tmp/bk.rpm \
+      https://github.com/buildkite/cli/releases/download/v3.51.1/bk_3.51.1_linux_amd64.rpm \
+    && dnf install -y /tmp/bk.rpm \
+    && rm -f /tmp/bk.rpm \
+    && dnf clean all
+
 # Passwordless sudo scoped to the package manager plus podman: the agent can install
 # missing system packages and run nested containers, but cannot sudo-write into the
 # bind mounts. Podman runs rootful because the guest kernel sees uid 0 as real root —

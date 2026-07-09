@@ -101,6 +101,7 @@ SANDBOX_SKILL_TOOLS: dict[str, str] = {
     "gh": "GitHub CLI",
     "infisical": "Infisical CLI (secrets management)",
     "pulumi": "Pulumi (infrastructure as code)",
+    "bk": "Buildkite CLI (auths via BUILDKITE_API_TOKEN)",
     "rg": "ripgrep (fast search)",
     "fd": "fd (fast file finder)",
     "make": "make",

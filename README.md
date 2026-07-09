@@ -321,6 +321,13 @@ claude-profile personal
 agent can read state and run `pulumi up`/`destroy`. It is off by default; enable it only when you
 want the agent working against your real Pulumi account.
 
+### Buildkite CLI
+
+The image ships `bk` (the Buildkite CLI). It authenticates from `BUILDKITE_API_TOKEN` — no dedicated
+toggle needed; forward that token via `CLAUDE_PROFILE_SANDBOX_FORWARD_ENV` (the same token the
+buildkite MCP uses). Pass `--org <slug>` per command, or run `bk configure` in-session for a default
+org.
+
 ### Nested containers (Podman)
 
 The image includes `podman`, so the agent can build and run containers inside the VM. They run
