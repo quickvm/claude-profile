@@ -22,18 +22,19 @@ the next launch**, and you have **passwordless `sudo` scoped to `dnf` and `podma
 
 ## Nested containers (podman)
 
-Run containers with **`sudo podman`** — they run rootful because the guest kernel treats uid 0 as
-real root; plain rootless `podman` can't unpack layers in the VM's user namespace. `sudo podman
-run`, `build`, and `pull` all work (fuse-overlayfs storage).
+`podman` runs **rootful** here — it is wrapped to `sudo` automatically (the guest kernel treats uid
+0 as real root; rootless can't unpack layers in the VM's user namespace). Just use `podman run`,
+`build`, and `pull` as usual (fuse-overlayfs storage); an explicit `sudo podman` also works. This is
+also why `podman run …` MCP servers work in the sandbox.
 
 Networking is normal: external DNS and container-to-container name resolution both work (the VM
 runs with a real guest netstack). So a multi-container app can use a user-defined network with
 service names as usual:
 
 ```sh
-sudo podman network create app
-sudo podman run -d --network app --name db postgres:15
-sudo podman run -d --network app --name web -e DB_HOST=db web-image
+podman network create app
+podman run -d --network app --name db postgres:15
+podman run -d --network app --name web -e DB_HOST=db web-image
 ```
 
 ## Rules

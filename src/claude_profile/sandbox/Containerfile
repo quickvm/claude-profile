@@ -20,10 +20,15 @@ RUN curl -1sLf https://artifacts-cli.infisical.com/setup.rpm.sh | bash \
 
 # Passwordless sudo scoped to the package manager plus podman: the agent can install
 # missing system packages and run nested containers, but cannot sudo-write into the
-# bind mounts. Podman runs rootful (`sudo podman`) because the guest kernel sees uid 0
-# as real root — rootless podman can't unpack layers in the nested user namespace.
+# bind mounts. Podman runs rootful because the guest kernel sees uid 0 as real root —
+# rootless podman can't unpack layers in the nested user namespace. The podman rule
+# carries SETENV so the `podman` wrapper's `sudo -E` can preserve pass-through env
+# (MCP servers pass tokens as `-e VAR` with the value taken from the environment).
 RUN useradd -m -u 1000 -U appuser \
-    && echo 'appuser ALL=(root) NOPASSWD: /usr/bin/dnf, /usr/bin/dnf5, /usr/bin/podman' > /etc/sudoers.d/appuser \
+    && printf '%s\n' \
+       'appuser ALL=(root) NOPASSWD: /usr/bin/dnf, /usr/bin/dnf5' \
+       'appuser ALL=(root) NOPASSWD:SETENV: /usr/bin/podman' \
+       > /etc/sudoers.d/appuser \
     && chmod 0440 /etc/sudoers.d/appuser
 
 # Rootful podman stores images with fuse-overlayfs: the microVM's virtiofs root can't
@@ -32,6 +37,13 @@ RUN useradd -m -u 1000 -U appuser \
 RUN mkdir -p /etc/containers \
     && printf '[storage]\ndriver = "overlay"\n[storage.options.overlay]\nmount_program = "/usr/bin/fuse-overlayfs"\n' \
        > /etc/containers/storage.conf
+
+# Route `podman` through rootful sudo inside the VM (see the wrapper script header).
+# Installed at /usr/local/bin (ahead of /usr/bin on PATH) so bare `podman` works —
+# including the `podman run …` MCP servers (github, buildkite, victoria*) — without
+# rewriting their config for the sandbox.
+COPY podman-wrapper /usr/local/bin/podman
+RUN chmod +x /usr/local/bin/podman
 
 # Install uv, the native claude binary, ty, and pulumi as the unprivileged user.
 # uv/claude/ty land in ~/.local/bin; pulumi installs to ~/.pulumi/bin (both on PATH
