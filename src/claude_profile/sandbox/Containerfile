@@ -33,12 +33,14 @@ RUN mkdir -p /etc/containers \
     && printf '[storage]\ndriver = "overlay"\n[storage.options.overlay]\nmount_program = "/usr/bin/fuse-overlayfs"\n' \
        > /etc/containers/storage.conf
 
-# Install uv, the native claude binary, and ty as the unprivileged user (into
-# ~/.local/bin).
+# Install uv, the native claude binary, ty, and pulumi as the unprivileged user.
+# uv/claude/ty land in ~/.local/bin; pulumi installs to ~/.pulumi/bin (both on PATH
+# below). claude-profile forwards your Pulumi Cloud token via CLAUDE_PROFILE_SANDBOX_PULUMI.
 USER appuser
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && curl -fsSL https://claude.ai/install.sh | bash \
-    && /home/appuser/.local/bin/uv tool install ty
+    && /home/appuser/.local/bin/uv tool install ty \
+    && curl -fsSL https://get.pulumi.com | sh
 USER root
 
 COPY entrypoint.sh /entrypoint.sh
@@ -52,6 +54,6 @@ RUN chmod +x /entrypoint.sh
 COPY wl-paste /usr/local/bin/wl-paste
 RUN chmod +x /usr/local/bin/wl-paste
 
-ENV PATH="/home/appuser/.local/bin:$PATH"
+ENV PATH="/home/appuser/.local/bin:/home/appuser/.pulumi/bin:$PATH"
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["claude"]
