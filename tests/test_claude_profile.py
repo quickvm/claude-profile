@@ -55,6 +55,7 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(claude_profile.settings, "sandbox_clipboard", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_gh", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_infisical", "")
+    monkeypatch.setattr(claude_profile.settings, "sandbox_pulumi", False)
     # Default the image-user check to root so launch tests skip the real podman call.
     monkeypatch.setattr(claude_profile, "_sandbox_image_user", lambda: "")
 
@@ -1966,6 +1967,77 @@ def test_argv_includes_infisical_briefing(
     briefing = argv[argv.index("--append-system-prompt") + 1]
     assert "infisical" in briefing.lower()
     assert "alice@corp.example" in briefing
+
+
+# ---------------------------------------------------------------------------
+# pulumi token forwarding
+# ---------------------------------------------------------------------------
+
+
+def _write_pulumi_creds(home: Path, creds: dict) -> None:
+    pdir = home / ".pulumi"
+    pdir.mkdir(exist_ok=True)
+    (pdir / "credentials.json").write_text(json.dumps(creds))
+
+
+def test_pulumi_token_reads_cloud_token(fake_home: Path) -> None:
+    _write_pulumi_creds(
+        fake_home,
+        {
+            "current": "https://api.pulumi.com",
+            "accessTokens": {"https://api.pulumi.com": "pul-secret"},
+        },
+    )
+    assert claude_profile._pulumi_token() == "pul-secret"
+
+
+def test_pulumi_token_none_when_missing(fake_home: Path) -> None:
+    assert claude_profile._pulumi_token() is None
+
+
+def test_pulumi_token_none_for_self_managed_backend(fake_home: Path) -> None:
+    _write_pulumi_creds(fake_home, {"current": "s3://my-bucket", "accessTokens": {}})
+    assert claude_profile._pulumi_token() is None
+
+
+def test_pulumi_token_none_when_no_token_for_current(fake_home: Path) -> None:
+    _write_pulumi_creds(
+        fake_home,
+        {"current": "https://api.pulumi.com", "accessTokens": {"https://other": "x"}},
+    )
+    assert claude_profile._pulumi_token() is None
+
+
+def test_with_pulumi_token_disabled_does_not_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def spy() -> str:
+        nonlocal called
+        called = True
+        return "pul-x"
+
+    monkeypatch.setattr(claude_profile, "_pulumi_token", spy)
+    assert claude_profile._with_pulumi_token({"A": "1"}) == {"A": "1"}
+    assert called is False
+
+
+def test_with_pulumi_token_injects_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_pulumi", True)
+    monkeypatch.setattr(claude_profile, "_pulumi_token", lambda: "pul-secret")
+    assert claude_profile._with_pulumi_token({"A": "1"}) == {
+        "A": "1",
+        "PULUMI_ACCESS_TOKEN": "pul-secret",
+    }
+
+
+def test_with_pulumi_token_warns_when_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_pulumi", True)
+    monkeypatch.setattr(claude_profile, "_pulumi_token", lambda: None)
+    assert claude_profile._with_pulumi_token({"A": "1"}) == {"A": "1"}
 
 
 # ---------------------------------------------------------------------------

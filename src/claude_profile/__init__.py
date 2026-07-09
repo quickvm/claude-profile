@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     # Allowlist of infisical logins to forward into the sandbox: comma-separated
     # emails or domain substrings (e.g. "corp.example,quickvm.com"). Empty = disabled.
     sandbox_infisical: str = Field(default="")
+    sandbox_pulumi: bool = Field(default=False)
     # Per-launch override of the .sandbox marker (CLAUDE_PROFILE_SANDBOX). None = use marker.
     sandbox: Optional[bool] = Field(default=None)
 
@@ -94,6 +95,7 @@ SANDBOX_SKILL_TOOLS: dict[str, str] = {
     "git": "Git",
     "gh": "GitHub CLI",
     "infisical": "Infisical CLI (secrets management)",
+    "pulumi": "Pulumi (infrastructure as code)",
     "rg": "ripgrep (fast search)",
     "fd": "fd (fast file finder)",
     "make": "make",
@@ -1118,6 +1120,45 @@ def _infisical_briefing(extra_env: dict[str, str]) -> str:
     )
 
 
+def _pulumi_token() -> Optional[str]:
+    """Return the Pulumi Cloud access token from ~/.pulumi/credentials.json, or None.
+
+    pulumi stores a token per backend; we return the one for the current backend only
+    when it is a Pulumi Cloud (https) backend. Self-managed backends (s3://, file://, …)
+    carry no token and yield None.
+    """
+    path = Path.home() / ".pulumi" / "credentials.json"
+    try:
+        creds = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    current = creds.get("current") or ""
+    if not current.startswith("https://"):
+        return None
+    token = (creds.get("accessTokens") or {}).get(current)
+    return token if isinstance(token, str) and token else None
+
+
+def _with_pulumi_token(extra_env: dict[str, str]) -> dict[str, str]:
+    """Add PULUMI_ACCESS_TOKEN from the host Pulumi Cloud login when sandbox_pulumi is set.
+
+    pulumi keeps the token in ~/.pulumi/credentials.json, which a microVM can't reach,
+    so we read it on the host and forward it as the env var pulumi reads natively.
+    Returns extra_env unchanged when disabled or no token is found.
+    """
+    if not settings.sandbox_pulumi:
+        return extra_env
+    token = _pulumi_token()
+    if not token:
+        err_console.print(
+            "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_PULUMI is set but no Pulumi Cloud "
+            "token was found in ~/.pulumi/credentials.json. pulumi will be "
+            "unauthenticated in the sandbox.[/yellow]"
+        )
+        return extra_env
+    return {**extra_env, "PULUMI_ACCESS_TOKEN": token}
+
+
 def _launch_sandbox(
     profile_dir: Path, claude_args: list[str], extra_env: dict[str, str]
 ) -> None:
@@ -1133,6 +1174,7 @@ def _launch_sandbox(
         )
     extra_env = _with_gh_token(extra_env)
     extra_env = _with_infisical_env(extra_env)
+    extra_env = _with_pulumi_token(extra_env)
     cwd = Path.cwd()
     forwarding = _build_forwarding()
     if forwarding.active():
