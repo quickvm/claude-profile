@@ -358,8 +358,18 @@ claude *sees* them — but servers written for the host don't all launch there:
 - **Host-path servers** (that run a host binary or read a host directory — e.g. an Obsidian vault
   path) won't work unless that path is mounted or the tool is installed in the VM.
 
-Container MCP images are pulled inside the VM on each launch (it's ephemeral), so the first
-connection to each adds some startup time.
+Container MCP images are pulled inside the VM on each launch (it's ephemeral). To avoid that,
+pre-cache them once on the host:
+
+```sh
+claude-profile sandbox-cache personal   # pull this profile's MCP images into a shared store
+```
+
+`sandbox-cache` discovers the `podman run … <image>` servers from the profile's `.claude.json`,
+pulls them into `~/.local/share/claude-profile/image-store`, and makes it world-readable. The
+sandbox then mounts that store read-only (a podman `additionalimagestore`) whenever it's populated,
+so those images are found locally instead of pulled — no launch-time pull. It's read-only and
+shared, so your parallel worktree sandboxes can't corrupt it. Re-run to update; `--clear` empties it.
 
 ### Security
 

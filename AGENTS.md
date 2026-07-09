@@ -35,7 +35,9 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
 ## Architecture
 
 - **Entry point:** `main()` in `src/claude_profile/__init__.py` — dispatches to
-  typer subcommands or calls `_launch_profile()` directly for unknown first args.
+  typer subcommands or calls `_launch_profile()` directly for unknown first args. The subcommand
+  names live in the module-level `KNOWN_COMMANDS`; every `@app.command` must be listed there or it
+  is shadowed by the profile-launch path (a test enforces the two stay in sync).
 - **Profile isolation:** `CLAUDE_CONFIG_DIR` env var is set to the profile
   directory before `os.execvpe()` replaces the process with `claude`. No wrapper
   process remains — this is intentional for correct TUI behavior.
@@ -171,8 +173,17 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   through as `-e VAR` need that host var inside the VM: `sandbox_forward_env` is a comma-separated
   list of env var names, and `_with_forwarded_env` copies each one present in the host environment
   into the sandbox (missing names warn and skip). Servers that bake values into the config's `env`
-  block (e.g. the victoria* servers) already travel with the mounted config. Container MCP images
-  are pulled inside the ephemeral VM per launch.
+  block (e.g. the victoria* servers) already travel with the mounted config. See the image-cache
+  bullet to avoid re-pulling container MCP images each launch.
+- **MCP image cache (`sandbox-cache`):** container MCP images would be re-pulled every launch (the
+  VM is ephemeral). `claude-profile sandbox-cache <name>` discovers the podman/docker MCP images from
+  the profile's `.claude.json` (`_mcp_container_images`), pulls them into a shared host store
+  (`~/.local/share/claude-profile/image-store`, overlay+fuse-overlayfs to match the VM) and
+  `podman unshare chmod -R a+rX`s it so the VM's mapped root can read it. When the store is
+  populated, `_image_cache_mounts` bind-mounts it read-only at `SANDBOX_IMAGE_STORE` plus a
+  generated storage.conf overlay with `additionalimagestores`, so in-VM podman finds images locally
+  (no pull); an empty/absent store leaves the pull-on-demand default. Read-only and shared, so
+  parallel worktree sandboxes can't corrupt it.
 - **`sandbox` subcommand & override:** `sandbox <name> --on/--off` toggles the `.sandbox`
   marker on an existing profile (shows status when no flag). `_sandbox_enabled()` decides
   per launch: the `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state
