@@ -339,6 +339,28 @@ real guest network stack (`krun.use_passt=1`) instead of libkrun's default TSI s
 impersonation. (TSI silently drops socket options like `SO_REUSEADDR`, which breaks gRPC, and
 intercepts container DNS.) This needs `passt` on the host and a recent crun/libkrun.
 
+### MCP servers
+
+Your MCP servers are configured in the profile's `.claude.json`, which is mounted into the VM, so
+claude *sees* them — but servers written for the host don't all launch there:
+
+- **HTTP servers** (e.g. `windmill`, `exa`) work as-is: the VM has network egress and any OAuth
+  token travels in the mounted config.
+- **Container servers** (`podman run …`, e.g. `github`, `buildkite`, the `victoria*` servers) work
+  because the sandbox routes `podman` through rootful sudo automatically. A server that passes a
+  token through as `-e VAR` needs that variable forwarded into the VM (servers that bake the value
+  into the config's `env` block, like the `victoria*` ones, already travel with the config):
+
+  ```sh
+  export CLAUDE_PROFILE_SANDBOX_FORWARD_ENV="BUILDKITE_API_TOKEN,GITHUB_PERSONAL_ACCESS_TOKEN"
+  ```
+
+- **Host-path servers** (that run a host binary or read a host directory — e.g. an Obsidian vault
+  path) won't work unless that path is mounted or the tool is installed in the VM.
+
+Container MCP images are pulled inside the VM on each launch (it's ephemeral), so the first
+connection to each adds some startup time.
+
 ### Security
 
 A microVM raises the bar considerably but is not a perfect boundary. Networking stays open
@@ -364,6 +386,7 @@ article [Sandbox AI coding agents with microVMs on Fedora Linux](https://fedoram
 | `CLAUDE_PROFILE_SANDBOX_GH` | `false` | Forward your GitHub login into the VM as `GH_TOKEN` (read via `gh auth token`) so `gh` acts as you |
 | `CLAUDE_PROFILE_SANDBOX_INFISICAL` | _(empty)_ | Allowlist (comma-separated emails/domains) of infisical logins to forward into the VM as `INFISICAL_TOKEN`/`--token` |
 | `CLAUDE_PROFILE_SANDBOX_PULUMI` | `false` | Forward your Pulumi Cloud token into the VM as `PULUMI_ACCESS_TOKEN` so `pulumi` acts as you |
+| `CLAUDE_PROFILE_SANDBOX_FORWARD_ENV` | _(empty)_ | Comma-separated host env var names to copy into the VM (e.g. tokens MCP servers pass through as `-e VAR`) |
 | `CLAUDE_PROFILE_SANDBOX` | _(unset)_ | Per-launch override: `1` forces microVM, `0` forces host; unset uses the profile's setting |
 
 ## License

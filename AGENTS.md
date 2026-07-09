@@ -79,7 +79,8 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   already passed it.
 - **Sandbox settings:** `podman_bin`, `sandbox_image`, `sandbox_ram_mib`, `sandbox_cpus`,
   `sandbox_skip_permissions`, `sandbox_ssh_agent`, `sandbox_gpg_agent`, `sandbox_clipboard`,
-  `sandbox_gh`, `sandbox_infisical`, `sandbox_pulumi` (all read from `CLAUDE_PROFILE_*`).
+  `sandbox_gh`, `sandbox_infisical`, `sandbox_pulumi`, `sandbox_forward_env` (all read from
+  `CLAUDE_PROFILE_*`).
 - **Agent self-provisioning:** the image bakes common dev tools (`uv`, jq/yq,
   python+pyyaml/jinja2, make/openssl/trash) plus `dnf`-scoped passwordless sudo, so the
   agent installs missing tools ad-hoc (`sudo dnf install`, `uv tool install`; ephemeral).
@@ -89,10 +90,14 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   via `podman run … command -v`); `--check` detects drift. Template lives at
   `src/claude_profile/sandbox_skill_template.md`.
 - **Nested containers (podman):** the image installs `podman` + `fuse-overlayfs`, scopes
-  passwordless sudo to `/usr/bin/podman`, and ships `/etc/containers/storage.conf` pinning
-  fuse-overlayfs. Containers run **rootful** via `sudo podman` — the krun guest kernel sees uid 0
-  as real root, so layer unpack works; rootless podman can't map the nested user namespace
-  (`newuidmap … Operation not permitted`) and native overlay isn't backable on the virtiofs root.
+  passwordless sudo to `/usr/bin/podman` (with the `SETENV` tag), and ships
+  `/etc/containers/storage.conf` pinning fuse-overlayfs. Containers run **rootful**: a `podman`
+  wrapper at `/usr/local/bin/podman` (ahead of `/usr/bin` on PATH) execs `sudo -E /usr/bin/podman`,
+  so bare `podman` — including `podman run …` MCP servers — works without config changes; `sudo -E`
+  (needing SETENV) preserves the environment so those servers' pass-through `-e VAR` tokens survive.
+  The krun guest kernel sees uid 0 as real root, so layer unpack works; rootless podman can't map
+  the nested user namespace (`newuidmap … Operation not permitted`) and native overlay isn't
+  backable on the virtiofs root.
   `run`/`build`/`pull`, TCP egress, external DNS, and container-to-container name resolution all
   work, because `_build_sandbox_argv` runs the microVM with `krun.use_passt=1` (a real virtio-net
   guest netstack). Without it libkrun defaults to TSI socket impersonation, whose stubbed
@@ -160,6 +165,14 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   URL; self-managed backends (`s3://`, `file://`) have no token — and `_with_pulumi_token` injects it
   as `PULUMI_ACCESS_TOKEN` (the env var pulumi reads natively). A missing token warns and continues.
   The token grants full access to the account's stacks, so it is opt-in.
+- **MCP servers & host env forwarding (`sandbox_forward_env`):** the profile's `.claude.json` is
+  mounted, so claude in the VM sees the configured MCP servers. HTTP servers work over the VM's
+  egress; `podman run …` servers work via the podman wrapper above. Servers that pass a secret
+  through as `-e VAR` need that host var inside the VM: `sandbox_forward_env` is a comma-separated
+  list of env var names, and `_with_forwarded_env` copies each one present in the host environment
+  into the sandbox (missing names warn and skip). Servers that bake values into the config's `env`
+  block (e.g. the victoria* servers) already travel with the mounted config. Container MCP images
+  are pulled inside the ephemeral VM per launch.
 - **`sandbox` subcommand & override:** `sandbox <name> --on/--off` toggles the `.sandbox`
   marker on an existing profile (shows status when no flag). `_sandbox_enabled()` decides
   per launch: the `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state
