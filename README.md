@@ -301,6 +301,26 @@ a non-primary org always pass `--domain` explicitly.
 **Security:** each forwarded token grants the sandbox that login's full access to your secrets. It
 is off by default and takes an explicit allowlist — no login is forwarded unless you name it.
 
+### Pulumi
+
+The image ships the `pulumi` CLI. To let the agent run `pulumi preview`/`up` against your stacks,
+forward your Pulumi Cloud token:
+
+```sh
+export CLAUDE_PROFILE_SANDBOX_PULUMI=1
+claude-profile personal
+```
+
+`pulumi` stores its token in `~/.pulumi/credentials.json`, which the microVM can't reach, so
+`claude-profile` reads it on the host and passes it in as `PULUMI_ACCESS_TOKEN` — the env var
+`pulumi` reads natively. Only Pulumi Cloud (https) backends are forwarded; self-managed backends
+(`s3://`, `file://`, …) carry no token and are skipped. If no token is found you get a warning and
+`pulumi` is unauthenticated inside the VM.
+
+**Security:** this hands the sandbox a token with full access to your Pulumi Cloud stacks — the
+agent can read state and run `pulumi up`/`destroy`. It is off by default; enable it only when you
+want the agent working against your real Pulumi account.
+
 ### Nested containers (Podman)
 
 The image includes `podman`, so the agent can build and run containers inside the VM. They run
@@ -343,6 +363,7 @@ article [Sandbox AI coding agents with microVMs on Fedora Linux](https://fedoram
 | `CLAUDE_PROFILE_SANDBOX_CLIPBOARD` | `false` | Bridge your clipboard into the VM (read-only) so image paste works; needs `wl-paste` on the host |
 | `CLAUDE_PROFILE_SANDBOX_GH` | `false` | Forward your GitHub login into the VM as `GH_TOKEN` (read via `gh auth token`) so `gh` acts as you |
 | `CLAUDE_PROFILE_SANDBOX_INFISICAL` | _(empty)_ | Allowlist (comma-separated emails/domains) of infisical logins to forward into the VM as `INFISICAL_TOKEN`/`--token` |
+| `CLAUDE_PROFILE_SANDBOX_PULUMI` | `false` | Forward your Pulumi Cloud token into the VM as `PULUMI_ACCESS_TOKEN` so `pulumi` acts as you |
 | `CLAUDE_PROFILE_SANDBOX` | _(unset)_ | Per-launch override: `1` forces microVM, `0` forces host; unset uses the profile's setting |
 
 ## License

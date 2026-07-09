@@ -79,7 +79,7 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   already passed it.
 - **Sandbox settings:** `podman_bin`, `sandbox_image`, `sandbox_ram_mib`, `sandbox_cpus`,
   `sandbox_skip_permissions`, `sandbox_ssh_agent`, `sandbox_gpg_agent`, `sandbox_clipboard`,
-  `sandbox_gh`, `sandbox_infisical` (all read from `CLAUDE_PROFILE_*`).
+  `sandbox_gh`, `sandbox_infisical`, `sandbox_pulumi` (all read from `CLAUDE_PROFILE_*`).
 - **Agent self-provisioning:** the image bakes common dev tools (`uv`, jq/yq,
   python+pyyaml/jinja2, make/openssl/trash) plus `dnf`-scoped passwordless sudo, so the
   agent installs missing tools ad-hoc (`sudo dnf install`, `uv tool install`; ephemeral).
@@ -153,6 +153,13 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   reliable domain override, and it beats a repo's `.infisical.json`, so non-primary orgs need an
   explicit `--domain`. Each token grants full access to that login's secrets, so it is opt-in via
   explicit allowlist.
+- **Pulumi (`sandbox_pulumi`):** the image bakes the `pulumi` CLI; enabling `sandbox_pulumi` forwards
+  your Pulumi Cloud token into the VM. `pulumi` keeps the token in `~/.pulumi/credentials.json` (a
+  plaintext file, not a keyring), which a microVM can't reach, so `_pulumi_token` reads it on the
+  host — the `accessTokens[current]` entry, only when the current backend is an https (Pulumi Cloud)
+  URL; self-managed backends (`s3://`, `file://`) have no token — and `_with_pulumi_token` injects it
+  as `PULUMI_ACCESS_TOKEN` (the env var pulumi reads natively). A missing token warns and continues.
+  The token grants full access to the account's stacks, so it is opt-in.
 - **`sandbox` subcommand & override:** `sandbox <name> --on/--off` toggles the `.sandbox`
   marker on an existing profile (shows status when no flag). `_sandbox_enabled()` decides
   per launch: the `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state
