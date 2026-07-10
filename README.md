@@ -206,8 +206,14 @@ claude-profile personal
 
 This forwards your active agent (`$SSH_AUTH_SOCK`) and, if present, the 1Password agent
 (`~/.1password/agent.sock`) into the VM — hardware/security keys included — so `ssh-add -l`
-and `git push` work there. To switch to 1Password inside the VM,
-`export SSH_AUTH_SOCK=~/.1password/agent.sock`.
+and `git push` work there. Dead agent sockets (e.g. a stale gnome-keyring stub) are skipped,
+and the agent that actually holds keys is used by default. To switch to 1Password inside the
+VM, `export SSH_AUTH_SOCK=~/.1password/agent.sock`.
+
+Host-key checking persists per profile: your `~/.ssh/known_hosts` is mounted read-only for
+verification, and host keys ssh accepts inside the VM are saved to a per-profile
+`known_hosts` that carries over to the next launch — your real `~/.ssh/known_hosts` is never
+modified.
 
 A microVM has its own kernel, so the socket can't be bind-mounted; a `socat` bridge relays
 the agent over pasta networking, with the host end bound to `127.0.0.1`. Managing that

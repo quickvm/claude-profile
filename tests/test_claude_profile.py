@@ -808,9 +808,12 @@ def test_sandbox_mounts_no_git(
 ) -> None:
     cwd = tmp_path / "plain"
     cwd.mkdir()
+    profile = tmp_path / "prof"
+    profile.mkdir()
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
-    mounts = _sandbox_mounts(tmp_path / "prof", cwd)
-    assert mounts.count("-v") == 2
+    mounts = _sandbox_mounts(profile, cwd)
+    # profile config + cwd + per-profile user known_hosts
+    assert mounts.count("-v") == 3
     assert f"{cwd}:{cwd}:z" in mounts
 
 
@@ -821,9 +824,12 @@ def test_sandbox_mounts_includes_external_git_dir(
     cwd.mkdir(parents=True)
     git_dir = tmp_path / "main" / ".git"
     git_dir.mkdir(parents=True)
+    profile = tmp_path / "prof"
+    profile.mkdir()
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: git_dir)
-    mounts = _sandbox_mounts(tmp_path / "prof", cwd)
-    assert mounts.count("-v") == 3
+    mounts = _sandbox_mounts(profile, cwd)
+    # profile config + cwd + git dir + per-profile user known_hosts
+    assert mounts.count("-v") == 4
     assert f"{git_dir}:{git_dir}:z" in mounts
 
 
@@ -832,9 +838,12 @@ def test_sandbox_mounts_skips_git_dir_inside_cwd(
 ) -> None:
     cwd = tmp_path / "repo"
     cwd.mkdir()
+    profile = tmp_path / "prof"
+    profile.mkdir()
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: cwd / ".git")
-    mounts = _sandbox_mounts(tmp_path / "prof", cwd)
-    assert mounts.count("-v") == 2
+    mounts = _sandbox_mounts(profile, cwd)
+    # profile config + cwd + per-profile user known_hosts (git dir skipped, inside cwd)
+    assert mounts.count("-v") == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1466,7 +1475,9 @@ def test_build_forwarding_ssh_only(
     auth.touch()
     monkeypatch.setenv("SSH_AUTH_SOCK", str(auth))
     monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", True)
-    monkeypatch.setattr(claude_profile, "_ssh_agent_status", lambda s: 2)  # live w/ keys
+    monkeypatch.setattr(
+        claude_profile, "_ssh_agent_status", lambda s: 2
+    )  # live w/ keys
     monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 5000)
     fwd = claude_profile._build_forwarding()
     assert fwd.forwards == [(auth, auth, 5000)]
@@ -2375,7 +2386,7 @@ def test_launch_warns_nonroot_image_but_proceeds(
     assert mock_exec.called
 
 
-def test_sandbox_mounts_includes_known_hosts(
+def test_sandbox_mounts_known_hosts_global_ro_and_user_rw(
     fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
@@ -2387,10 +2398,14 @@ def test_sandbox_mounts_includes_known_hosts(
     cwd = tmp_path / "work"
     cwd.mkdir()
     mounts = _sandbox_mounts(profile, cwd)
-    assert f"{ssh / 'known_hosts'}:/home/appuser/.ssh/known_hosts:ro,z" in mounts
+    # host file is the read-only global known_hosts (verification only)
+    assert f"{ssh / 'known_hosts'}:/etc/ssh/ssh_known_hosts:ro,z" in mounts
+    # per-profile writable user known_hosts persists newly accepted keys
+    assert f"{profile / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z" in mounts
+    assert (profile / "known_hosts").exists()
 
 
-def test_sandbox_mounts_no_known_hosts(
+def test_sandbox_mounts_user_known_hosts_without_host_file(
     fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
@@ -2399,4 +2414,24 @@ def test_sandbox_mounts_no_known_hosts(
     cwd = tmp_path / "work"
     cwd.mkdir()
     mounts = _sandbox_mounts(profile, cwd)
-    assert not any("known_hosts" in m for m in mounts)
+    # no host known_hosts -> no global mount, but the writable user file is still provided
+    assert not any("/etc/ssh/ssh_known_hosts" in m for m in mounts)
+    assert f"{profile / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z" in mounts
+
+
+def test_sandbox_known_hosts_creates_empty(tmp_path: Path) -> None:
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    kh = claude_profile._sandbox_known_hosts(profile)
+    assert kh == profile / "known_hosts"
+    assert kh.exists() and kh.read_text() == ""
+
+
+def test_sandbox_known_hosts_preserves_existing(tmp_path: Path) -> None:
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    (profile / "known_hosts").write_text("host1 ssh-ed25519 KEY\n")
+    assert (
+        claude_profile._sandbox_known_hosts(profile).read_text()
+        == "host1 ssh-ed25519 KEY\n"
+    )

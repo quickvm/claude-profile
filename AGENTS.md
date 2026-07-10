@@ -114,11 +114,19 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   hit the throwaway overlay (regenerated each launch), not the real profile settings. Host launches
   are untouched and keep the sudo deny.
 - **SSH agent forwarding (`sandbox_ssh_agent`):** a microVM can't bind-mount the agent
-  socket (separate kernel), so `_ssh_agent_sockets()` lists the active agent + 1Password,
-  `_start_host_bridge()` runs a host `socat` (TCP on 127.0.0.1 → the agent socket), and
+  socket (separate kernel), so `_ssh_agent_sockets()` probes the candidates (the active
+  `SSH_AUTH_SOCK` agent + 1Password) with `ssh-add -l`, drops dead ones (a stale socket
+  whose agent doesn't answer would surface in-VM as "communication with agent failed") and
+  orders keyed agents first so the VM's `SSH_AUTH_SOCK` holds keys. `_start_host_bridge()`
+  runs a host `socat` (TCP on 127.0.0.1 → the agent socket), and
   `--network=pasta:--map-host-loopback,…` lets the guest reach it; `entrypoint.sh` starts a
   guest `socat` per forward and sets `SSH_AUTH_SOCK`. Because the bridges need teardown,
   this path supervises podman (`_run_sandbox_supervised`) instead of `execvpe`.
+- **known_hosts persistence:** `_sandbox_mounts` mounts the host's `~/.ssh/known_hosts`
+  read-only as the VM's *global* known_hosts (`/etc/ssh/ssh_known_hosts`, for verification)
+  and a per-profile writable `known_hosts` (`_sandbox_known_hosts`) as the *user* file, so
+  ssh records newly accepted host keys there and they persist across launches — the host's
+  real file is never written by the sandbox.
 - **GPG agent forwarding (`sandbox_gpg_agent`):** same bridge, forwarding the host
   gpg-agent restricted socket (`gpgconf --list-dirs agent-extra-socket`) to the in-VM
   `GNUPGHOME/S.gpg-agent` and seeding a fresh GNUPGHOME with the host's public keys

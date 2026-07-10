@@ -853,6 +853,20 @@ def _image_cache_mounts(profile_dir: Path) -> list[str]:
     ]
 
 
+def _sandbox_known_hosts(profile_dir: Path) -> Path:
+    """Per-profile user known_hosts the sandbox records accepted host keys into.
+
+    Created empty if absent and mounted read-write, so host keys ssh accepts inside the
+    VM persist across launches. The host's own known_hosts is mounted read-only as the
+    global known_hosts (see _sandbox_mounts), so already-trusted hosts still verify and
+    the host's real file is never written by the sandbox.
+    """
+    dest = profile_dir / "known_hosts"
+    if not dest.exists():
+        dest.touch()
+    return dest
+
+
 def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
     """Build podman -v args: profile config, cwd, and the git common dir.
 
@@ -878,9 +892,17 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
     gitconfig = Path.home() / ".gitconfig"
     if gitconfig.exists():
         mounts += ["-v", f"{gitconfig}:/home/appuser/.gitconfig:ro,z"]
-    known_hosts = Path.home() / ".ssh" / "known_hosts"
-    if known_hosts.exists():
-        mounts += ["-v", f"{known_hosts}:/home/appuser/.ssh/known_hosts:ro,z"]
+    host_known_hosts = Path.home() / ".ssh" / "known_hosts"
+    if host_known_hosts.exists():
+        # Read-only *global* known_hosts: ssh verifies already-trusted hosts against it
+        # but never writes it, so the sandbox can't modify the host's real file.
+        mounts += ["-v", f"{host_known_hosts}:/etc/ssh/ssh_known_hosts:ro,z"]
+    # Writable per-profile *user* known_hosts: ssh records newly accepted host keys here,
+    # so they persist across launches instead of vanishing with the VM.
+    mounts += [
+        "-v",
+        f"{_sandbox_known_hosts(profile_dir)}:/home/appuser/.ssh/known_hosts:z",
+    ]
     mounts += _linked_dir_mounts(profile_dir)
     mounts += _image_cache_mounts(profile_dir)
     return mounts
