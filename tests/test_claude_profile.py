@@ -1331,6 +1331,9 @@ def test_ssh_agent_sockets_includes_auth_and_1password(
     op_dir = fake_home / ".1password"
     op_dir.mkdir()
     (op_dir / "agent.sock").touch()
+    monkeypatch.setattr(
+        claude_profile, "_ssh_agent_status", lambda s: 2
+    )  # both live w/ keys
     assert claude_profile._ssh_agent_sockets() == [auth, op_dir / "agent.sock"]
 
 
@@ -1346,6 +1349,56 @@ def test_ssh_agent_sockets_skips_missing(
 ) -> None:
     monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "nope.sock"))
     assert claude_profile._ssh_agent_sockets() == []
+
+
+def test_ssh_agent_status_tiers(monkeypatch: pytest.MonkeyPatch) -> None:
+    for rc, expected in [(0, 2), (1, 1), (2, 0)]:
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, rc=rc, **k: subprocess.CompletedProcess([], rc),
+        )
+        assert claude_profile._ssh_agent_status(Path("/x")) == expected
+
+
+def test_ssh_agent_status_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert claude_profile._ssh_agent_status(Path("/x")) == 0
+
+
+def test_ssh_agent_sockets_skips_dead(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gnome = fake_home / "gnome.sock"
+    gnome.touch()
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(gnome))
+    op = fake_home / ".1password" / "agent.sock"
+    op.parent.mkdir()
+    op.touch()
+    # gnome is a dead stale stub; 1password has keys
+    monkeypatch.setattr(
+        claude_profile, "_ssh_agent_status", lambda s: 0 if s == gnome else 2
+    )
+    assert claude_profile._ssh_agent_sockets() == [op]
+
+
+def test_ssh_agent_sockets_prefers_keyed_over_empty(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gnome = fake_home / "gnome.sock"
+    gnome.touch()
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(gnome))
+    op = fake_home / ".1password" / "agent.sock"
+    op.parent.mkdir()
+    op.touch()
+    # gnome live-but-empty; 1password has keys -> 1password ordered first
+    monkeypatch.setattr(
+        claude_profile, "_ssh_agent_status", lambda s: 1 if s == gnome else 2
+    )
+    assert claude_profile._ssh_agent_sockets() == [op, gnome]
 
 
 def test_forwarding_env_empty() -> None:
@@ -1413,6 +1466,7 @@ def test_build_forwarding_ssh_only(
     auth.touch()
     monkeypatch.setenv("SSH_AUTH_SOCK", str(auth))
     monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", True)
+    monkeypatch.setattr(claude_profile, "_ssh_agent_status", lambda s: 2)  # live w/ keys
     monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 5000)
     fwd = claude_profile._build_forwarding()
     assert fwd.forwards == [(auth, auth, 5000)]

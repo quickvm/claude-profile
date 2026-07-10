@@ -1016,16 +1016,52 @@ def _free_tcp_port() -> int:
         return sock.getsockname()[1]
 
 
+def _ssh_agent_status(sock: Path) -> int:
+    """Probe an ssh-agent socket: 2 = live with keys, 1 = live but empty, 0 = dead.
+
+    ``ssh-add -l`` exits 0 when it lists keys, 1 when the agent is live but has none, and
+    2 when it cannot connect — a stale/dead socket (e.g. a gnome-keyring stub whose agent
+    isn't running, common when the real keys live in 1Password). Forwarding a dead socket
+    puts a broken agent behind the VM's SSH_AUTH_SOCK ("communication with agent failed"),
+    and forwarding a live-but-empty one first would shadow the agent that actually holds
+    the keys — so callers skip dead sockets and prefer keyed ones.
+    """
+    try:
+        result = subprocess.run(
+            ["ssh-add", "-l"],
+            env={**os.environ, "SSH_AUTH_SOCK": str(sock)},
+            capture_output=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return 0
+    return {0: 2, 1: 1}.get(result.returncode, 0)
+
+
 def _ssh_agent_sockets() -> list[Path]:
-    """Host SSH agent sockets to bridge: the active agent plus 1Password."""
-    sockets: list[Path] = []
+    """Live host SSH agent sockets to bridge, agents holding keys first.
+
+    Candidates are the active agent (SSH_AUTH_SOCK) and the 1Password agent. A socket
+    file can exist while its agent is dead (a stale gnome-keyring stub), so each is
+    probed: dead ones are dropped and the rest are ordered keyed-agents-first, so the
+    VM's SSH_AUTH_SOCK lands on an agent that actually has keys.
+    """
+    candidates: list[Path] = []
     auth = os.environ.get("SSH_AUTH_SOCK")
-    if auth and Path(auth).exists():
-        sockets.append(Path(auth))
+    if auth:
+        candidates.append(Path(auth))
     onepassword = Path.home() / ".1password" / "agent.sock"
-    if onepassword.exists() and onepassword not in sockets:
-        sockets.append(onepassword)
-    return sockets
+    if onepassword not in candidates:
+        candidates.append(onepassword)
+    live = [
+        (sock, status)
+        for sock in candidates
+        if sock.exists() and (status := _ssh_agent_status(sock)) > 0
+    ]
+    live.sort(
+        key=lambda pair: -pair[1]
+    )  # stable: keyed agents first, else insertion order
+    return [sock for sock, _ in live]
 
 
 def _gpg_extra_socket() -> Optional[Path]:
