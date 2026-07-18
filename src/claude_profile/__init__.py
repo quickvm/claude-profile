@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import pwd
 import shutil
 import socket
 import subprocess
@@ -37,6 +38,7 @@ class Settings(BaseSettings):
     sandbox_ssh_agent: bool = Field(default=False)
     sandbox_gpg_agent: bool = Field(default=False)
     sandbox_clipboard: bool = Field(default=False)
+    sandbox_chrome: bool = Field(default=False)
     sandbox_gh: bool = Field(default=False)
     # Allowlist of infisical logins to forward into the sandbox: comma-separated
     # emails or domain substrings (e.g. "corp.example,quickvm.com"). Empty = disabled.
@@ -62,6 +64,8 @@ SANDBOX_GNUPGHOME = "/home/appuser/.gnupg"
 SANDBOX_IMAGE_STORE = "/var/lib/shared-mcp-store"
 # Env var carrying the host clipboard-bridge TCP port to the in-VM wl-paste shim.
 SANDBOX_CLIPBOARD_PORT_ENV = "CLAUDE_SANDBOX_CLIPBOARD_PORT"
+# Env var carrying the host browser-bridge TCP port to the in-VM entrypoint.
+SANDBOX_BROWSER_BRIDGE_PORT_ENV = "CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT"
 # Deny-rule prefixes stripped from the in-VM settings overlay: host guardrails that
 # are counterproductive inside the isolated microVM (deny beats
 # --dangerously-skip-permissions, so they still apply there). The VM grants OS-level
@@ -939,10 +943,17 @@ class _Forwarding:
     ssh_auth_sock: Optional[Path] = None
     gpg_pubkeys_b64: Optional[str] = None
     clipboard_port: Optional[int] = None  # host TCP port serving the clipboard bridge
+    browser_port: Optional[int] = (
+        None  # host TCP port serving the Claude in Chrome bridge
+    )
 
     def active(self) -> bool:
-        """True when any host-side bridge (agent socket or clipboard) is needed."""
-        return bool(self.forwards) or self.clipboard_port is not None
+        """True when any host-side bridge (agent socket, clipboard, browser) is needed."""
+        return (
+            bool(self.forwards)
+            or self.clipboard_port is not None
+            or self.browser_port is not None
+        )
 
 
 def _build_sandbox_argv(
@@ -1028,6 +1039,8 @@ def _forwarding_env(forwarding: Optional[_Forwarding]) -> list[str]:
         ]
     if forwarding.clipboard_port is not None:
         env += ["-e", f"{SANDBOX_CLIPBOARD_PORT_ENV}={forwarding.clipboard_port}"]
+    if forwarding.browser_port is not None:
+        env += ["-e", f"{SANDBOX_BROWSER_BRIDGE_PORT_ENV}={forwarding.browser_port}"]
     return env
 
 
@@ -1114,6 +1127,37 @@ def _export_gpg_pubkeys() -> Optional[str]:
     return base64.b64encode(result.stdout).decode("ascii")
 
 
+def _browser_bridge_dir() -> Path:
+    """Host dir where Claude in Chrome native hosts bind their sockets.
+
+    Chrome spawns ``claude --chrome-native-host`` (stdio to the extension), which
+    binds ``/tmp/claude-mcp-browser-bridge-<username>/<pid>.sock``; claude sessions
+    discover the bridge by scanning that dir at startup. The username comes from the
+    uid, matching claude's own ``os.userInfo().username``.
+    """
+    return Path(f"/tmp/claude-mcp-browser-bridge-{pwd.getpwuid(os.getuid()).pw_name}")
+
+
+def _browser_bridge_live() -> bool:
+    """True when some Claude in Chrome native-host socket accepts connections.
+
+    A socket file can outlive its native host (nothing unlinks it after a crash or
+    browser exit), so each candidate is probed with a real connect — a directory
+    holding only stale sockets means no bridge.
+    """
+    for sock_path in sorted(_browser_bridge_dir().glob("*.sock")):
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(1.0)
+        try:
+            probe.connect(str(sock_path))
+        except OSError:
+            continue
+        finally:
+            probe.close()
+        return True
+    return False
+
+
 def _build_forwarding() -> _Forwarding:
     """Collect the agent forwards requested via settings."""
     forwards: list[tuple[Path, Path, int]] = []
@@ -1131,7 +1175,17 @@ def _build_forwarding() -> _Forwarding:
             forwards.append((extra, guest, _free_tcp_port()))
             pubkeys = _export_gpg_pubkeys()
     clipboard_port = _free_tcp_port() if settings.sandbox_clipboard else None
-    return _Forwarding(forwards, ssh_auth, pubkeys, clipboard_port)
+    browser_port: Optional[int] = None
+    if settings.sandbox_chrome:
+        browser_port = _free_tcp_port()
+        if not _browser_bridge_live():
+            err_console.print(
+                "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_CHROME is set but no Claude "
+                "in Chrome native host is listening on the host. Open Chrome with the "
+                "Claude extension connected (restarting Chrome wakes it) and relaunch "
+                "— claude only scans for the bridge at session startup.[/yellow]"
+            )
+    return _Forwarding(forwards, ssh_auth, pubkeys, clipboard_port, browser_port)
 
 
 def _start_host_bridge(agent_sock: Path, port: int) -> subprocess.Popen[bytes]:
@@ -1161,6 +1215,30 @@ def _start_clipboard_host_bridge(port: int) -> subprocess.Popen[bytes]:
     the sandbox, unlike forwarding the compositor wholesale.
     """
     handler = _clipboard_host_handler()
+    return subprocess.Popen(
+        [
+            "socat",
+            f"TCP-LISTEN:{port},bind=127.0.0.1,reuseaddr,fork",
+            f"EXEC:bash {handler}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _browser_bridge_host_handler() -> Path:
+    """Path to the packaged host-side Claude-in-Chrome bridge handler script."""
+    return Path(str(resources.files("claude_profile") / "browser_bridge_host.sh"))
+
+
+def _start_browser_host_bridge(port: int) -> subprocess.Popen[bytes]:
+    """Serve the host Claude in Chrome native-host socket to the VM.
+
+    socat execs the handler per guest connection; the handler resolves the newest
+    ``claude --chrome-native-host`` socket and relays to it, so the bridge follows
+    Chrome's native host across restarts (its socket pid changes each spawn).
+    """
+    handler = _browser_bridge_host_handler()
     return subprocess.Popen(
         [
             "socat",
@@ -1503,6 +1581,8 @@ def _run_sandbox_supervised(
     ]
     if forwarding.clipboard_port is not None:
         bridges.append(_start_clipboard_host_bridge(forwarding.clipboard_port))
+    if forwarding.browser_port is not None:
+        bridges.append(_start_browser_host_bridge(forwarding.browser_port))
     argv = _build_sandbox_argv(profile_dir, cwd, claude_args, extra_env, forwarding)
     try:
         result = subprocess.run(argv, env=os.environ.copy())

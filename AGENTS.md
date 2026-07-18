@@ -81,8 +81,8 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   already passed it.
 - **Sandbox settings:** `podman_bin`, `sandbox_image`, `sandbox_ram_mib`, `sandbox_cpus`,
   `sandbox_skip_permissions`, `sandbox_ssh_agent`, `sandbox_gpg_agent`, `sandbox_clipboard`,
-  `sandbox_gh`, `sandbox_infisical`, `sandbox_pulumi`, `sandbox_forward_env` (all read from
-  `CLAUDE_PROFILE_*`).
+  `sandbox_chrome`, `sandbox_gh`, `sandbox_infisical`, `sandbox_pulumi`, `sandbox_forward_env`
+  (all read from `CLAUDE_PROFILE_*`).
 - **Agent self-provisioning:** the image bakes common dev tools (`uv`, jq/yq,
   python+pyyaml/jinja2, make/openssl/trash) plus `dnf`-scoped passwordless sudo, so the
   agent installs missing tools ad-hoc (`sudo dnf install`, `uv tool install`; ephemeral).
@@ -148,6 +148,23 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   `_run_sandbox_supervised`, which also verifies the host has `wl-paste`) serves it. Read-only:
   the sandbox reads the clipboard but cannot write it or reach any other Wayland protocol. No
   entrypoint or image-package changes — the shim is inert unless the port env is set.
+- **Claude in Chrome bridge (`sandbox_chrome`):** the `mcp__claude-in-chrome__*` tools drive a
+  browser through a native host Chrome spawns on the host (`claude --chrome-native-host`, wired via
+  the `com.anthropic.claude_code_browser_extension` native-messaging manifest). That native host
+  **binds** a Unix socket at `/tmp/claude-mcp-browser-bridge-<user>/<pid>.sock`; the interactive
+  claude session is the client — it scans that dir, connects out, and (per its `validateSocketSecurity`)
+  requires the dir be mode `0700`. The microVM has its own kernel, so it can't reach the host socket
+  directly. Discovery is inverted vs. the ssh/gpg bridges (guest connects, not the host), so the
+  entrypoint presents a guest-side socket: it creates `/tmp/claude-mcp-browser-bridge-$(id -un)`
+  (the VM user is `appuser`) at mode `0700` and `socat UNIX-LISTEN … host.sock` → `TCP:host.containers.internal:$port`
+  over pasta, waiting for the socket to bind before exec'ing claude (claude scans at startup). On the
+  host, `_start_browser_host_bridge` runs `socat TCP-LISTEN:$port … EXEC:bash browser_bridge_host.sh`;
+  the resolver picks the **newest** live native-host socket per connection and relays to it, so the
+  bridge follows Chrome across native-host restarts (its pid changes each spawn) and claude's reconnect
+  loop self-heals if Chrome starts after the VM. `_build_forwarding` allocates the port (warning if no
+  native host is currently listening), `_forwarding_env` exports `CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT`,
+  and `_run_sandbox_supervised` starts/tears down the host bridge. Nothing but clipboard-style socat
+  relaying crosses the boundary — the host filesystem and other browser state stay out of the VM.
 - **GitHub CLI (`sandbox_gh`):** the image bakes `gh`, and enabling `sandbox_gh` forwards your
   GitHub login into the VM. `gh` keeps its token in the system keyring (or `hosts.yml`), which a
   microVM can't reach, so `_with_gh_token` reads it on the host via `gh auth token` and injects it

@@ -36,6 +36,23 @@ if [ -n "$CLAUDE_SANDBOX_FORWARDS" ]; then
   done
 fi
 
+# Claude in Chrome bridge: claude scans /tmp/claude-mcp-browser-bridge-<user> for a
+# native-host socket and connects out to it. Present one there that relays over pasta
+# to the host bridge (claude_profile._start_browser_host_bridge). claude requires the
+# dir be mode 0700, and it scans at startup, so bind the socket before exec'ing claude.
+if [ -n "$CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT" ]; then
+  _bdir="/tmp/claude-mcp-browser-bridge-$(id -un)"
+  mkdir -p "$_bdir"
+  chmod 700 "$_bdir"
+  socat "UNIX-LISTEN:${_bdir}/host.sock,fork,unlink-early" \
+    "TCP:host.containers.internal:${CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT}" &
+  _tries=0
+  while [ ! -S "${_bdir}/host.sock" ] && [ "$_tries" -lt 50 ]; do
+    sleep 0.1
+    _tries=$((_tries + 1))
+  done
+fi
+
 # Seed a fresh GNUPGHOME with the host's public keys; signing uses the forwarded
 # gpg-agent (the secret keys/card stay on the host).
 if [ -n "$CLAUDE_SANDBOX_GPG_PUBKEYS" ]; then

@@ -53,6 +53,7 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_clipboard", False)
+    monkeypatch.setattr(claude_profile.settings, "sandbox_chrome", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_gh", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_infisical", "")
     monkeypatch.setattr(claude_profile.settings, "sandbox_pulumi", False)
@@ -1716,6 +1717,142 @@ def test_launch_clipboard_no_wl_paste_exits(
     with pytest.raises(SystemExit) as exc_info:
         _launch_profile("work", [])
     assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# Claude in Chrome bridge
+# ---------------------------------------------------------------------------
+
+
+def test_browser_bridge_live_true_with_listener(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import socket as _socket
+
+    d = tmp_path / "bridge"
+    d.mkdir()
+    monkeypatch.setattr(claude_profile, "_browser_bridge_dir", lambda: d)
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    srv.bind(str(d / "123.sock"))
+    srv.listen(1)
+    try:
+        assert claude_profile._browser_bridge_live() is True
+    finally:
+        srv.close()
+
+
+def test_browser_bridge_live_false_stale_socket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import socket as _socket
+
+    d = tmp_path / "bridge"
+    d.mkdir()
+    monkeypatch.setattr(claude_profile, "_browser_bridge_dir", lambda: d)
+    # Bound then closed without listen(): the socket file remains but connect is
+    # refused — a stale native-host socket left behind after a crash.
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    srv.bind(str(d / "456.sock"))
+    srv.close()
+    assert claude_profile._browser_bridge_live() is False
+
+
+def test_browser_bridge_live_false_missing_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        claude_profile, "_browser_bridge_dir", lambda: tmp_path / "nope"
+    )
+    assert claude_profile._browser_bridge_live() is False
+
+
+def test_build_forwarding_chrome_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_chrome", True)
+    monkeypatch.setattr(claude_profile, "_browser_bridge_live", lambda: True)
+    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 8888)
+    fwd = claude_profile._build_forwarding()
+    assert fwd.forwards == []
+    assert fwd.browser_port == 8888
+    assert fwd.active() is True
+
+
+def test_build_forwarding_chrome_port_set_even_when_not_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_chrome", True)
+    monkeypatch.setattr(claude_profile, "_browser_bridge_live", lambda: False)
+    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 8888)
+    # The guest still presents the socket and reconnects until the host native host
+    # appears, so the port is allocated regardless; the warning is informational.
+    fwd = claude_profile._build_forwarding()
+    assert fwd.browser_port == 8888
+
+
+def test_build_forwarding_no_chrome_when_disabled() -> None:
+    fwd = claude_profile._build_forwarding()
+    assert fwd.browser_port is None
+    assert fwd.active() is False
+
+
+def test_forwarding_env_chrome_only() -> None:
+    fwd = claude_profile._Forwarding([], browser_port=8888)
+    env = claude_profile._forwarding_env(fwd)
+    assert f"{claude_profile.SANDBOX_BROWSER_BRIDGE_PORT_ENV}=8888" in env
+    assert not any(e.startswith("CLAUDE_SANDBOX_FORWARDS") for e in env)
+
+
+def test_argv_chrome_adds_pasta_and_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    fwd = claude_profile._Forwarding([], browser_port=8888)
+    argv = _build_sandbox_argv(profile, cwd, [], {}, fwd)
+    assert any(arg.startswith("--network=pasta") for arg in argv)
+    assert f"{claude_profile.SANDBOX_BROWSER_BRIDGE_PORT_ENV}=8888" in argv
+
+
+def test_browser_bridge_host_handler_is_packaged() -> None:
+    handler = claude_profile._browser_bridge_host_handler()
+    assert handler.name == "browser_bridge_host.sh"
+    assert handler.exists()
+
+
+def test_launch_supervised_chrome_only(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / SANDBOX_MARKER).touch()
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    fwd = claude_profile._Forwarding([], browser_port=8888)
+    monkeypatch.setattr(claude_profile, "_build_forwarding", lambda: fwd)
+    monkeypatch.setattr(claude_profile.shutil, "which", lambda _: "/usr/bin/tool")
+    browser_ports: list[int] = []
+
+    def fake_browser_bridge(port: int) -> Mock:
+        browser_ports.append(port)
+        return Mock()
+
+    monkeypatch.setattr(
+        claude_profile, "_start_browser_host_bridge", fake_browser_bridge
+    )
+    monkeypatch.chdir(tmp_path)
+    with (
+        patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run,
+        patch("os.execvpe") as mock_exec,
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        _launch_profile("work", [])
+    assert exc_info.value.code == 0
+    mock_exec.assert_not_called()
+    run.assert_called_once()
+    assert any(arg.startswith("--network=pasta") for arg in run.call_args[0][0])
+    assert browser_ports == [8888]
 
 
 # ---------------------------------------------------------------------------
