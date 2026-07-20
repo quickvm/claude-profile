@@ -1769,10 +1769,12 @@ def test_browser_bridge_live_false_missing_dir(
 def test_build_forwarding_chrome_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(claude_profile.settings, "sandbox_chrome", True)
     monkeypatch.setattr(claude_profile, "_browser_bridge_live", lambda: True)
-    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 8888)
+    ports = iter([8888, 9999])
+    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: next(ports))
     fwd = claude_profile._build_forwarding()
     assert fwd.forwards == []
     assert fwd.browser_port == 8888
+    assert fwd.browser_open_port == 9999
     assert fwd.active() is True
 
 
@@ -1799,6 +1801,19 @@ def test_forwarding_env_chrome_only() -> None:
     env = claude_profile._forwarding_env(fwd)
     assert f"{claude_profile.SANDBOX_BROWSER_BRIDGE_PORT_ENV}=8888" in env
     assert not any(e.startswith("CLAUDE_SANDBOX_FORWARDS") for e in env)
+
+
+def test_forwarding_env_browser_open() -> None:
+    fwd = claude_profile._Forwarding([], browser_open_port=9999)
+    env = claude_profile._forwarding_env(fwd)
+    assert f"{claude_profile.SANDBOX_BROWSER_OPEN_PORT_ENV}=9999" in env
+    assert fwd.active() is True
+
+
+def test_browser_open_host_handler_is_packaged() -> None:
+    handler = claude_profile._browser_open_host_handler()
+    assert handler.name == "browser_open_host.sh"
+    assert handler.exists()
 
 
 def test_argv_chrome_adds_pasta_and_env(
@@ -1829,17 +1844,25 @@ def test_launch_supervised_chrome_only(
     (profile / SANDBOX_MARKER).touch()
     monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
-    fwd = claude_profile._Forwarding([], browser_port=8888)
+    fwd = claude_profile._Forwarding([], browser_port=8888, browser_open_port=9999)
     monkeypatch.setattr(claude_profile, "_build_forwarding", lambda: fwd)
     monkeypatch.setattr(claude_profile.shutil, "which", lambda _: "/usr/bin/tool")
     browser_ports: list[int] = []
+    browser_open_ports: list[int] = []
 
     def fake_browser_bridge(port: int) -> Mock:
         browser_ports.append(port)
         return Mock()
 
+    def fake_browser_open_bridge(port: int) -> Mock:
+        browser_open_ports.append(port)
+        return Mock()
+
     monkeypatch.setattr(
         claude_profile, "_start_browser_host_bridge", fake_browser_bridge
+    )
+    monkeypatch.setattr(
+        claude_profile, "_start_browser_open_host_bridge", fake_browser_open_bridge
     )
     monkeypatch.chdir(tmp_path)
     with (
@@ -1851,8 +1874,11 @@ def test_launch_supervised_chrome_only(
     assert exc_info.value.code == 0
     mock_exec.assert_not_called()
     run.assert_called_once()
-    assert any(arg.startswith("--network=pasta") for arg in run.call_args[0][0])
+    argv = run.call_args[0][0]
+    assert any(arg.startswith("--network=pasta") for arg in argv)
+    assert f"{claude_profile.SANDBOX_BROWSER_OPEN_PORT_ENV}=9999" in argv
     assert browser_ports == [8888]
+    assert browser_open_ports == [9999]
 
 
 # ---------------------------------------------------------------------------

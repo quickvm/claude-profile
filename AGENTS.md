@@ -165,6 +165,23 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   native host is currently listening), `_forwarding_env` exports `CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT`,
   and `_run_sandbox_supervised` starts/tears down the host bridge. Nothing but clipboard-style socat
   relaying crosses the boundary — the host filesystem and other browser state stay out of the VM.
+  The native host only exists while Chrome's extension holds its native-messaging port; that spawn is
+  triggered CLI-side by Claude Code opening a connect page (`clau.de/chrome/reconnect`) in a browser,
+  and the extension's service worker idles (dropping the link) — both upstream behaviors the socket
+  bridge can't fix on its own, which is what the browser-open shim below addresses.
+- **Browser-open shim (part of `sandbox_chrome`):** the socket bridge is useless if nothing spawns the
+  host native host, and the VM has no browser to open the connect/reconnect page that wakes the
+  extension. Claude Code detects a browser with `which google-chrome` and opens URLs by running
+  `google-chrome <url>`, so the image ships a `google-chrome` shim (+ `google-chrome-stable` symlink)
+  at `/usr/local/bin` (`src/claude_profile/sandbox/google-chrome`) that relays the URL over pasta
+  (bash `/dev/tcp`, no guest socat) to a second host bridge. `_start_browser_open_host_bridge` runs
+  `socat TCP-LISTEN:$port … EXEC:bash browser_open_host.sh`, which opens the URL in the host's real
+  Chrome **only** for Anthropic's `clau.de`/`claude.ai` `/chrome` URLs (so a misbehaving sandbox can't
+  open arbitrary pages in the host's logged-in browser), and acks `OK`/`NO`. `sandbox_chrome` allocates
+  both ports; `_forwarding_env` exports `CLAUDE_SANDBOX_BROWSER_OPEN_PORT` (the shim is inert without
+  it, so browser detection stays harmless when disabled). Net effect: `/chrome` → "Reconnect extension"
+  inside the sandbox opens the page in host Chrome, waking the extension so it spawns the native host
+  the socket bridge then relays to.
 - **GitHub CLI (`sandbox_gh`):** the image bakes `gh`, and enabling `sandbox_gh` forwards your
   GitHub login into the VM. `gh` keeps its token in the system keyring (or `hosts.yml`), which a
   microVM can't reach, so `_with_gh_token` reads it on the host via `gh auth token` and injects it
