@@ -200,6 +200,26 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   it, so browser detection stays harmless when disabled). Net effect: `/chrome` → "Reconnect extension"
   inside the sandbox opens the page in host Chrome, waking the extension so it spawns the native host
   the socket bridge then relays to.
+- **Chrome enablement gates (why it says "Disabled"):** claude gates Claude in Chrome behind
+  several checks, in this order: an **OAuth scope** check (`KYn()` — the token must carry one of
+  `user:profile`/`user:office`/`user:ccr_inference`), then the `--chrome` flag, then
+  `CLAUDE_CODE_ENABLE_CFC`, then `dn()` (`!isInteractive`), and only then the profile's
+  `claudeInChromeDefaultEnabled`. Two of those bite the sandbox: a profile authenticated with a
+  **setup-token gets `user:inference` only**, so Chrome reports "Disabled" no matter what the
+  bridge does (fix: `CLAUDE_PROFILE_SANDBOX=0 claude-profile <name> /login` for a full OAuth
+  login — `_warn_missing_chrome_scope` checks this at launch and points at the fix); and the
+  sandbox launch trips `dn()`, which sits ahead of the config default, so `_build_sandbox_argv`
+  auto-appends `--chrome` (checked before `dn()`) whenever `sandbox_chrome` is set. Note
+  `/chrome` may still show "Extension: Not detected" until you pick **Install Chrome extension**
+  once in the session — that writes the native-messaging manifest the CLI's detection looks for
+  (the VM's copy is throwaway, so it is per-session); browser tools work through the bridge
+  regardless of that cosmetic status.
+- **Protecting the host's native-host wrapper:** the profile is mounted as the in-VM config dir,
+  so an in-VM "Install Chrome extension" rewrites `<profile>/chrome/chrome-native-host` to an
+  in-VM path (`/home/appuser/…`). Chrome's manifest on the **host** points at that same wrapper,
+  so the in-VM install silently breaks the host's Chrome integration — Chrome can no longer spawn
+  the native host. `_sandbox_chrome_overlay` masks the dir with a per-launch throwaway
+  (`<profile>/chrome.sandbox`) mounted over `<config>/chrome`, keeping in-VM installs in the VM.
 - **GitHub CLI (`sandbox_gh`):** the image bakes `gh`, and enabling `sandbox_gh` forwards your
   GitHub login into the VM. `gh` keeps its token in the system keyring (or `hosts.yml`), which a
   microVM can't reach, so `_with_gh_token` reads it on the host via `gh auth token` and injects it

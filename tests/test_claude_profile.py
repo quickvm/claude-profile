@@ -814,7 +814,7 @@ def test_sandbox_mounts_no_git(
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
     mounts = _sandbox_mounts(profile, cwd)
     # profile config + cwd + per-profile user known_hosts
-    assert mounts.count("-v") == 3
+    assert mounts.count("-v") == 4  # +1 for the chrome-dir mask
     assert f"{cwd}:{cwd}:z" in mounts
 
 
@@ -830,7 +830,7 @@ def test_sandbox_mounts_includes_external_git_dir(
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: git_dir)
     mounts = _sandbox_mounts(profile, cwd)
     # profile config + cwd + git dir + per-profile user known_hosts
-    assert mounts.count("-v") == 4
+    assert mounts.count("-v") == 5  # +1 for the chrome-dir mask
     assert f"{git_dir}:{git_dir}:z" in mounts
 
 
@@ -844,7 +844,7 @@ def test_sandbox_mounts_skips_git_dir_inside_cwd(
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: cwd / ".git")
     mounts = _sandbox_mounts(profile, cwd)
     # profile config + cwd + per-profile user known_hosts (git dir skipped, inside cwd)
-    assert mounts.count("-v") == 3
+    assert mounts.count("-v") == 4  # +1 for the chrome-dir mask
 
 
 # ---------------------------------------------------------------------------
@@ -1846,6 +1846,79 @@ def test_argv_no_chrome_flag_when_disabled(
     cwd.mkdir()
     argv = _build_sandbox_argv(profile, cwd, [], {})
     assert "--chrome" not in argv
+
+
+def test_sandbox_mounts_masks_profile_chrome_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # an in-VM "Install Chrome extension" must not rewrite the host's native-host wrapper
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    (profile / "chrome").mkdir()
+    (profile / "chrome" / "chrome-native-host").write_text("host wrapper\n")
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    assert (
+        f"{profile / 'chrome.sandbox'}:{claude_profile.SANDBOX_CONFIG_DIR}/chrome:z"
+        in mounts
+    )
+    # the real wrapper is untouched on the host
+    assert (profile / "chrome" / "chrome-native-host").read_text() == "host wrapper\n"
+
+
+def _write_creds(profile: Path, scopes: list[str]) -> None:
+    (profile / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "t", "scopes": scopes}})
+    )
+
+
+def test_profile_oauth_scopes_reads_scopes(tmp_path: Path) -> None:
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    _write_creds(profile, ["user:inference", "user:profile"])
+    assert claude_profile._profile_oauth_scopes(profile) == [
+        "user:inference",
+        "user:profile",
+    ]
+
+
+def test_profile_oauth_scopes_none_when_missing(tmp_path: Path) -> None:
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    assert claude_profile._profile_oauth_scopes(profile) is None
+
+
+def test_warn_missing_chrome_scope_warns_for_setup_token(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    profile = tmp_path / "personal"
+    profile.mkdir()
+    _write_creds(profile, ["user:inference"])  # setup-token style
+    claude_profile._warn_missing_chrome_scope(profile)
+    err = capsys.readouterr().err
+    assert "user:profile" in err
+    assert "/login" in err
+
+
+def test_warn_missing_chrome_scope_silent_when_scope_present(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    profile = tmp_path / "personal"
+    profile.mkdir()
+    _write_creds(profile, ["user:inference", "user:profile"])
+    claude_profile._warn_missing_chrome_scope(profile)
+    assert capsys.readouterr().err == ""
+
+
+def test_warn_missing_chrome_scope_silent_without_creds(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    profile = tmp_path / "personal"
+    profile.mkdir()
+    claude_profile._warn_missing_chrome_scope(profile)
+    assert capsys.readouterr().err == ""
 
 
 def test_browser_open_host_handler_is_packaged() -> None:

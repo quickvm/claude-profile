@@ -68,6 +68,12 @@ SANDBOX_CLIPBOARD_PORT_ENV = "CLAUDE_SANDBOX_CLIPBOARD_PORT"
 SANDBOX_BROWSER_BRIDGE_PORT_ENV = "CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT"
 # Env var carrying the host browser-open TCP port to the in-VM google-chrome shim.
 SANDBOX_BROWSER_OPEN_PORT_ENV = "CLAUDE_SANDBOX_BROWSER_OPEN_PORT"
+# OAuth scopes claude accepts for Claude in Chrome. It gates the integration on the token
+# carrying one of these *before* every other enable condition, so a profile authenticated
+# with a setup-token (which grants user:inference only) silently reports "Disabled".
+CHROME_OAUTH_SCOPES: frozenset[str] = frozenset(
+    {"user:profile", "user:office", "user:ccr_inference"}
+)
 # Deny-rule prefixes stripped from the in-VM settings overlay: host guardrails that
 # are counterproductive inside the isolated microVM (deny beats
 # --dangerously-skip-permissions, so they still apply there). The VM grants OS-level
@@ -822,6 +828,21 @@ def _sandbox_settings_overlay(profile_dir: Path) -> Optional[Path]:
     return overlay
 
 
+def _sandbox_chrome_overlay(profile_dir: Path) -> Path:
+    """Throwaway dir mounted over the profile's ``chrome/`` inside the VM.
+
+    The profile is mounted as the in-VM config dir, so claude's "Install Chrome extension"
+    run *inside* the sandbox rewrites ``chrome/chrome-native-host`` to an in-VM path
+    (``/home/appuser/...``). Chrome's native-messaging manifest on the host points at that
+    same wrapper, so the in-VM install silently breaks the **host's** Chrome integration —
+    Chrome can no longer spawn the native host. Masking the dir keeps in-VM installs inside
+    the VM while leaving the host's wrapper intact.
+    """
+    overlay = profile_dir / "chrome.sandbox"
+    overlay.mkdir(exist_ok=True)
+    return overlay
+
+
 def _storage_cache_conf(profile_dir: Path) -> Path:
     """Write the storage.conf overlay adding the mounted store as a read-only
     additionalimagestore (regenerated each launch), and return its path."""
@@ -886,6 +907,12 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
         f"{profile_dir}:{SANDBOX_CONFIG_DIR}:z",
         "-v",
         f"{cwd}:{cwd}:z",
+    ]
+    # Mask the profile's chrome/ dir: an in-VM native-host install must not rewrite the
+    # host's wrapper, which Chrome's manifest points at (see _sandbox_chrome_overlay).
+    mounts += [
+        "-v",
+        f"{_sandbox_chrome_overlay(profile_dir)}:{SANDBOX_CONFIG_DIR}/chrome:z",
     ]
     overlay = _sandbox_settings_overlay(profile_dir)
     if overlay is not None:
@@ -1271,6 +1298,41 @@ def _start_browser_host_bridge(port: int) -> subprocess.Popen[bytes]:
     )
 
 
+def _profile_oauth_scopes(profile_dir: Path) -> Optional[list[str]]:
+    """Return the profile's OAuth scopes, or None if credentials are absent/unreadable."""
+    try:
+        data = json.loads((profile_dir / ".credentials.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    scopes = oauth.get("scopes")
+    return scopes if isinstance(scopes, list) else None
+
+
+def _warn_missing_chrome_scope(profile_dir: Path) -> None:
+    """Warn when sandbox_chrome is on but the profile's token can't enable Chrome.
+
+    claude checks the OAuth scope first, ahead of ``--chrome`` and every other condition,
+    so a profile authenticated with a setup-token (``user:inference`` only) reports
+    "Status: Disabled" with no hint as to why. Surface that here instead, since the fix is
+    a re-login rather than anything the bridge can do. Unreadable credentials are left
+    alone — claude reports auth problems itself.
+    """
+    scopes = _profile_oauth_scopes(profile_dir)
+    if scopes is None or CHROME_OAUTH_SCOPES & set(scopes):
+        return
+    err_console.print(
+        f"[yellow]Warning: CLAUDE_PROFILE_SANDBOX_CHROME is set but profile "
+        f"'{profile_dir.name}' has OAuth scopes {sorted(scopes)}, none of which claude "
+        f"accepts for Claude in Chrome (needs one of {sorted(CHROME_OAUTH_SCOPES)}). "
+        f"Chrome will report 'Disabled' regardless of the bridge. A setup-token login "
+        f"grants user:inference only — re-authenticate with a full OAuth login: "
+        f"CLAUDE_PROFILE_SANDBOX=0 claude-profile {profile_dir.name} /login[/yellow]"
+    )
+
+
 def _browser_open_host_handler() -> Path:
     """Path to the packaged host-side browser-open handler script."""
     return Path(str(resources.files("claude_profile") / "browser_open_host.sh"))
@@ -1584,6 +1646,8 @@ def _launch_sandbox(
             f"UID and forward SSH/GPG agents. End your Containerfile with `USER root`."
             f"[/yellow]"
         )
+    if settings.sandbox_chrome:
+        _warn_missing_chrome_scope(profile_dir)
     extra_env = _with_gh_token(extra_env)
     extra_env = _with_infisical_env(extra_env)
     extra_env = _with_pulumi_token(extra_env)
