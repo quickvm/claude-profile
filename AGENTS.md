@@ -153,10 +153,13 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   the `com.anthropic.claude_code_browser_extension` native-messaging manifest). That native host
   **binds** a Unix socket at `/tmp/claude-mcp-browser-bridge-<user>/<pid>.sock`; the interactive
   claude session is the client — it scans that dir, connects out, and (per its `validateSocketSecurity`)
-  requires the dir be mode `0700`. The microVM has its own kernel, so it can't reach the host socket
-  directly. Discovery is inverted vs. the ssh/gpg bridges (guest connects, not the host), so the
-  entrypoint presents a guest-side socket: it creates `/tmp/claude-mcp-browser-bridge-$(id -un)`
-  (the VM user is `appuser`) at mode `0700` and `socat UNIX-LISTEN … host.sock` → `TCP:host.containers.internal:$port`
+  requires the dir be mode `0700` owned by the current uid AND the socket itself be mode `0600` (it
+  throws "Insecure socket permissions (expected 0600)" and reports the extension as "Not detected"
+  otherwise — which is why the real native host binds its socket `srw-------`). The microVM has its own
+  kernel, so it can't reach the host socket directly. Discovery is inverted vs. the ssh/gpg bridges
+  (guest connects, not the host), so the entrypoint presents a guest-side socket: it creates
+  `/tmp/claude-mcp-browser-bridge-$(id -un)` (the VM user is `appuser`) at mode `0700` and
+  `socat UNIX-LISTEN … host.sock,perm=0600` → `TCP:host.containers.internal:$port`
   over pasta, waiting for the socket to bind before exec'ing claude (claude scans at startup). On the
   host, `_start_browser_host_bridge` runs `socat TCP-LISTEN:$port … EXEC:bash browser_bridge_host.sh`;
   the resolver picks the **newest** live native-host socket per connection and relays to it, so the
