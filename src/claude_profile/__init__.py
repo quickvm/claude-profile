@@ -68,6 +68,18 @@ SANDBOX_CLIPBOARD_PORT_ENV = "CLAUDE_SANDBOX_CLIPBOARD_PORT"
 SANDBOX_BROWSER_BRIDGE_PORT_ENV = "CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT"
 # Env var carrying the host browser-open TCP port to the in-VM google-chrome shim.
 SANDBOX_BROWSER_OPEN_PORT_ENV = "CLAUDE_SANDBOX_BROWSER_OPEN_PORT"
+# Chrome Web Store id of the Claude extension, and the env var naming the in-VM path to
+# create so claude's extension detection (a readdir of
+# <chrome-user-data>/<profile>/Extensions/<id>) succeeds inside the sandbox.
+CHROME_EXTENSION_ID = "fcoeoabgfenejglbffodgkkbkcdhcgfn"
+SANDBOX_CHROME_EXT_PATH_ENV = "CLAUDE_SANDBOX_CHROME_EXT_PATH"
+# Chromium-family user-data dirs under ~/.config to look for the extension in.
+CHROME_USER_DATA_DIRS: tuple[str, ...] = (
+    "google-chrome",
+    "chromium",
+    "microsoft-edge",
+    "BraveSoftware/Brave-Browser",
+)
 # OAuth scopes claude accepts for Claude in Chrome. It gates the integration on the token
 # carrying one of these *before* every other enable condition, so a profile authenticated
 # with a setup-token (which grants user:inference only) silently reports "Disabled".
@@ -1298,6 +1310,35 @@ def _start_browser_host_bridge(port: int) -> subprocess.Popen[bytes]:
     )
 
 
+def _chrome_extension_guest_path() -> Optional[str]:
+    """In-VM path to create so claude detects the extension, or None if it isn't installed.
+
+    claude reports "Extension: Installed" by readdir'ing
+    ``<chrome-user-data>/<profile>/Extensions/<id>``; the VM has no Chrome install, so it
+    always reports "Not detected" even with the bridge working. Find the extension in a
+    host browser profile and return the equivalent in-VM path — only the directory's
+    existence is checked, so the entrypoint just creates it. Returning None when the
+    extension is genuinely absent keeps the reported status honest, and the host's Chrome
+    profile (cookies, history, passwords) is never exposed to the VM.
+    """
+    config = Path.home() / ".config"
+    for browser in CHROME_USER_DATA_DIRS:
+        user_data = config / browser
+        if not user_data.is_dir():
+            continue
+        for profile in sorted(user_data.iterdir()):
+            if not profile.is_dir():
+                continue
+            if profile.name != "Default" and not profile.name.startswith("Profile "):
+                continue
+            if (profile / "Extensions" / CHROME_EXTENSION_ID).is_dir():
+                return (
+                    f"/home/appuser/.config/{browser}/{profile.name}"
+                    f"/Extensions/{CHROME_EXTENSION_ID}"
+                )
+    return None
+
+
 def _profile_oauth_scopes(profile_dir: Path) -> Optional[list[str]]:
     """Return the profile's OAuth scopes, or None if credentials are absent/unreadable."""
     try:
@@ -1648,6 +1689,9 @@ def _launch_sandbox(
         )
     if settings.sandbox_chrome:
         _warn_missing_chrome_scope(profile_dir)
+        ext_path = _chrome_extension_guest_path()
+        if ext_path is not None:
+            extra_env = {**extra_env, SANDBOX_CHROME_EXT_PATH_ENV: ext_path}
     extra_env = _with_gh_token(extra_env)
     extra_env = _with_infisical_env(extra_env)
     extra_env = _with_pulumi_token(extra_env)

@@ -54,29 +54,17 @@ if [ -n "$CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT" ]; then
     _tries=$((_tries + 1))
   done
 
-  # claude detects the extension by looking for the native-messaging manifest on the local
-  # filesystem, which a VM with no Chrome install lacks — so /chrome reports "Extension: Not
-  # detected" even though the bridge works, and picking "Install Chrome extension" (which just
-  # writes this file) is needed every session because the VM is ephemeral. Write it up front.
-  # The wrapper it names is only read by Chrome, which isn't here; the real connection is the
-  # bridged socket above. Both land in throwaway VM paths (~/.claude/chrome is masked by
-  # claude_profile._sandbox_chrome_overlay), so the host's wrapper is never touched.
-  _nmdir="$HOME/.config/google-chrome/NativeMessagingHosts"
-  mkdir -p "$_nmdir" "$HOME/.claude/chrome"
-  printf '#!/bin/sh\nexec "%s" --chrome-native-host\n' "$(command -v claude)" \
-    >"$HOME/.claude/chrome/chrome-native-host"
-  chmod +x "$HOME/.claude/chrome/chrome-native-host"
-  cat >"$_nmdir/com.anthropic.claude_code_browser_extension.json" <<JSON
-{
-  "name": "com.anthropic.claude_code_browser_extension",
-  "description": "Claude Code Browser Extension Native Host",
-  "path": "$HOME/.claude/chrome/chrome-native-host",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://fcoeoabgfenejglbffodgkkbkcdhcgfn/"
-  ]
-}
-JSON
+fi
+
+# claude reports "Extension: Installed" by readdir'ing
+# <chrome-user-data>/<profile>/Extensions/<extension-id>. A VM with no Chrome install always
+# fails that, so /chrome shows "Extension: Not detected" even though the bridge works and the
+# extension really is installed — on the host, where Chrome runs. claude-profile passes the
+# path to create only when it verified the extension on the host, so the status stays honest.
+# Only the directory's existence is checked, so an empty dir suffices; the host's Chrome
+# profile (cookies, history, passwords) is deliberately never exposed to the VM.
+if [ -n "$CLAUDE_SANDBOX_CHROME_EXT_PATH" ]; then
+  mkdir -p "$CLAUDE_SANDBOX_CHROME_EXT_PATH"
 fi
 
 # Seed a fresh GNUPGHOME with the host's public keys; signing uses the forwarded

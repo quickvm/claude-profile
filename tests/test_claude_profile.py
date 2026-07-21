@@ -1848,6 +1848,43 @@ def test_argv_no_chrome_flag_when_disabled(
     assert "--chrome" not in argv
 
 
+def test_chrome_extension_guest_path_found(fake_home: Path) -> None:
+    ext = (
+        fake_home
+        / ".config"
+        / "google-chrome"
+        / "Default"
+        / "Extensions"
+        / claude_profile.CHROME_EXTENSION_ID
+    )
+    ext.mkdir(parents=True)
+    assert claude_profile._chrome_extension_guest_path() == (
+        f"/home/appuser/.config/google-chrome/Default/Extensions/"
+        f"{claude_profile.CHROME_EXTENSION_ID}"
+    )
+
+
+def test_chrome_extension_guest_path_none_when_absent(fake_home: Path) -> None:
+    (fake_home / ".config" / "google-chrome" / "Default").mkdir(parents=True)
+    assert claude_profile._chrome_extension_guest_path() is None
+
+
+def test_chrome_extension_guest_path_finds_numbered_profile(fake_home: Path) -> None:
+    ext = (
+        fake_home
+        / ".config"
+        / "chromium"
+        / "Profile 2"
+        / "Extensions"
+        / claude_profile.CHROME_EXTENSION_ID
+    )
+    ext.mkdir(parents=True)
+    assert claude_profile._chrome_extension_guest_path() == (
+        f"/home/appuser/.config/chromium/Profile 2/Extensions/"
+        f"{claude_profile.CHROME_EXTENSION_ID}"
+    )
+
+
 def test_sandbox_mounts_masks_profile_chrome_dir(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

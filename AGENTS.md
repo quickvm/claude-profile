@@ -209,12 +209,15 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   bridge does (fix: `CLAUDE_PROFILE_SANDBOX=0 claude-profile <name> /login` for a full OAuth
   login — `_warn_missing_chrome_scope` checks this at launch and points at the fix); and the
   sandbox launch trips `dn()`, which sits ahead of the config default, so `_build_sandbox_argv`
-  auto-appends `--chrome` (checked before `dn()`) whenever `sandbox_chrome` is set. claude also detects the
-  extension by looking for the native-messaging manifest on the **local** filesystem, which a VM
-  with no Chrome install lacks — so `/chrome` reported "Extension: Not detected" until you picked
-  **Install Chrome extension** (which just writes that file), every session, since the VM is
-  ephemeral. The entrypoint now writes that manifest at startup so the status is right from the
-  start; browser tools work through the bridge either way.
+  auto-appends `--chrome` (checked before `dn()`) whenever `sandbox_chrome` is set. claude separately reports
+  **Extension: Installed** by `readdir`-ing `<chrome-user-data>/<profile>/Extensions/<ext-id>`
+  (*not* the native-messaging manifest), which a VM with no Chrome install always fails — so
+  `/chrome` showed "Not detected" even with the bridge working. `_chrome_extension_guest_path`
+  locates the extension in a host browser profile and passes the equivalent in-VM path as
+  `CLAUDE_SANDBOX_CHROME_EXT_PATH`; the entrypoint creates just that directory (only its
+  existence is checked). It returns None when the extension really is absent, so the status stays
+  honest, and the host's Chrome profile — cookies, history, passwords — is never mounted into the
+  VM. Browser tools work through the bridge either way; this only fixes the reported status.
 - **Protecting the host's native-host wrapper:** the profile is mounted as the in-VM config dir,
   so an in-VM "Install Chrome extension" rewrites `<profile>/chrome/chrome-native-host` to an
   in-VM path (`/home/appuser/…`). Chrome's manifest on the **host** points at that same wrapper,
