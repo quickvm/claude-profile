@@ -209,11 +209,12 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   bridge does (fix: `CLAUDE_PROFILE_SANDBOX=0 claude-profile <name> /login` for a full OAuth
   login — `_warn_missing_chrome_scope` checks this at launch and points at the fix); and the
   sandbox launch trips `dn()`, which sits ahead of the config default, so `_build_sandbox_argv`
-  auto-appends `--chrome` (checked before `dn()`) whenever `sandbox_chrome` is set. Note
-  `/chrome` may still show "Extension: Not detected" until you pick **Install Chrome extension**
-  once in the session — that writes the native-messaging manifest the CLI's detection looks for
-  (the VM's copy is throwaway, so it is per-session); browser tools work through the bridge
-  regardless of that cosmetic status.
+  auto-appends `--chrome` (checked before `dn()`) whenever `sandbox_chrome` is set. claude also detects the
+  extension by looking for the native-messaging manifest on the **local** filesystem, which a VM
+  with no Chrome install lacks — so `/chrome` reported "Extension: Not detected" until you picked
+  **Install Chrome extension** (which just writes that file), every session, since the VM is
+  ephemeral. The entrypoint now writes that manifest at startup so the status is right from the
+  start; browser tools work through the bridge either way.
 - **Protecting the host's native-host wrapper:** the profile is mounted as the in-VM config dir,
   so an in-VM "Install Chrome extension" rewrites `<profile>/chrome/chrome-native-host` to an
   in-VM path (`/home/appuser/…`). Chrome's manifest on the **host** points at that same wrapper,
