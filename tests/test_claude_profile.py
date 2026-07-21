@@ -2441,6 +2441,30 @@ def test_with_forwarded_env_forwards_present(monkeypatch: pytest.MonkeyPatch) ->
     }
 
 
+def test_with_forwarded_env_silent_when_dotenv_supplies_it(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # set via `claude-profile env --set` (profile .env -> extra_env), absent from host env
+    monkeypatch.setattr(
+        claude_profile.settings, "sandbox_forward_env", "BUILDKITE_API_TOKEN"
+    )
+    monkeypatch.delenv("BUILDKITE_API_TOKEN", raising=False)
+    out = claude_profile._with_forwarded_env({"BUILDKITE_API_TOKEN": "from-dotenv"})
+    assert out["BUILDKITE_API_TOKEN"] == "from-dotenv"
+    assert capsys.readouterr().err == ""
+
+
+def test_with_forwarded_env_host_value_wins_over_dotenv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        claude_profile.settings, "sandbox_forward_env", "BUILDKITE_API_TOKEN"
+    )
+    monkeypatch.setenv("BUILDKITE_API_TOKEN", "from-host")
+    out = claude_profile._with_forwarded_env({"BUILDKITE_API_TOKEN": "from-dotenv"})
+    assert out["BUILDKITE_API_TOKEN"] == "from-host"
+
+
 def test_with_forwarded_env_skips_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         claude_profile.settings, "sandbox_forward_env", "PRESENT_V,MISSING_V"

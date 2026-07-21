@@ -1656,7 +1656,9 @@ def _with_forwarded_env(extra_env: dict[str, str]) -> dict[str, str]:
     A comma-separated list of variable names; each one present in the host environment
     is copied into the VM. Lets host-oriented MCP servers that pass secrets through as
     ``-e VAR`` (e.g. BUILDKITE_API_TOKEN, GITHUB_PERSONAL_ACCESS_TOKEN) find them inside
-    the VM. Names not set on the host are warned about and skipped.
+    the VM. A name the profile's ``.env`` already supplies (``claude-profile env --set``)
+    is left alone — it reaches the VM either way, so warning about it would be wrong. Only
+    names available from neither source are warned about and skipped.
     """
     names = [n.strip() for n in settings.sandbox_forward_env.split(",") if n.strip()]
     if not names:
@@ -1664,13 +1666,16 @@ def _with_forwarded_env(extra_env: dict[str, str]) -> dict[str, str]:
     forwarded = dict(extra_env)
     for name in names:
         value = os.environ.get(name)
-        if value is None:
-            err_console.print(
-                f"[yellow]Warning: CLAUDE_PROFILE_SANDBOX_FORWARD_ENV lists '{name}' but "
-                f"it is not set in the environment; skipping.[/yellow]"
-            )
+        if value is not None:
+            forwarded[name] = value
             continue
-        forwarded[name] = value
+        if name in extra_env:
+            continue  # already provided by the profile's .env
+        err_console.print(
+            f"[yellow]Warning: CLAUDE_PROFILE_SANDBOX_FORWARD_ENV lists '{name}' but it "
+            f"is set neither in the environment nor in the profile's .env; skipping. Set "
+            f"it with: claude-profile env <name> --set {name}=…[/yellow]"
+        )
     return forwarded
 
 
