@@ -1240,23 +1240,25 @@ def _start_clipboard_host_bridge(port: int) -> subprocess.Popen[bytes]:
 
 
 def _browser_bridge_host_handler() -> Path:
-    """Path to the packaged host-side Claude-in-Chrome bridge handler script."""
-    return Path(str(resources.files("claude_profile") / "browser_bridge_host.sh"))
+    """Path to the packaged host-side Claude-in-Chrome bridge proxy."""
+    return Path(str(resources.files("claude_profile") / "browser_bridge_host.py"))
 
 
 def _start_browser_host_bridge(port: int) -> subprocess.Popen[bytes]:
     """Serve the host Claude in Chrome native-host socket to the VM.
 
-    socat execs the handler per guest connection; the handler resolves the newest
-    ``claude --chrome-native-host`` socket and relays to it, so the bridge follows
-    Chrome's native host across restarts (its socket pid changes each spawn).
+    socat execs the proxy per guest connection; it resolves the newest
+    ``claude --chrome-native-host`` socket (so the bridge follows Chrome's native host
+    across restarts, its pid changing each spawn), relays the framed messages, and
+    injects a keepalive during idle gaps so Chrome's MV3 service worker does not go idle
+    and kill the native host mid-session.
     """
     handler = _browser_bridge_host_handler()
     return subprocess.Popen(
         [
             "socat",
             f"TCP-LISTEN:{port},bind=127.0.0.1,reuseaddr,fork",
-            f"EXEC:bash {handler}",
+            f"EXEC:python3 {handler}",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

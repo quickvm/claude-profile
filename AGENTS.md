@@ -161,13 +161,28 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   `/tmp/claude-mcp-browser-bridge-$(id -un)` (the VM user is `appuser`) at mode `0700` and
   `socat UNIX-LISTEN … host.sock,perm=0600` → `TCP:host.containers.internal:$port`
   over pasta, waiting for the socket to bind before exec'ing claude (claude scans at startup). On the
-  host, `_start_browser_host_bridge` runs `socat TCP-LISTEN:$port … EXEC:bash browser_bridge_host.sh`;
-  the resolver picks the **newest** live native-host socket per connection and relays to it, so the
-  bridge follows Chrome across native-host restarts (its pid changes each spawn) and claude's reconnect
-  loop self-heals if Chrome starts after the VM. `_build_forwarding` allocates the port (warning if no
-  native host is currently listening), `_forwarding_env` exports `CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT`,
-  and `_run_sandbox_supervised` starts/tears down the host bridge. Nothing but clipboard-style socat
-  relaying crosses the boundary — the host filesystem and other browser state stay out of the VM.
+  host, `_start_browser_host_bridge` runs `socat TCP-LISTEN:$port … EXEC:python3 browser_bridge_host.py`;
+  the proxy picks the **newest** live native-host socket per connection and relays the framed messages,
+  so the bridge follows Chrome across native-host restarts (its pid changes each spawn) and claude's
+  reconnect loop self-heals if Chrome starts after the VM. `_build_forwarding` allocates the port
+  (warning if no native host is currently listening), `_forwarding_env` exports
+  `CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT`, and `_run_sandbox_supervised` starts/tears down the host bridge.
+  Nothing but the framed native-messaging relay crosses the boundary — the host filesystem and other
+  browser state stay out of the VM.
+- **Service-worker keepalive (`browser_bridge_host.py`):** Chrome's MV3 service worker goes idle after
+  ~30s, which closes the native-messaging port and kills the native host, so browser tools break after
+  any idle gap (upstream anthropics/claude-code #16350, #61347 — the keepalive fix requests were
+  stale-closed unfixed). The bridge is a Python proxy rather than a dumb socat relay so it can work
+  around this: the native host is a transparent bridge to the extension service worker (reading the
+  extension's `service-worker.ts` shows every native message hits its `onMessage` handler — an
+  `execute_tool` runs a real browser tool, any other method round-trips as
+  `{"result":{"content":"Unknown method: X"}}` **from the service worker**), and processing an event
+  resets the MV3 idle timer. So during idle gaps (>20s of no traffic) the proxy injects a keepalive
+  whose method name is distinctive; the service worker echoes that name back in its "Unknown method"
+  reply, which lets the proxy swallow its own keepalive responses so the in-VM claude never sees them.
+  Verified end-to-end: the native host survives 100s+ of idle through the proxy (vs ~30s bare). This
+  makes the sandbox's browser connection *more* reliable than a plain host session, which has no
+  keepalive.
   The native host only exists while Chrome's extension holds its native-messaging port; that spawn is
   triggered CLI-side by Claude Code opening a connect page (`clau.de/chrome/reconnect`) in a browser,
   and the extension's service worker idles (dropping the link) — both upstream behaviors the socket

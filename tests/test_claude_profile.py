@@ -1832,7 +1832,7 @@ def test_argv_chrome_adds_pasta_and_env(
 
 def test_browser_bridge_host_handler_is_packaged() -> None:
     handler = claude_profile._browser_bridge_host_handler()
-    assert handler.name == "browser_bridge_host.sh"
+    assert handler.name == "browser_bridge_host.py"
     assert handler.exists()
 
 
