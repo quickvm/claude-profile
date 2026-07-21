@@ -1018,6 +1018,12 @@ def _build_sandbox_argv(
     args = list(claude_args)
     if settings.sandbox_skip_permissions and SKIP_PERMISSIONS_FLAG not in args:
         args.append(SKIP_PERMISSIONS_FLAG)
+    # claude force-disables Chrome in a non-interactive session (dn()=!isInteractive),
+    # which the sandbox launch trips, so claudeInChromeDefaultEnabled never applies. The
+    # explicit --chrome flag is checked first, so append it to actually enable the
+    # integration when the user opted into sandbox_chrome.
+    if settings.sandbox_chrome and "--chrome" not in args and "--no-chrome" not in args:
+        args.append("--chrome")
     if "--append-system-prompt" not in args:
         args += [
             "--append-system-prompt",

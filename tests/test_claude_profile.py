@@ -1810,6 +1810,44 @@ def test_forwarding_env_browser_open() -> None:
     assert fwd.active() is True
 
 
+def test_argv_appends_chrome_flag_when_sandbox_chrome(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.setattr(claude_profile.settings, "sandbox_chrome", True)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    argv = _build_sandbox_argv(profile, cwd, [], {})
+    assert "--chrome" in argv
+
+
+def test_argv_respects_user_no_chrome(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.setattr(claude_profile.settings, "sandbox_chrome", True)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    argv = _build_sandbox_argv(profile, cwd, ["--no-chrome"], {})
+    assert "--chrome" not in argv
+
+
+def test_argv_no_chrome_flag_when_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    argv = _build_sandbox_argv(profile, cwd, [], {})
+    assert "--chrome" not in argv
+
+
 def test_browser_open_host_handler_is_packaged() -> None:
     handler = claude_profile._browser_open_host_handler()
     assert handler.name == "browser_open_host.sh"
