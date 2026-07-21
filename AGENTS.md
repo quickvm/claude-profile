@@ -256,7 +256,10 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   egress; `podman run …` servers work via the podman wrapper above. Servers that pass a secret
   through as `-e VAR` need that host var inside the VM: `sandbox_forward_env` is a comma-separated
   list of env var names, and `_with_forwarded_env` copies each one present in the host environment
-  into the sandbox (missing names warn and skip). Servers that bake values into the config's `env`
+  into the sandbox. A name the profile's `.env` already supplies (`claude-profile env --set`) is
+  left alone rather than warned about — it reaches the VM either way, and the host value wins when
+  both are set; only names available from neither source warn and skip. Servers that bake values
+  into the config's `env`
   block (e.g. the victoria* servers) already travel with the mounted config. See the image-cache
   bullet to avoid re-pulling container MCP images each launch.
 - **MCP image cache (`sandbox-cache`):** container MCP images would be re-pulled every launch (the
