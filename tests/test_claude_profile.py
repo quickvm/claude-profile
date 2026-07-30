@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import subprocess
 import sys
 import time
@@ -29,6 +30,10 @@ from claude_profile import (
 )
 
 runner = CliRunner()
+
+# Captured before the autouse fixture below stubs it out, for the tests that exercise the
+# real host-install probe.
+_real_host_claude_binary = claude_profile._host_claude_binary
 
 
 @pytest.fixture()
@@ -60,6 +65,9 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(claude_profile.settings, "sandbox_forward_env", "")
     # Default the image-user check to root so launch tests skip the real podman call.
     monkeypatch.setattr(claude_profile, "_sandbox_image_user", lambda: "")
+    # Default the host-claude probe to "not a native install" so tests never read (or
+    # copy) the developer's real claude binary. Tests for that path set it themselves.
+    monkeypatch.setattr(claude_profile, "_host_claude_binary", lambda: None)
 
 
 # ---------------------------------------------------------------------------
@@ -848,6 +856,115 @@ def test_sandbox_mounts_skips_git_dir_inside_cwd(
 
 
 # ---------------------------------------------------------------------------
+# host claude binary (sandbox tracks the host's version)
+# ---------------------------------------------------------------------------
+
+
+def _native_install(root: Path, version: str = "2.1.220") -> Path:
+    """Create a fake native-installer layout and return the versioned binary."""
+    versions = root / "claude" / "versions"
+    versions.mkdir(parents=True, exist_ok=True)
+    binary = versions / version
+    binary.write_text(f"#!/bin/sh\necho {version}\n")
+    binary.chmod(0o755)
+    return binary
+
+
+def test_host_claude_binary_follows_native_install(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    binary = _native_install(tmp_path)
+    link = tmp_path / "bin" / "claude"
+    link.parent.mkdir()
+    link.symlink_to(binary)
+    monkeypatch.setattr(claude_profile.shutil, "which", lambda b: str(link))
+    assert _real_host_claude_binary() == binary
+
+
+def test_host_claude_binary_none_for_other_install_methods(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    launcher = tmp_path / "node_modules" / ".bin" / "claude"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/usr/bin/env node\n")
+    launcher.chmod(0o755)
+    monkeypatch.setattr(claude_profile.shutil, "which", lambda b: str(launcher))
+    assert _real_host_claude_binary() is None
+
+
+def test_host_claude_binary_none_when_not_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claude_profile.shutil, "which", lambda b: None)
+    assert _real_host_claude_binary() is None
+
+
+def test_sandbox_claude_binary_caches_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    binary = _native_install(tmp_path)
+    monkeypatch.setattr(claude_profile, "_host_claude_binary", lambda: binary)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    cached = claude_profile._sandbox_claude_binary()
+    assert cached is not None
+    assert cached == tmp_path / "data" / "claude-profile" / "claude" / "2.1.220"
+    assert cached.read_text() == binary.read_text()
+    assert os.access(cached, os.X_OK)  # must still be executable in the VM
+
+
+def test_sandbox_claude_binary_reuses_existing_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    binary = _native_install(tmp_path)
+    monkeypatch.setattr(claude_profile, "_host_claude_binary", lambda: binary)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    cached = claude_profile._sandbox_claude_binary()
+
+    def fail_copy(src: object, dst: object) -> None:
+        raise AssertionError("re-copied an already cached version")
+
+    # Version dirs are immutable, so a second launch on the same version must not copy.
+    monkeypatch.setattr(claude_profile.shutil, "copy", fail_copy)
+    assert claude_profile._sandbox_claude_binary() == cached
+
+
+def test_sandbox_claude_binary_prunes_old_versions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    cache = tmp_path / "data" / "claude-profile" / "claude"
+    cache.mkdir(parents=True)
+    (cache / "2.1.100").write_text("old")
+    (cache / ".2.1.100.999.partial").write_text("leftover from a killed launch")
+    binary = _native_install(tmp_path)
+    monkeypatch.setattr(claude_profile, "_host_claude_binary", lambda: binary)
+    claude_profile._sandbox_claude_binary()
+    assert sorted(p.name for p in cache.iterdir()) == ["2.1.220"]
+
+
+def test_sandbox_claude_binary_none_without_native_install(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    assert claude_profile._sandbox_claude_binary() is None
+    assert not (tmp_path / "data").exists()
+
+
+def test_sandbox_mounts_host_claude_read_only(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    binary = _native_install(tmp_path)
+    monkeypatch.setattr(claude_profile, "_sandbox_claude_binary", lambda: binary)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    prof = tmp_path / "prof"
+    prof.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(prof, cwd)
+    assert f"{binary}:{claude_profile.SANDBOX_HOST_CLAUDE}:ro,z" in mounts
+
+
+# ---------------------------------------------------------------------------
 # _sandbox_settings_overlay
 # ---------------------------------------------------------------------------
 
@@ -950,6 +1067,23 @@ def test_argv_has_krun_runtime_and_image(
     assert "krun.use_passt=1" in argv  # real guest netstack (not TSI)
     assert claude_profile.settings.sandbox_image in argv
     assert "claude" in argv
+
+
+def test_argv_disables_autoupdater_when_host_claude_mounted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    binary = _native_install(tmp_path)
+    monkeypatch.setattr(claude_profile, "_host_claude_binary", lambda: binary)
+    monkeypatch.setattr(claude_profile, "_sandbox_claude_binary", lambda: binary)
+    argv = _make_argv(monkeypatch, tmp_path, [])
+    assert "DISABLE_AUTOUPDATER=1" in argv
+
+
+def test_argv_keeps_autoupdater_without_host_claude(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    argv = _make_argv(monkeypatch, tmp_path, [])
+    assert "DISABLE_AUTOUPDATER=1" not in argv
 
 
 def test_argv_sizing_from_settings(

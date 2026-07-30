@@ -105,6 +105,20 @@ claude-profile add work --sandbox  # mark a profile as sandboxed
 passwordless sudo. Edit it for more baked-in tooling and rebuild; override the image name
 with `CLAUDE_PROFILE_SANDBOX_IMAGE`.
 
+### Claude Code version
+
+You don't have to rebuild the image to keep the sandbox current. If your host's Claude Code
+came from the native installer (`claude.ai/install.sh`), that binary is self-contained, so
+each launch mounts the host's *current* version into the VM read-only and runs it — the
+sandbox is on whatever version you are, and it follows along when Claude Code updates
+itself on the host. The in-VM auto-updater is switched off, since the VM is thrown away at
+exit and an update would only be discarded.
+
+The binary is copied to `~/.local/share/claude-profile/claude/<version>` first (mounting it
+would otherwise SELinux-relabel your real install), which happens once per version, not
+once per launch. If your claude came from npm or a distro package instead, the VM runs the
+version baked into the image and `claude-profile build` is how you update it.
+
 ### Tools & installing more
 
 On launch the agent is told (via the system prompt) that it's in the sandbox, and the

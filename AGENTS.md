@@ -71,6 +71,19 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   profile dir at the in-VM config dir. VM sizing uses `krun.ram_mib`/`krun.cpus`
   annotations, not `--memory`/`--cpus`. `.env` vars plus `TERM`/`COLORTERM` are
   forwarded with `-e`; the rest of the host environment is not.
+- **Claude Code version tracks the host:** the image's baked claude would age with every
+  release until someone rebuilt, so the VM runs the *host's* binary instead. The native
+  installer produces a self-contained executable at `<data>/claude/versions/<version>`
+  (`_host_claude_binary` recognises that layout; other install methods return None and the
+  image's claude stays in play). `_sandbox_claude_binary` copies it to
+  `~/.local/share/claude-profile/claude/<version>` — the mount needs an SELinux `:z`
+  relabel and relabelling the user's real install is not ours to do — pruning older
+  versions, and `_sandbox_mounts` mounts that copy read-only at `SANDBOX_HOST_CLAUDE`
+  (`/opt/claude-host/claude`). The entrypoint points `~/.local/bin/claude` at it before
+  dropping privileges. The copy happens only when the host updates (version dirs are
+  immutable). `_build_sandbox_argv` also sets `DISABLE_AUTOUPDATER=1` when the mount is
+  present: the VM is ephemeral, so an in-VM update would download a release only to
+  discard it, and would move the session off the host's version mid-run.
 - **Linked commands/skills:** `_linked_dir_mounts()` bind-mounts the real target of any
   symlinked `LINKABLE_DIRS` (e.g. `skills` → `~/.claude/skills`) read-only at the link's
   path, so the symlink resolves inside the VM without exposing the global dir writable.

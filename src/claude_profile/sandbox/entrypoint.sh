@@ -10,6 +10,13 @@ if [ "$(id -u)" = "0" ]; then
   groupmod -o -g "$HOST_GID" appuser 2>/dev/null || true
   usermod -o -u "$HOST_UID" appuser 2>/dev/null || true
   export HOME=/home/appuser
+  # claude-profile mounts the host's own claude binary at /opt/claude-host/claude, so the
+  # VM runs the version the host is on rather than the one baked into the image at build
+  # time. Point the PATH entry at it. Absent for non-native host installs, in which case
+  # the image's claude stays in place.
+  if [ -x /opt/claude-host/claude ]; then
+    ln -sf /opt/claude-host/claude /home/appuser/.local/bin/claude
+  fi
   # Agent socket paths live under root-owned trees (e.g. /run/user/..., the in-VM
   # GNUPGHOME); create and hand their parents to the host user before dropping.
   if [ -n "$CLAUDE_SANDBOX_FORWARDS" ]; then

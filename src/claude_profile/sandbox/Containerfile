@@ -57,9 +57,13 @@ RUN chmod +x /usr/local/bin/podman
 # Install uv, the native claude binary, ty, and pulumi as the unprivileged user.
 # uv/claude/ty land in ~/.local/bin; pulumi installs to ~/.pulumi/bin (both on PATH
 # below). claude-profile forwards your Pulumi Cloud token via CLAUDE_PROFILE_SANDBOX_PULUMI.
+# claude is installed from the `latest` channel, the same one the host installer's
+# auto-updater tracks: launches normally run the host's own binary (mounted at
+# /opt/claude-host/claude, see claude_profile._sandbox_claude_binary), so this copy is the
+# fallback for hosts whose claude did not come from the native installer.
 USER appuser
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
-    && curl -fsSL https://claude.ai/install.sh | bash \
+    && curl -fsSL https://claude.ai/install.sh | bash -s latest \
     && /home/appuser/.local/bin/uv tool install ty \
     && curl -fsSL https://get.pulumi.com | sh
 USER root

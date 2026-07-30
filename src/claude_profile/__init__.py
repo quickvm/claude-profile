@@ -60,6 +60,10 @@ SANDBOX_MARKER = ".sandbox"
 SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 SANDBOX_CONFIG_DIR = "/home/appuser/.claude"
 SANDBOX_GNUPGHOME = "/home/appuser/.gnupg"
+# In-VM path where the host's Claude Code binary is mounted read-only. The entrypoint
+# points the PATH entry at it, so the VM runs the host's version instead of the one
+# baked into the image (see _sandbox_claude_binary).
+SANDBOX_HOST_CLAUDE = "/opt/claude-host/claude"
 # In-VM path where the shared, read-only MCP image store is mounted (additionalimagestore).
 SANDBOX_IMAGE_STORE = "/var/lib/shared-mcp-store"
 # Env var carrying the host clipboard-bridge TCP port to the in-VM wl-paste shim.
@@ -389,10 +393,15 @@ def sandbox_skill(
     console.print(f"[green]Wrote {dest}[/green]")
 
 
-def _image_cache_dir() -> Path:
-    """Host directory holding the shared, read-only MCP image store (XDG data)."""
+def _data_dir() -> Path:
+    """Host directory holding claude-profile's own cached data (XDG data)."""
     base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
-    return Path(base) / "claude-profile" / "image-store"
+    return Path(base) / "claude-profile"
+
+
+def _image_cache_dir() -> Path:
+    """Host directory holding the shared, read-only MCP image store."""
+    return _data_dir() / "image-store"
 
 
 def _image_ref_from_args(args: list) -> Optional[str]:
@@ -906,6 +915,62 @@ def _sandbox_known_hosts(profile_dir: Path) -> Path:
     return dest
 
 
+def _host_claude_binary() -> Optional[Path]:
+    """The host's Claude Code binary, when it came from the native installer.
+
+    ``claude.ai/install.sh`` drops a self-contained executable at
+    ``<data dir>/claude/versions/<version>`` and points ``claude`` on PATH at it, so that
+    one file runs anywhere with a glibc — including inside the sandbox. Returns None for
+    every other install method (npm, a distro package), whose entry point is a launcher
+    that needs the rest of its tree, leaving the image's own claude to run.
+    """
+    found = shutil.which(settings.claude_bin)
+    if found is None:
+        return None
+    binary = Path(found).resolve()
+    if binary.parent.name != "versions" or binary.parent.parent.name != "claude":
+        return None
+    return binary if os.access(binary, os.X_OK) else None
+
+
+def _sandbox_claude_binary() -> Optional[Path]:
+    """Cache the host's Claude Code binary for the VM and return the cached copy.
+
+    Without this the sandbox runs whatever version was baked into the image, which ages
+    with every release until someone rebuilds; mounting the host's binary makes each VM
+    track the host's own auto-updated install. The mount needs an SELinux relabel (``:z``)
+    to be readable in the VM, and relabelling the user's real install is not ours to do,
+    so the binary is copied into our data dir and that copy is relabelled instead. Version
+    directories are immutable, so the copy happens only when the host updates; the
+    previous version is pruned. Returns None when the host has no native install.
+    """
+    source = _host_claude_binary()
+    if source is None:
+        return None
+    cache = _data_dir() / "claude"
+    dest = cache / source.name
+    # Named per process: sandboxes launch in parallel (one per worktree), and two of them
+    # sharing a temp file would interleave writes into one torn binary.
+    partial = cache / f".{source.name}.{os.getpid()}.partial"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        if not dest.exists():
+            # Copy to a temp name and rename, so an interrupted launch can't leave a
+            # truncated binary that later launches would mistake for a complete one.
+            shutil.copy(source, partial)
+            os.replace(partial, dest)
+        for stale in cache.iterdir():
+            if stale not in (dest, partial):
+                stale.unlink()
+    except OSError as exc:
+        err_console.print(
+            f"[yellow]Warning: could not cache {source} for the sandbox ({exc}); "
+            f"the VM will run the image's own claude.[/yellow]"
+        )
+        return None
+    return dest
+
+
 def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
     """Build podman -v args: profile config, cwd, and the git common dir.
 
@@ -948,6 +1013,11 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
         "-v",
         f"{_sandbox_known_hosts(profile_dir)}:/home/appuser/.ssh/known_hosts:z",
     ]
+    host_claude = _sandbox_claude_binary()
+    if host_claude is not None:
+        # Run the host's current claude instead of the image's baked one, so the sandbox
+        # follows the host's auto-updates (see _sandbox_claude_binary).
+        mounts += ["-v", f"{host_claude}:{SANDBOX_HOST_CLAUDE}:ro,z"]
     mounts += _linked_dir_mounts(profile_dir)
     mounts += _image_cache_mounts(profile_dir)
     return mounts
@@ -1049,6 +1119,11 @@ def _build_sandbox_argv(
         "-e",
         "COLORTERM",
     ]
+    if _host_claude_binary() is not None:
+        # The VM runs the host's binary from a read-only mount and is thrown away at
+        # exit, so an in-VM self-update would download a release only to discard it —
+        # and would move the session off the host's version mid-run.
+        argv += ["-e", "DISABLE_AUTOUPDATER=1"]
     argv += _forwarding_env(forwarding)
     for key, value in extra_env.items():
         argv += ["-e", f"{key}={value}"]
