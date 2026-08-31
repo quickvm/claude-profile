@@ -17,6 +17,13 @@ if [ "$(id -u)" = "0" ]; then
   if [ -x /opt/claude-host/claude ]; then
     ln -sf /opt/claude-host/claude /home/appuser/.local/bin/claude
   fi
+  # claude-profile bind-mounts the host's custom CA anchors over the image's (empty)
+  # anchor dir. Anchors are only source material: nothing reads them until
+  # update-ca-trust regenerates the extracted bundles that curl/git/openssl consume.
+  if [ -n "$(ls -A /etc/pki/ca-trust/source/anchors 2>/dev/null)" ]; then
+    update-ca-trust extract ||
+      echo "warning: update-ca-trust failed; the host's CAs are not trusted" >&2
+  fi
   # Agent socket paths live under root-owned trees (e.g. /run/user/..., the in-VM
   # GNUPGHOME); create and hand their parents to the host user before dropping.
   if [ -n "$CLAUDE_SANDBOX_FORWARDS" ]; then
@@ -72,6 +79,17 @@ fi
 # profile (cookies, history, passwords) is deliberately never exposed to the VM.
 if [ -n "$CLAUDE_SANDBOX_CHROME_EXT_PATH" ]; then
   mkdir -p "$CLAUDE_SANDBOX_CHROME_EXT_PATH"
+fi
+
+# Node and Python ship their own CA bundles and ignore the system trust store, so the
+# anchors extracted above would still leave `npx` MCP servers and agent scripts failing
+# TLS against internal hosts. Point each at the extracted bundle, which carries the
+# image's public CAs plus the host's. An explicitly forwarded value wins.
+_ca_bundle=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+if [ -n "$(ls -A /etc/pki/ca-trust/source/anchors 2>/dev/null)" ] && [ -f "$_ca_bundle" ]; then
+  export NODE_EXTRA_CA_CERTS="${NODE_EXTRA_CA_CERTS:-$_ca_bundle}"
+  export SSL_CERT_FILE="${SSL_CERT_FILE:-$_ca_bundle}"
+  export REQUESTS_CA_BUNDLE="${REQUESTS_CA_BUNDLE:-$_ca_bundle}"
 fi
 
 # Seed a fresh GNUPGHOME with the host's public keys; signing uses the forwarded

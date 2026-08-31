@@ -285,6 +285,19 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   it does on the host. Read-only: a sandboxed agent has no business rewriting the MCP config shared
   by every project under that directory. `_mcp_container_images` reads them too, so a container
   server declared there is cacheable by `sandbox-cache` rather than re-pulled every launch.
+- **Host CA trust (`_ca_trust_mounts`):** the image ships only public roots, so anything served by a
+  private CA (internal registries, git remotes, APIs) fails TLS in the VM. The host's custom anchors
+  (`SANDBOX_CA_ANCHORS`, `/etc/pki/ca-trust/source/anchors`) are bind-mounted at the same path — the
+  only place `update-ca-trust` reads, and empty in the image, so the mount masks nothing. Uniquely
+  among the mounts it uses plain `:ro` with **no `:z`**: relabelling is for paths the container
+  writes, SELinux already lets containers read `cert_t`, and `:z` would relabel a root-owned system
+  dir out from under the host's own TLS clients (and fail outright for a rootless podman that cannot
+  chcon it). Anchors are inert source material, so `entrypoint.sh` runs `update-ca-trust extract` as
+  root to regenerate the bundles curl/git/openssl consume. Node and Python ignore the system store
+  entirely, which would leave `npx` MCP servers still failing, so after dropping privileges the
+  entrypoint points `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` at the extracted
+  bundle (image roots plus the host's); an explicitly forwarded value wins. No-op when the host has
+  no custom anchors.
 - **MCP image cache (`sandbox-cache`):** container MCP images would be re-pulled every launch (the
   VM is ephemeral). `claude-profile sandbox-cache <name>` discovers the podman/docker MCP images from
   the profile's `.claude.json` and any ancestor `.mcp.json` (`_mcp_container_images`), pulls them

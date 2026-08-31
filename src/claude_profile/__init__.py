@@ -66,6 +66,9 @@ SANDBOX_GNUPGHOME = "/home/appuser/.gnupg"
 SANDBOX_HOST_CLAUDE = "/opt/claude-host/claude"
 # In-VM path where the shared, read-only MCP image store is mounted (additionalimagestore).
 SANDBOX_IMAGE_STORE = "/var/lib/shared-mcp-store"
+# Trust anchors sourced by update-ca-trust. Same path on host and in the VM: the host's
+# copy is mounted straight over the image's (see _ca_trust_mounts).
+SANDBOX_CA_ANCHORS = "/etc/pki/ca-trust/source/anchors"
 # Env var carrying the host clipboard-bridge TCP port to the in-VM wl-paste shim.
 SANDBOX_CLIPBOARD_PORT_ENV = "CLAUDE_SANDBOX_CLIPBOARD_PORT"
 # Env var carrying the host browser-bridge TCP port to the in-VM entrypoint.
@@ -1011,6 +1014,29 @@ def _mcp_json_mounts(cwd: Path) -> list[str]:
     return mounts
 
 
+def _ca_trust_mounts() -> list[str]:
+    """Read-only mount of the host's custom CA anchors, when it has any.
+
+    Internal services signed by a private CA fail TLS in the VM otherwise: the image
+    ships only public roots. Mounted at the same path because ``update-ca-trust`` (run
+    by the entrypoint) reads that location and nowhere else, and the image's own anchor
+    dir is empty, so the mount masks nothing.
+
+    No ``:z`` here, unlike every other mount: relabelling is for paths the container
+    must *write*, and this one is read-only system state. SELinux already lets
+    containers read ``cert_t``, while ``:z`` would relabel a root-owned system
+    directory out from under the host's own TLS clients (and fail for a rootless
+    podman that cannot chcon it in the first place).
+    """
+    anchors = Path(SANDBOX_CA_ANCHORS)
+    try:
+        if not any(anchors.iterdir()):
+            return []
+    except OSError:
+        return []
+    return ["-v", f"{anchors}:{anchors}:ro"]
+
+
 def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
     """Build podman -v args: profile config, cwd, and the git common dir.
 
@@ -1059,6 +1085,7 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
         # follows the host's auto-updates (see _sandbox_claude_binary).
         mounts += ["-v", f"{host_claude}:{SANDBOX_HOST_CLAUDE}:ro,z"]
     mounts += _mcp_json_mounts(cwd)
+    mounts += _ca_trust_mounts()
     mounts += _linked_dir_mounts(profile_dir)
     mounts += _image_cache_mounts(profile_dir)
     return mounts

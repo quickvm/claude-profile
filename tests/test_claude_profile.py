@@ -52,8 +52,11 @@ def fake_home(tmp_path: Path) -> Generator[Path, None, None]:
 
 
 @pytest.fixture(autouse=True)
-def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch) -> None:
+def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Keep the sandbox env overrides off unless a test sets them."""
+    # Point the trust anchors at an absent dir so the developer's real host CAs (this
+    # runs on machines that have them) never add a mount. Tests for that path set it.
+    monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(tmp_path / "no-ca"))
     monkeypatch.setattr(claude_profile.settings, "sandbox", None)
     monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", False)
@@ -900,6 +903,53 @@ def test_sandbox_mounts_includes_ancestor_mcp_json(
     profile.mkdir()
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
     assert f"{config}:{config}:ro,z" in _sandbox_mounts(profile, cwd)
+
+
+# ---------------------------------------------------------------------------
+# host CA trust anchors
+# ---------------------------------------------------------------------------
+
+
+def test_ca_trust_mounts_when_anchors_present(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    anchors = tmp_path / "anchors"
+    anchors.mkdir()
+    (anchors / "internal-root.pem").write_text("-----BEGIN CERTIFICATE-----")
+    monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(anchors))
+    # Read-only and deliberately unrelabelled: see _ca_trust_mounts.
+    assert claude_profile._ca_trust_mounts() == ["-v", f"{anchors}:{anchors}:ro"]
+
+
+def test_ca_trust_mounts_empty_when_no_anchors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    anchors = tmp_path / "anchors"
+    anchors.mkdir()
+    monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(anchors))
+    assert claude_profile._ca_trust_mounts() == []
+
+
+def test_ca_trust_mounts_empty_when_dir_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(tmp_path / "nope"))
+    assert claude_profile._ca_trust_mounts() == []
+
+
+def test_sandbox_mounts_includes_ca_anchors(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    anchors = tmp_path / "anchors"
+    anchors.mkdir()
+    (anchors / "internal-root.pem").write_text("-----BEGIN CERTIFICATE-----")
+    monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(anchors))
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    assert f"{anchors}:{anchors}:ro" in _sandbox_mounts(profile, cwd)
 
 
 # ---------------------------------------------------------------------------
