@@ -856,6 +856,53 @@ def test_sandbox_mounts_skips_git_dir_inside_cwd(
 
 
 # ---------------------------------------------------------------------------
+# ancestor .mcp.json (project-scoped MCP servers declared above the CWD)
+# ---------------------------------------------------------------------------
+
+
+def test_ancestor_mcp_json_finds_files_above_cwd(tmp_path: Path) -> None:
+    (tmp_path / ".mcp.json").write_text("{}")
+    cwd = tmp_path / "src" / "proj"
+    cwd.mkdir(parents=True)
+    assert tmp_path / ".mcp.json" in claude_profile._ancestor_mcp_json(cwd)
+
+
+def test_ancestor_mcp_json_skips_cwd_own_file(tmp_path: Path) -> None:
+    """The CWD is already bind-mounted, so its own .mcp.json needs no extra mount."""
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    (cwd / ".mcp.json").write_text("{}")
+    assert cwd / ".mcp.json" not in claude_profile._ancestor_mcp_json(cwd)
+
+
+def test_mcp_json_mounts_are_read_only(tmp_path: Path) -> None:
+    config = tmp_path / ".mcp.json"
+    config.write_text("{}")
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    assert claude_profile._mcp_json_mounts(cwd) == ["-v", f"{config}:{config}:ro,z"]
+
+
+def test_mcp_json_mounts_empty_when_absent(tmp_path: Path) -> None:
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    assert claude_profile._mcp_json_mounts(cwd) == []
+
+
+def test_sandbox_mounts_includes_ancestor_mcp_json(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = tmp_path / ".mcp.json"
+    config.write_text("{}")
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    assert f"{config}:{config}:ro,z" in _sandbox_mounts(profile, cwd)
+
+
+# ---------------------------------------------------------------------------
 # host claude binary (sandbox tracks the host's version)
 # ---------------------------------------------------------------------------
 
@@ -2670,14 +2717,41 @@ def test_mcp_container_images_discovers(tmp_path: Path) -> None:
             }
         )
     )
-    assert claude_profile._mcp_container_images(profile) == [
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    assert claude_profile._mcp_container_images(profile, cwd) == [
         "ghcr.io/github/mcp",
         "ghcr.io/buildkite/mcp:v1",
     ]
 
 
 def test_mcp_container_images_missing_config(tmp_path: Path) -> None:
-    assert claude_profile._mcp_container_images(tmp_path) == []
+    assert claude_profile._mcp_container_images(tmp_path, tmp_path) == []
+
+
+def test_mcp_container_images_includes_ancestor_mcp_json(tmp_path: Path) -> None:
+    """A container server declared in an ancestor .mcp.json runs in the VM, so its
+    image belongs in the cache too."""
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "sonar": {
+                        "command": "docker",
+                        "args": ["run", "--rm", "ghcr.io/acme/sonar:2"],
+                    },
+                    "exa": {"command": "npx", "args": ["-y", "exa-mcp-server"]},
+                }
+            }
+        )
+    )
+    cwd = tmp_path / "a" / "b"
+    cwd.mkdir(parents=True)
+    assert claude_profile._mcp_container_images(profile, cwd) == [
+        "ghcr.io/acme/sonar:2"
+    ]
 
 
 def test_image_cache_dir_respects_xdg(monkeypatch: pytest.MonkeyPatch) -> None:

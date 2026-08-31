@@ -275,9 +275,20 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   into the config's `env`
   block (e.g. the victoria* servers) already travel with the mounted config. See the image-cache
   bullet to avoid re-pulling container MCP images each launch.
+- **Ancestor `.mcp.json` (`_mcp_json_mounts`):** the mounted `.claude.json` is not the only place
+  claude finds MCP servers — it also walks *up* from the CWD reading project-scoped `.mcp.json`
+  files, so a `~/.mcp.json` configures every project beneath it. Only the CWD itself is mounted, so
+  those ancestors are invisible in the VM and their servers silently disappear (the symptom: a
+  server that works on the host is simply absent in the sandbox, with no error). `_ancestor_mcp_json`
+  collects the files above the CWD — ones at or below it already ride along on the CWD mount — and
+  `_mcp_json_mounts` bind-mounts each at its host path, so claude's upward walk resolves exactly as
+  it does on the host. Read-only: a sandboxed agent has no business rewriting the MCP config shared
+  by every project under that directory. `_mcp_container_images` reads them too, so a container
+  server declared there is cacheable by `sandbox-cache` rather than re-pulled every launch.
 - **MCP image cache (`sandbox-cache`):** container MCP images would be re-pulled every launch (the
   VM is ephemeral). `claude-profile sandbox-cache <name>` discovers the podman/docker MCP images from
-  the profile's `.claude.json` (`_mcp_container_images`), pulls them into a shared host store
+  the profile's `.claude.json` and any ancestor `.mcp.json` (`_mcp_container_images`), pulls them
+  into a shared host store
   (`~/.local/share/claude-profile/image-store`, overlay+fuse-overlayfs to match the VM) and
   `podman unshare chmod -R a+rX`s it so the VM's mapped root can read it. When the store is
   populated, `_image_cache_mounts` bind-mounts it read-only at `SANDBOX_IMAGE_STORE` plus a

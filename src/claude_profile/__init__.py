@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 from pydantic import Field
@@ -420,16 +420,18 @@ def _image_ref_from_args(args: list) -> Optional[str]:
     return None
 
 
-def _mcp_container_images(profile_dir: Path) -> list[str]:
-    """Return the image refs used by the profile's podman/docker MCP servers.
+def _mcp_server_blocks(config: Path) -> list[Any]:
+    """Return every ``mcpServers`` block in one MCP config file.
 
-    Reads the profile's ``.claude.json`` (user-scope and per-project ``mcpServers``)
-    and extracts the image from each stdio server run via podman/docker. De-duplicated.
+    Covers both the user-scope block and the per-project ones ``.claude.json`` nests
+    under ``projects``. An unreadable or malformed file yields nothing: a broken config
+    should not abort a launch that has other places to look.
     """
-    config = profile_dir / ".claude.json"
     try:
         data = json.loads(config.read_text())
     except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
         return []
     blocks = [data.get("mcpServers")]
     projects = data.get("projects")
@@ -437,6 +439,19 @@ def _mcp_container_images(profile_dir: Path) -> list[str]:
         blocks += [
             p.get("mcpServers") for p in projects.values() if isinstance(p, dict)
         ]
+    return blocks
+
+
+def _mcp_container_images(profile_dir: Path, cwd: Path) -> list[str]:
+    """Return the image refs used by the profile's podman/docker MCP servers.
+
+    Reads the profile's ``.claude.json`` plus the ``.mcp.json`` files claude picks up
+    from directories above ``cwd``, which the sandbox mounts and so can run too.
+    Extracts the image from each stdio server run via podman/docker. De-duplicated.
+    """
+    blocks: list[Any] = []
+    for config in [profile_dir / ".claude.json", *_ancestor_mcp_json(cwd)]:
+        blocks += _mcp_server_blocks(config)
     images: list[str] = []
     for block in blocks:
         if not isinstance(block, dict):
@@ -536,7 +551,7 @@ def sandbox_cache(
     if not profile_dir.exists():
         err_console.print(f"[red]Profile '{name}' does not exist.[/red]")
         raise typer.Exit(code=1)
-    images = _mcp_container_images(profile_dir)
+    images = _mcp_container_images(profile_dir, Path.cwd())
     if not images:
         console.print(f"No podman/docker MCP images found in profile '{name}'.")
         return
@@ -971,6 +986,31 @@ def _sandbox_claude_binary() -> Optional[Path]:
     return dest
 
 
+def _ancestor_mcp_json(cwd: Path) -> list[Path]:
+    """Return the ``.mcp.json`` files claude reads from directories above the CWD.
+
+    claude discovers project-scoped MCP servers by walking up from the working
+    directory, so a ``.mcp.json`` in an ancestor (commonly ``~/.mcp.json``) configures
+    every project beneath it. Only the CWD itself is mounted into the VM, so those
+    ancestors are invisible there and their servers silently vanish from the sandbox.
+    Files at or below the CWD are already covered by its mount and are skipped.
+    """
+    return [f for parent in cwd.parents if (f := parent / ".mcp.json").is_file()]
+
+
+def _mcp_json_mounts(cwd: Path) -> list[str]:
+    """Read-only mounts for the ancestor ``.mcp.json`` files (see _ancestor_mcp_json).
+
+    Mounted at their host paths so claude's upward walk finds them exactly as it does
+    on the host, and read-only because a sandboxed agent has no business rewriting the
+    MCP config shared by every project under that directory.
+    """
+    mounts: list[str] = []
+    for config in _ancestor_mcp_json(cwd):
+        mounts += ["-v", f"{config}:{config}:ro,z"]
+    return mounts
+
+
 def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
     """Build podman -v args: profile config, cwd, and the git common dir.
 
@@ -1018,6 +1058,7 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
         # Run the host's current claude instead of the image's baked one, so the sandbox
         # follows the host's auto-updates (see _sandbox_claude_binary).
         mounts += ["-v", f"{host_claude}:{SANDBOX_HOST_CLAUDE}:ro,z"]
+    mounts += _mcp_json_mounts(cwd)
     mounts += _linked_dir_mounts(profile_dir)
     mounts += _image_cache_mounts(profile_dir)
     return mounts
