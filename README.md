@@ -84,6 +84,32 @@ alias claude-work='claude-profile work'
 alias claude-personal='claude-profile personal'
 ```
 
+## Shared settings
+
+Settings every profile should have, such as hooks, can live in one file instead of being
+copied into each profile's `settings.json`:
+
+```sh
+~/.claude-profiles/shared-settings.json
+```
+
+Every launch passes it to claude with `--settings`. claude merges it over the profile's own
+settings, and hooks from both run. `{profile}` anywhere in the file becomes the profile's
+name, so a hook can tell profiles apart:
+
+```json
+{
+  "hooks": {
+    "Stop": [{"hooks": [{"type": "http",
+      "url": "http://127.0.0.1:8080/hook?profile={profile}"}]}]
+  }
+}
+```
+
+In the sandbox, HTTP hooks aimed at `127.0.0.1` or `localhost` are re-pointed at the host
+(inside the VM, 127.0.0.1 is the VM itself), so local hook receivers hear from sandboxed
+sessions too. Passing your own `--settings` skips the shared file for that launch.
+
 ## Sandbox (microVM)
 
 Sandbox mode runs Claude Code inside a lightweight microVM (podman + the

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import typer
 from pydantic import Field
@@ -108,6 +109,11 @@ SANDBOX_STRIP_DENY_PREFIXES: tuple[str, ...] = (
 # podman's default host.containers.internal address under pasta; mapping it to the
 # host loopback lets the agent bridge bind to 127.0.0.1 instead of all interfaces.
 SANDBOX_HOST_LOOPBACK = "169.254.1.2"
+# Settings every profile gets (e.g. hooks), in the profiles base and passed to each launch
+# with --settings; "{profile}" in any string becomes the profile name.
+SHARED_SETTINGS = "shared-settings.json"
+PROFILE_PLACEHOLDER = "{profile}"
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
 SANDBOX_BRIEFING = (
     "You are running inside the claude-profile microVM sandbox — an ephemeral "
     "podman/krun VM (confirm with /run/.containerenv). Only the mounted working "
@@ -867,6 +873,83 @@ def _sandbox_settings_overlay(profile_dir: Path) -> Optional[Path]:
     return overlay
 
 
+def _shared_settings_args(
+    name: str, claude_args: list[str], *, sandbox: bool
+) -> tuple[list[str], bool]:
+    """``--settings`` args for the shared settings file, and whether the VM needs host loopback.
+
+    ``shared-settings.json`` in the profiles base holds settings every profile gets, such
+    as hooks. claude merges ``--settings`` over the profile's own settings.json, and hook
+    entries from both run. ``{profile}`` in any string becomes the profile name; in the
+    sandbox, HTTP hooks aimed at the host's loopback are re-pointed so they still reach it.
+    """
+    path = settings.profiles_base / SHARED_SETTINGS
+    if not path.exists():
+        return [], False
+    if any(arg == "--settings" or arg.startswith("--settings=") for arg in claude_args):
+        err_console.print(
+            f"[yellow]--settings was given, so {path} is not applied.[/yellow]"
+        )
+        return [], False
+    try:
+        data = _fill_profile(json.loads(path.read_text()), name)
+    except (OSError, json.JSONDecodeError) as err:
+        err_console.print(f"[red]Can't read {path}: {err}[/red]")
+        sys.exit(1)
+    if not isinstance(data, dict):
+        err_console.print(f"[red]{path} must hold a JSON object.[/red]")
+        sys.exit(1)
+    host_loopback = sandbox and _rewrite_loopback_hooks(data)
+    return ["--settings", json.dumps(data)], host_loopback
+
+
+def _fill_profile(value: Any, name: str) -> Any:
+    """Replace ``{profile}`` with the profile name in every string inside ``value``."""
+    if isinstance(value, str):
+        return value.replace(PROFILE_PLACEHOLDER, name)
+    if isinstance(value, list):
+        return [_fill_profile(item, name) for item in value]
+    if isinstance(value, dict):
+        return {key: _fill_profile(item, name) for key, item in value.items()}
+    return value
+
+
+def _rewrite_loopback_hooks(data: dict[str, Any]) -> bool:
+    """Point HTTP hooks aimed at the host's loopback at the VM's route to it.
+
+    Inside the microVM 127.0.0.1 is the VM itself; under --map-host-loopback the host's
+    loopback answers at SANDBOX_HOST_LOOPBACK instead. Returns whether any hook moved, so
+    the caller knows the VM needs that mapping even without an agent bridge.
+    """
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    rewrote = False
+    for groups in hooks.values():
+        for handler in _http_hook_handlers(groups):
+            url = urlsplit(handler["url"])
+            if url.hostname in LOOPBACK_HOSTS:
+                netloc = SANDBOX_HOST_LOOPBACK + (f":{url.port}" if url.port else "")
+                handler["url"] = urlunsplit(url._replace(netloc=netloc))
+                rewrote = True
+    return rewrote
+
+
+def _http_hook_handlers(groups: Any) -> list[dict[str, Any]]:
+    """The ``"type": "http"`` handlers in one hook event's list of matcher groups."""
+    if not isinstance(groups, list):
+        return []
+    return [
+        handler
+        for group in groups
+        if isinstance(group, dict)
+        for handler in group.get("hooks") or []
+        if isinstance(handler, dict)
+        and handler.get("type") == "http"
+        and isinstance(handler.get("url"), str)
+    ]
+
+
 def _sandbox_chrome_overlay(profile_dir: Path) -> Path:
     """Throwaway dir mounted over the profile's ``chrome/`` inside the VM.
 
@@ -1145,6 +1228,8 @@ def _build_sandbox_argv(
     claude_args: list[str],
     extra_env: dict[str, str],
     forwarding: Optional[_Forwarding] = None,
+    *,
+    host_loopback: bool = False,
 ) -> list[str]:
     """Assemble the `podman run` argv that boots claude in a krun microVM."""
     argv = [
@@ -1170,10 +1255,11 @@ def _build_sandbox_argv(
         "--device",
         "/dev/kvm",
     ]
-    if forwarding and forwarding.active():
+    if host_loopback or (forwarding and forwarding.active()):
         # pasta gives the VM a route to the host (TSI cannot); --map-host-loopback
         # makes host.containers.internal reach the host's loopback, so the agent
-        # bridge can bind to 127.0.0.1 rather than every host interface.
+        # bridge can bind to 127.0.0.1 rather than every host interface. Shared HTTP
+        # hooks aimed at the host's loopback (host_loopback) need the same route.
         argv.append(f"--network=pasta:--map-host-loopback,{SANDBOX_HOST_LOOPBACK}")
     argv += [
         "-e",
@@ -1844,12 +1930,18 @@ def _launch_sandbox(
     extra_env = _with_infisical_env(extra_env)
     extra_env = _with_pulumi_token(extra_env)
     extra_env = _with_forwarded_env(extra_env)
+    shared, host_loopback = _shared_settings_args(
+        profile_dir.name, claude_args, sandbox=True
+    )
+    claude_args = [*shared, *claude_args]
     cwd = Path.cwd()
     forwarding = _build_forwarding()
     if forwarding.active():
         _run_sandbox_supervised(profile_dir, cwd, claude_args, extra_env, forwarding)
         return
-    argv = _build_sandbox_argv(profile_dir, cwd, claude_args, extra_env)
+    argv = _build_sandbox_argv(
+        profile_dir, cwd, claude_args, extra_env, host_loopback=host_loopback
+    )
     os.execvpe(settings.podman_bin, argv, os.environ.copy())
 
 
@@ -1920,12 +2012,13 @@ def _launch_profile(name: str, claude_args: list[str]) -> None:
     if _sandbox_enabled(d):
         _launch_sandbox(d, claude_args, extra_env)
         return
+    shared, _host_loopback = _shared_settings_args(name, claude_args, sandbox=False)
     env = os.environ.copy()
     env["CLAUDE_CONFIG_DIR"] = str(d)
     env.update(extra_env)
     # exec replaces this process - no wrapper in between, which matters for
     # claude's TUI (raw terminal mode, signal handling, etc.)
-    os.execvpe(settings.claude_bin, [settings.claude_bin] + claude_args, env)
+    os.execvpe(settings.claude_bin, [settings.claude_bin, *shared, *claude_args], env)
 
 
 def main() -> None:

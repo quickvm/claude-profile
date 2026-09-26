@@ -126,6 +126,18 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   bind-mounts it over `settings.json` **inside the VM only**, read-write so in-VM setting writes
   hit the throwaway overlay (regenerated each launch), not the real profile settings. Host launches
   are untouched and keep the sudo deny.
+- **Shared settings (`shared-settings.json`):** settings every profile should get (hooks, for
+  example) live once in `<profiles_base>/shared-settings.json` instead of being copied into each
+  profile's `settings.json`. `_shared_settings_args` loads it at every launch, replaces
+  `{profile}` in any string with the profile name (so a hook URL can carry
+  `?profile={profile}`), and passes the result as `--settings <json>`; claude merges that over
+  the profile's own settings, and hook entries from both run. A user-supplied `--settings`
+  wins (the shared file is skipped with a warning), and an unreadable or non-object file fails
+  the launch. In the sandbox, `_rewrite_loopback_hooks` re-points HTTP hooks aimed at
+  `127.0.0.1`/`localhost` at `SANDBOX_HOST_LOOPBACK`, and `_build_sandbox_argv(host_loopback=…)`
+  adds `--map-host-loopback` even when no agent bridge is active — inside the VM, 127.0.0.1 is
+  the VM itself, so without both a local hook receiver would silently never
+  hear from sandboxed sessions.
 - **SSH agent forwarding (`sandbox_ssh_agent`):** a microVM can't bind-mount the agent
   socket (separate kernel), so `_ssh_agent_sockets()` probes the candidates (the active
   `SSH_AUTH_SOCK` agent + 1Password) with `ssh-add -l`, drops dead ones (a stale socket

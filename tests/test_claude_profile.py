@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Generator
+from typing import Any, Generator
 from unittest.mock import Mock, patch
 
 import pytest
@@ -3028,3 +3028,151 @@ def test_sandbox_known_hosts_preserves_existing(tmp_path: Path) -> None:
         claude_profile._sandbox_known_hosts(profile).read_text()
         == "host1 ssh-ed25519 KEY\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# shared settings
+# ---------------------------------------------------------------------------
+
+HOOK_URL = "http://127.0.0.1:8080/hook?profile={profile}"
+SHARED: dict[str, Any] = {
+    "hooks": {
+        "Stop": [
+            {
+                "hooks": [
+                    {"type": "http", "url": HOOK_URL, "timeout": 5},
+                    {"type": "command", "command": "echo {profile}"},
+                ]
+            }
+        ],
+        "PreToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [{"type": "http", "url": "https://hooks.example.com/check"}],
+            }
+        ],
+    }
+}
+
+
+def _write_shared(profiles_base: Path, data: object) -> None:
+    profiles_base.mkdir(parents=True, exist_ok=True)
+    (profiles_base / claude_profile.SHARED_SETTINGS).write_text(json.dumps(data))
+
+
+def _settings_arg(argv: list[str]) -> dict[str, Any]:
+    return json.loads(argv[argv.index("--settings") + 1])
+
+
+def test_launch_passes_shared_settings_with_the_profile_name(
+    profiles_base: Path,
+) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    _write_shared(profiles_base, SHARED)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", ["--resume"])
+    _bin, argv, _env = mock_exec.call_args[0]
+    stop = _settings_arg(argv)["hooks"]["Stop"][0]["hooks"]
+    assert stop[0]["url"] == "http://127.0.0.1:8080/hook?profile=work"
+    assert stop[1]["command"] == "echo work"
+    assert argv[-1] == "--resume"
+
+
+def test_launch_without_shared_settings_passes_none(profiles_base: Path) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    assert "--settings" not in mock_exec.call_args[0][1]
+
+
+def test_launch_leaves_an_explicit_settings_flag_alone(profiles_base: Path) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    _write_shared(profiles_base, SHARED)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", ["--settings", "mine.json"])
+    argv = mock_exec.call_args[0][1]
+    assert argv.count("--settings") == 1
+    assert argv[argv.index("--settings") + 1] == "mine.json"
+
+
+@pytest.mark.parametrize("content", ["{not json", "[1, 2]"])
+def test_launch_exits_on_a_broken_shared_settings_file(
+    profiles_base: Path, content: str
+) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    (profiles_base / claude_profile.SHARED_SETTINGS).write_text(content)
+    with pytest.raises(SystemExit) as exc_info, patch("os.execvpe"):
+        _launch_profile("work", [])
+    assert exc_info.value.code == 1
+
+
+def test_sandbox_repoints_loopback_hooks_at_the_host(profiles_base: Path) -> None:
+    _write_shared(profiles_base, SHARED)
+    args, host_loopback = claude_profile._shared_settings_args(
+        "personal", [], sandbox=True
+    )
+    hooks = json.loads(args[1])["hooks"]
+    loopback = claude_profile.SANDBOX_HOST_LOOPBACK
+    assert hooks["Stop"][0]["hooks"][0]["url"] == (
+        f"http://{loopback}:8080/hook?profile=personal"
+    )
+    assert (
+        hooks["PreToolUse"][0]["hooks"][0]["url"] == "https://hooks.example.com/check"
+    )
+    assert host_loopback is True
+
+
+def test_host_launch_keeps_loopback_hooks(profiles_base: Path) -> None:
+    _write_shared(profiles_base, SHARED)
+    args, host_loopback = claude_profile._shared_settings_args(
+        "work", [], sandbox=False
+    )
+    url = json.loads(args[1])["hooks"]["Stop"][0]["hooks"][0]["url"]
+    assert url == "http://127.0.0.1:8080/hook?profile=work"
+    assert host_loopback is False
+
+
+def test_sandbox_needs_no_loopback_mapping_without_loopback_hooks(
+    profiles_base: Path,
+) -> None:
+    _write_shared(
+        profiles_base, {"hooks": {"PreToolUse": SHARED["hooks"]["PreToolUse"]}}
+    )
+    _args, host_loopback = claude_profile._shared_settings_args(
+        "work", [], sandbox=True
+    )
+    assert host_loopback is False
+
+
+def test_argv_maps_host_loopback_for_shared_hooks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    argv = _build_sandbox_argv(profile, cwd, [], {}, host_loopback=True)
+    loopback = claude_profile.SANDBOX_HOST_LOOPBACK
+    assert f"--network=pasta:--map-host-loopback,{loopback}" in argv
+
+
+def test_sandbox_launch_with_loopback_hooks_maps_host_loopback(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = profiles_base / "personal"
+    profile.mkdir(parents=True)
+    (profile / SANDBOX_MARKER).touch()
+    _write_shared(profiles_base, SHARED)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.setattr(
+        claude_profile, "_build_forwarding", lambda: claude_profile._Forwarding([])
+    )
+    monkeypatch.chdir(tmp_path)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("personal", [])
+    _bin, argv, _env = mock_exec.call_args[0]
+    assert any(arg.startswith("--network=pasta:--map-host-loopback") for arg in argv)
+    url = _settings_arg(argv)["hooks"]["Stop"][0]["hooks"][0]["url"]
+    assert url.startswith(f"http://{claude_profile.SANDBOX_HOST_LOOPBACK}:8080/")
