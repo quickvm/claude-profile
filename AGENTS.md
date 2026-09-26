@@ -162,6 +162,22 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   `clipboard_port` for the clipboard bridge; `active()` reports whether any host bridge is
   needed. The in-VM env (`CLAUDE_SANDBOX_FORWARDS`, `SSH_AUTH_SOCK`, `GNUPGHOME`,
   `CLAUDE_SANDBOX_GPG_PUBKEYS`, `CLAUDE_SANDBOX_CLIPBOARD_PORT`) is built by `_forwarding_env`.
+  The seeded GNUPGHOME also gets a `gpg.conf` carrying **`no-autostart`**, without which the
+  forward dies partway through long sessions: `S.gpg-agent` in the VM is the bridge socket, not
+  an agent, so any moment the host end is unreachable (the host gpg-agent restarting is enough)
+  makes a request over it return EOF, and gpg's default autostart answers EOF by launching a
+  local agent that unlinks the bridge socket and binds its own. socat keeps listening on the
+  orphaned inode, so every later gpg call silently reaches the local keyless agent and signing
+  stays broken even after the host recovers. `no-autostart` turns that into a plain transient
+  failure the next call recovers from — the host-side socat re-resolves the agent path per
+  connection, so it already picks up a restarted agent on its own. (`gpg-connect-agent` reads no
+  options file and still autostarts; pass it `--no-autostart` when poking at the agent by hand.)
+  The other way the forward goes missing is at launch: gpgconf reports the extra-socket path
+  whether or not an agent is running, but the socket only exists while one is, and nothing says
+  the host has used gpg yet this login. `_gpg_extra_socket` therefore runs `gpgconf --launch
+  gpg-agent` when the socket is absent and re-checks; if it is still missing, `_build_forwarding`
+  warns rather than skipping GPG silently, which used to leave a whole session with no GPG and no
+  indication why.
 - **Clipboard bridge (`sandbox_clipboard`):** Claude Code reads a pasted image on Linux by
   shelling out to `wl-paste`/`xclip`, but the microVM has no display. Rather than forward the
   whole Wayland compositor (waypipe would also hand the sandbox screen capture and keystroke

@@ -1674,6 +1674,20 @@ def test_gpg_extra_socket_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     assert claude_profile._gpg_extra_socket() is None
 
 
+def test_gpg_extra_socket_launches_idle_agent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    extra = tmp_path / "S.gpg-agent.extra"
+
+    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        if "--launch" in cmd:
+            extra.touch()  # the agent binds its sockets on launch
+        return subprocess.CompletedProcess(cmd, 0, stdout=f"{extra}\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert claude_profile._gpg_extra_socket() == extra
+
+
 def test_gpg_extra_socket_no_gpgconf(monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(*a: object, **k: object) -> None:
         raise FileNotFoundError
@@ -1731,6 +1745,17 @@ def test_build_forwarding_gpg_only(
     assert fwd.forwards == [(extra, guest, 6000)]
     assert fwd.ssh_auth_sock is None
     assert fwd.gpg_pubkeys_b64 == "QUJD"
+
+
+def test_build_forwarding_gpg_warns_when_agent_unavailable(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", True)
+    monkeypatch.setattr(claude_profile, "_gpg_extra_socket", lambda: None)
+    fwd = claude_profile._build_forwarding()
+    assert fwd.forwards == []
+    assert fwd.gpg_pubkeys_b64 is None
+    assert "gpg-agent" in capsys.readouterr().err
 
 
 def test_build_forwarding_none_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:

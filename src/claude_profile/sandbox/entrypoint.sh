@@ -95,8 +95,19 @@ fi
 # Seed a fresh GNUPGHOME with the host's public keys; signing uses the forwarded
 # gpg-agent (the secret keys/card stay on the host).
 if [ -n "$CLAUDE_SANDBOX_GPG_PUBKEYS" ]; then
-  mkdir -p "${GNUPGHOME:-$HOME/.gnupg}"
-  chmod 700 "${GNUPGHOME:-$HOME/.gnupg}"
+  _gnupghome="${GNUPGHOME:-$HOME/.gnupg}"
+  mkdir -p "$_gnupghome"
+  chmod 700 "$_gnupghome"
+  # S.gpg-agent here is the bridge socket, not a real agent. Whenever the host end is
+  # briefly unreachable — the host gpg-agent restarting is enough — a request over it
+  # returns EOF, and gpg's default autostart answers that by launching a local agent,
+  # which unlinks the bridge socket and binds its own. The bridge keeps listening on an
+  # orphaned inode, so every later gpg call silently reaches the local keyless agent and
+  # signing stays broken for the rest of the session even once the host recovers.
+  # no-autostart makes that outage a plain transient failure the next call recovers from.
+  # It also stops dirmngr autostarting (keyserver lookups need an explicit
+  # `gpgconf --launch dirmngr`), which the forwarded-agent setup does not rely on.
+  printf 'no-autostart\n' >"$_gnupghome/gpg.conf"
   printf '%s' "$CLAUDE_SANDBOX_GPG_PUBKEYS" | base64 -d | gpg --batch --import 2>/dev/null || true
 fi
 

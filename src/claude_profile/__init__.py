@@ -1382,7 +1382,13 @@ def _ssh_agent_sockets() -> list[Path]:
 
 
 def _gpg_extra_socket() -> Optional[Path]:
-    """Path to the host gpg-agent restricted (signing-only) socket, if present."""
+    """Path to the host gpg-agent restricted (signing-only) socket, starting one if needed.
+
+    gpgconf reports the path whether or not an agent is running, but the socket only
+    exists while one is, and nothing guarantees the host has used gpg yet this login.
+    Without the launch a sandbox started at the wrong moment forwards no GPG at all for
+    its whole life, so ask gpgconf to bring the agent up before giving up.
+    """
     try:
         result = subprocess.run(
             ["gpgconf", "--list-dirs", "agent-extra-socket"],
@@ -1395,6 +1401,8 @@ def _gpg_extra_socket() -> Optional[Path]:
     if result.returncode != 0 or not path:
         return None
     sock = Path(path)
+    if not sock.exists():
+        subprocess.run(["gpgconf", "--launch", "gpg-agent"], capture_output=True)
     return sock if sock.exists() else None
 
 
@@ -1456,6 +1464,12 @@ def _build_forwarding() -> _Forwarding:
             guest = Path(SANDBOX_GNUPGHOME) / "S.gpg-agent"
             forwards.append((extra, guest, _free_tcp_port()))
             pubkeys = _export_gpg_pubkeys()
+        else:
+            err_console.print(
+                "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_GPG_AGENT is set but no host "
+                "gpg-agent socket is available, so GPG is not forwarded and signing will "
+                "fail in the sandbox. Check 'gpgconf --launch gpg-agent'.[/yellow]"
+            )
     clipboard_port = _free_tcp_port() if settings.sandbox_clipboard else None
     browser_port: Optional[int] = None
     browser_open_port: Optional[int] = None
