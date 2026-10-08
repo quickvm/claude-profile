@@ -3289,6 +3289,24 @@ def test_mcp_container_images_includes_ancestor_mcp_json(tmp_path: Path) -> None
     ]
 
 
+def test_sandbox_cache_clear_deletes_only_the_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `podman system reset` also stops the user's rootless pause process and wipes the
+    # run root that their other rootless containers share.
+    store = tmp_path / "image-store"
+    store.mkdir()
+    monkeypatch.setattr(claude_profile, "_image_cache_dir", lambda: store)
+    monkeypatch.setattr(claude_profile.shutil, "which", lambda name: None)
+    ran: list[list[str]] = []
+    monkeypatch.setattr(claude_profile, "_run_checked", ran.append)
+    result = runner.invoke(app, ["sandbox-cache", "work", "--clear"])
+    assert result.exit_code == 0, result.output
+    assert ran == [
+        [claude_profile.settings.podman_bin, "unshare", "rm", "-rf", str(store)]
+    ]
+
+
 def test_image_cache_dir_respects_xdg(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", "/x/data")
     assert claude_profile._image_cache_dir() == Path(

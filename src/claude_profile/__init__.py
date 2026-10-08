@@ -559,6 +559,14 @@ def sandbox_cache(
     """Pre-pull a profile's podman-run MCP images into a shared store the sandbox mounts
     read-only, so they are not re-pulled on every microVM launch."""
     store = _image_cache_dir()
+    if clear:
+        if store.exists():
+            # Delete just the store (its files belong to subuids, hence unshare).
+            # `podman system reset` would also stop the user's rootless pause process
+            # and wipe the run root their other rootless containers share.
+            _run_checked([settings.podman_bin, "unshare", "rm", "-rf", str(store)])
+        console.print(f"[green]Image cache cleared ({store}).[/green]")
+        return
     fuse = shutil.which("fuse-overlayfs")
     if fuse is None:
         err_console.print(
@@ -566,21 +574,6 @@ def sandbox_cache(
             "(dnf install fuse-overlayfs)."
         )
         raise typer.Exit(code=1)
-    if clear:
-        if store.exists():
-            _run_checked(
-                [
-                    settings.podman_bin,
-                    "--root",
-                    str(store),
-                    *_cache_driver_args(fuse),
-                    "system",
-                    "reset",
-                    "--force",
-                ]
-            )
-        console.print(f"[green]Image cache cleared ({store}).[/green]")
-        return
     profile_dir = settings.profiles_base / name
     if not profile_dir.exists():
         err_console.print(f"[red]Profile '{name}' does not exist.[/red]")
