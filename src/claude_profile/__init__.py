@@ -2,11 +2,25 @@
 
 from __future__ import annotations
 
+import base64
+import contextlib
+import hashlib
+import json
 import os
+import pwd
+import re
 import shutil
+import signal
+import socket
+import subprocess
 import sys
+import tempfile
+import time
+from dataclasses import KW_ONLY, dataclass
+from importlib import resources
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import typer
 from pydantic import Field
@@ -16,24 +30,187 @@ from rich.table import Table
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="CLAUDE_PROFILE_")
+    # An empty value means unset: `CLAUDE_PROFILE_SANDBOX=` clears an exported override
+    # instead of failing every command on a bool that cannot be parsed.
+    model_config = SettingsConfigDict(
+        env_prefix="CLAUDE_PROFILE_", env_ignore_empty=True
+    )
 
     profiles_base: Path = Field(
         default_factory=lambda: Path.home() / ".claude-profiles"
     )
     claude_bin: str = Field(default="claude")
+    podman_bin: str = Field(default="podman")
+    sandbox_image: str = Field(default="claude-profile-sandbox:latest")
+    sandbox_ram_mib: int = Field(default=4096)
+    sandbox_cpus: int = Field(default=4)
+    sandbox_skip_permissions: bool = Field(default=True)
+    sandbox_ssh_agent: bool = Field(default=False)
+    sandbox_gpg_agent: bool = Field(default=False)
+    sandbox_clipboard: bool = Field(default=False)
+    sandbox_chrome: bool = Field(default=False)
+    sandbox_gh: bool = Field(default=False)
+    # Allowlist of infisical logins to forward into the sandbox: comma-separated
+    # emails or domains (e.g. "corp.example,quickvm.com"). Empty = disabled.
+    sandbox_infisical: str = Field(default="")
+    sandbox_pulumi: bool = Field(default=False)
+    # Comma-separated names of host env vars to copy into the sandbox (e.g. tokens that
+    # host-oriented MCP servers pass through as `-e VAR`). Empty = none forwarded.
+    sandbox_forward_env: str = Field(default="")
+    # Per-launch override of the .sandbox marker (CLAUDE_PROFILE_SANDBOX). None = use marker.
+    sandbox: Optional[bool] = Field(default=None)
 
 
 settings = Settings()
 console = Console()
 err_console = Console(stderr=True)
 
-LINKABLE_DIRS: tuple[str, ...] = ("commands", "skills")
+# hooks: a hook or statusLine command written as ~/.claude/hooks/... resolves to the
+# profile dir inside the sandbox, so a guard hook there only runs if the link does.
+LINKABLE_DIRS: tuple[str, ...] = ("commands", "skills", "hooks")
+# Symlinked into each profile rather than copied: the sandbox reaches it through the
+# profile dir, and a copy goes stale the moment the global script changes.
+STATUSLINE_FILE = "statusline.sh"
+SANDBOX_MARKER = ".sandbox"
+SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
+SANDBOX_CONFIG_DIR = "/home/appuser/.claude"
+SANDBOX_GNUPGHOME = "/home/appuser/.gnupg"
+# In-VM dir for the forwarded SSH agent sockets. Not the host's own path: the entrypoint
+# chowns each socket's parent, and when that is /run/user/<uid> gpg moves its socket
+# dir there and never reaches the GPG bridge in GNUPGHOME.
+SANDBOX_AGENT_DIR = "/run/claude-sandbox"
+# In-VM path of the host's public keyring, which the entrypoint imports into GNUPGHOME.
+SANDBOX_GPG_PUBKEYS = "/opt/claude-host/gpg-pubkeys"
+# In-VM path where the host's Claude Code binary is mounted read-only. The entrypoint
+# points the PATH entry at it, so the VM runs the host's version instead of the one
+# baked into the image (see _sandbox_claude_binary).
+SANDBOX_HOST_CLAUDE = "/opt/claude-host/claude"
+# In-VM path where the shared, read-only MCP image store is mounted (additionalimagestore).
+SANDBOX_IMAGE_STORE = "/var/lib/shared-mcp-store"
+# Trust anchors sourced by update-ca-trust. Same path on host and in the VM: the host's
+# copy is mounted straight over the image's (see _ca_trust_mounts).
+SANDBOX_CA_ANCHORS = "/etc/pki/ca-trust/source/anchors"
+# Env var carrying the host clipboard-bridge TCP port to the in-VM wl-paste shim.
+SANDBOX_CLIPBOARD_PORT_ENV = "CLAUDE_SANDBOX_CLIPBOARD_PORT"
+# Env var carrying the host browser-bridge TCP port to the in-VM entrypoint.
+SANDBOX_BROWSER_BRIDGE_PORT_ENV = "CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT"
+# Env var carrying the host browser-open TCP port to the in-VM google-chrome shim.
+SANDBOX_BROWSER_OPEN_PORT_ENV = "CLAUDE_SANDBOX_BROWSER_OPEN_PORT"
+# Chrome Web Store id of the Claude extension, and the env var naming the in-VM path to
+# create so claude's extension detection (a readdir of
+# <chrome-user-data>/<profile>/Extensions/<id>) succeeds inside the sandbox.
+CHROME_EXTENSION_ID = "fcoeoabgfenejglbffodgkkbkcdhcgfn"
+SANDBOX_CHROME_EXT_PATH_ENV = "CLAUDE_SANDBOX_CHROME_EXT_PATH"
+# Chromium-family user-data dirs under ~/.config to look for the extension in.
+CHROME_USER_DATA_DIRS: tuple[str, ...] = (
+    "google-chrome",
+    "chromium",
+    "microsoft-edge",
+    "BraveSoftware/Brave-Browser",
+)
+# OAuth scopes claude accepts for Claude in Chrome. It gates the integration on the token
+# carrying one of these *before* every other enable condition, so a profile authenticated
+# with a setup-token (which grants user:inference only) silently reports "Disabled".
+CHROME_OAUTH_SCOPES: frozenset[str] = frozenset(
+    {"user:profile", "user:office", "user:ccr_inference"}
+)
+# Deny-rule prefixes stripped from the in-VM settings overlay: host guardrails that
+# are counterproductive inside the isolated microVM (deny beats
+# --dangerously-skip-permissions, so they still apply there). The VM grants OS-level
+# sudo scoped to dnf/podman, and only mounted paths exist inside it, so the host's
+# blanket sudo deny and its ~/.ssh//~/.aws read guards just block the intended
+# workflow (e.g. `sudo podman`, reading the forwarded ssh/known_hosts).
+SANDBOX_STRIP_DENY_PREFIXES: tuple[str, ...] = (
+    "Bash(sudo",
+    "Read(~/.ssh",
+    "Edit(~/.ssh",
+    "Read(~/.aws",
+)
+# podman's default host.containers.internal address under pasta; mapping it to the
+# host loopback lets the agent bridge bind to 127.0.0.1 instead of all interfaces.
+SANDBOX_HOST_LOOPBACK = "169.254.1.2"
+# Git settings resolved on the host for the CWD and given to the VM (see
+# _git_identity_mounts). Signing settings go only when GPG is forwarded.
+GIT_IDENTITY_KEYS: tuple[str, ...] = ("user.name", "user.email")
+GIT_SIGNING_KEYS: tuple[str, ...] = ("user.signingkey", "commit.gpgsign", "gpg.format")
+# In-VM paths: the mounted ~/.gitconfig, and the generated global config that includes it.
+SANDBOX_GITCONFIG = "/home/appuser/.gitconfig"
+SANDBOX_GIT_IDENTITY = "/home/appuser/.gitconfig-identity"
+# Settings every profile gets (e.g. hooks), in the profiles base and passed to each launch
+# with --settings; "{profile}" in any string becomes the profile name.
+SHARED_SETTINGS = "shared-settings.json"
+PROFILE_PLACEHOLDER = "{profile}"
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
+# Names `env --set` accepts, and names a profile can have (see _check_profile_name).
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+SANDBOX_BRIEFING = (
+    "You are running inside the claude-profile microVM sandbox — an ephemeral "
+    "podman/krun VM (confirm with /run/.containerenv). The host filesystem is visible "
+    "only where it is mounted: the working directory and its git dir, this profile's "
+    "Claude config, and a few read-only files. Whatever you change under those mounts "
+    "persists on the host, where the user later runs it outside the sandbox — git hooks "
+    "and git config, .claude/ settings, and this profile's config included — so treat "
+    "those changes as you would on the host. Anything you install is discarded when "
+    "the session ends, and you have passwordless sudo for dnf and podman. To add a "
+    "missing tool use `sudo dnf "
+    "install <pkg>` or `uv tool install <tool>` (see the sandbox-tools skill). Nested "
+    "containers run rootful automatically — just use `podman` (it is wrapped to sudo "
+    "because rootless can't unpack layers in the VM's user namespace); give containers that "
+    'write into the mounted repo --user "$(id -u):$(id -g)", or the host user cannot delete '
+    "what they write. If you need a tool made "
+    "permanent, access outside the mounted paths, or anything the sandbox blocks, ask "
+    "the user instead of working around it."
+)
+# Curated dev tools advertised by the sandbox-tools skill (command name -> description).
+SANDBOX_SKILL_TOOLS: dict[str, str] = {
+    "uv": "Python package/tool manager (uv tool install, uv run)",
+    "ty": "ty (Python type checker)",
+    "python3": "Python 3 (with pyyaml and jinja2)",
+    "jq": "JSON processor",
+    "yq": "YAML processor",
+    "git": "Git",
+    "gh": "GitHub CLI",
+    "infisical": "Infisical CLI (secrets management)",
+    "pulumi": "Pulumi (infrastructure as code)",
+    "bk": "Buildkite CLI (auths via BUILDKITE_API_TOKEN)",
+    "rg": "ripgrep (fast search)",
+    "fd": "fd (fast file finder)",
+    "make": "make",
+    "shellcheck": "ShellCheck (shell linter)",
+    "gcc": "C compiler",
+    "openssl": "OpenSSL",
+    "trash": "trash-cli (use instead of rm -rf)",
+    "ssh": "OpenSSH client",
+    "gpg": "GnuPG",
+    "socat": "socat",
+    "podman": "Podman — run nested containers (runs rootful automatically)",
+    "node": "Node.js",
+    "npm": "npm",
+    "butane": "Butane (Ignition config compiler)",
+}
 
 app = typer.Typer(
     name="claude-profile",
     help="Launch Claude Code with isolated config directories per profile.",
     no_args_is_help=True,
+)
+
+# First-arg tokens that are subcommands, not profile names: main() treats any other
+# non-flag first arg as a profile to launch, so every @app.command must be listed here
+# (a test enforces this).
+KNOWN_COMMANDS: frozenset[str] = frozenset(
+    {
+        "list",
+        "add",
+        "remove",
+        "links",
+        "env",
+        "build",
+        "sandbox",
+        "sandbox-skill",
+        "sandbox-cache",
+    }
 )
 
 
@@ -53,6 +230,7 @@ def list_profiles() -> None:
     table = Table(title="Claude Code Profiles")
     table.add_column("Profile", style="cyan")
     table.add_column("Status")
+    table.add_column("Sandbox")
 
     for p in dirs:
         creds = p / ".credentials.json"
@@ -62,7 +240,8 @@ def list_profiles() -> None:
             status = (
                 f"[red]✗ not authenticated[/red] (run: claude-profile {p.name} /login)"
             )
-        table.add_row(p.name, status)
+        sandbox = "✓ microVM" if (p / SANDBOX_MARKER).exists() else "—"
+        table.add_row(p.name, status, sandbox)
 
     console.print(table)
 
@@ -91,23 +270,20 @@ def _setup_dir_link(profile_dir: Path, dir_name: str, link: bool) -> None:
 
 
 @app.command("add")
-def add_profile(name: str = typer.Argument(..., help="Profile name to create")) -> None:
+def add_profile(
+    name: str = typer.Argument(..., help="Profile name to create"),
+    sandbox: bool = typer.Option(
+        False, "--sandbox", help="Run this profile in a microVM (podman + krun)."
+    ),
+) -> None:
     """Create a new profile."""
+    _check_profile_name(name)
     d = settings.profiles_base / name
     if d.exists():
         err_console.print(f"[yellow]Profile '{name}' already exists at {d}[/yellow]")
         raise typer.Exit(code=1)
     d.mkdir(parents=True)
-    claude_dir = Path.home() / ".claude"
-    for fname in ("statusline.sh", "settings.json"):
-        src = claude_dir / fname
-        dst = d / fname
-        if src.exists() and not dst.exists():
-            shutil.copy2(src, dst)
-    claude_md = claude_dir / "CLAUDE.md"
-    dst_md = d / "CLAUDE.md"
-    if claude_md.exists() and not dst_md.exists():
-        shutil.copy2(claude_md, dst_md)
+    _seed_from_global(d)
 
     for dir_name in LINKABLE_DIRS:
         link = typer.confirm(
@@ -115,8 +291,408 @@ def add_profile(name: str = typer.Argument(..., help="Profile name to create")) 
         )
         _setup_dir_link(d, dir_name, link)
 
+    if sandbox:
+        (d / SANDBOX_MARKER).touch()
+
     console.print(f"[green]Created profile '{name}'[/green] at {d}")
+    if sandbox:
+        console.print("[cyan]Sandbox mode: launches run in a microVM.[/cyan]")
+        if not _sandbox_image_exists():
+            console.print(
+                f"Build the sandbox image first: claude-profile build "
+                f"(image '{settings.sandbox_image}' not found)"
+            )
     console.print(f"Authenticate with: claude-profile {name} /login")
+
+
+def _check_profile_name(name: str) -> None:
+    """Exit unless name can be launched as `claude-profile <name>`.
+
+    A subcommand's name would run that command instead, a path-like name would land
+    outside the profiles dir, and shared-settings.json is the shared settings file.
+    """
+    if (
+        not PROFILE_NAME.fullmatch(name)
+        or name in KNOWN_COMMANDS
+        or name == SHARED_SETTINGS
+    ):
+        err_console.print(
+            f"[red]Error: '{name}' can't be a profile name. Use letters, digits, '.', '_' "
+            f"and '-', starting with a letter or digit, and not a claude-profile "
+            f"command.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+
+def _seed_from_global(profile_dir: Path) -> None:
+    """Copy settings.json and CLAUDE.md from ~/.claude into a new profile, and link
+    its statusline.sh to the global one (see STATUSLINE_FILE)."""
+    claude_dir = Path.home() / ".claude"
+    for fname in ("settings.json", "CLAUDE.md"):
+        src = claude_dir / fname
+        if src.exists():
+            shutil.copy2(src, profile_dir / fname)
+    statusline = claude_dir / STATUSLINE_FILE
+    if statusline.exists():
+        (profile_dir / STATUSLINE_FILE).symlink_to(statusline)
+
+
+def _sandbox_data_dir() -> Path:
+    """Return the packaged sandbox build context (Containerfile + entrypoint.sh)."""
+    return Path(str(resources.files("claude_profile") / "sandbox"))
+
+
+def _sandbox_image_exists() -> bool:
+    """Return True if the configured sandbox image is present locally."""
+    try:
+        result = subprocess.run(
+            [settings.podman_bin, "image", "exists", settings.sandbox_image],
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0
+
+
+def _sandbox_image_user() -> str:
+    """Return the sandbox image's configured USER (empty string means root)."""
+    try:
+        result = subprocess.run(
+            [
+                settings.podman_bin,
+                "image",
+                "inspect",
+                settings.sandbox_image,
+                "--format",
+                "{{.Config.User}}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+@app.command("build")
+def build_sandbox() -> None:
+    """Build the microVM sandbox image (podman + krun)."""
+    ctx = _sandbox_data_dir()
+    cmd = [
+        settings.podman_bin,
+        "build",
+        "-t",
+        settings.sandbox_image,
+        "-f",
+        str(ctx / "Containerfile"),
+        str(ctx),
+    ]
+    console.print(f"Building [cyan]{settings.sandbox_image}[/cyan] ...")
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError:
+        err_console.print(
+            f"[red]'{settings.podman_bin}' not found.[/red] "
+            f"Install podman and crun-krun (dnf install crun-krun)."
+        )
+        raise typer.Exit(code=1) from None
+    except subprocess.CalledProcessError as exc:
+        err_console.print(f"[red]Build failed (exit {exc.returncode}).[/red]")
+        raise typer.Exit(code=1) from None
+    console.print(f"[green]Built {settings.sandbox_image}.[/green]")
+
+
+def _sandbox_installed_tools() -> list[str]:
+    """Return which curated dev tools are present in the sandbox image."""
+    names = " ".join(SANDBOX_SKILL_TOOLS)
+    # exit 0: the loop's status is its last `command -v`, so a missing last tool would
+    # otherwise look like a failed run.
+    script = f'for t in {names}; do command -v "$t" >/dev/null 2>&1 && echo "$t"; done; exit 0'
+    result = subprocess.run(
+        [
+            settings.podman_bin,
+            "run",
+            "--rm",
+            settings.sandbox_image,
+            "sh",
+            "-c",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        # Otherwise the skill would be rewritten listing no tools at all.
+        err_console.print(
+            f"[red]Could not list the tools in {settings.sandbox_image} (podman exit "
+            f"{result.returncode}): {result.stderr.strip()}[/red]"
+        )
+        sys.exit(1)
+    present = set(result.stdout.split())
+    return [tool for tool in SANDBOX_SKILL_TOOLS if tool in present]
+
+
+def _render_sandbox_skill(tools: list[str]) -> str:
+    """Render the sandbox-tools SKILL.md with the given installed-tools list."""
+    template = (
+        resources.files("claude_profile") / "sandbox_skill_template.md"
+    ).read_text()
+    listing = "\n".join(f"- `{tool}` — {SANDBOX_SKILL_TOOLS[tool]}" for tool in tools)
+    return template.replace("{{INSTALLED_TOOLS}}", listing)
+
+
+@app.command("sandbox-skill")
+def sandbox_skill(
+    check: bool = typer.Option(
+        False, "--check", help="Verify the skill matches the image; exit 1 if stale."
+    ),
+    path: Optional[Path] = typer.Option(
+        None,
+        "--path",
+        help="SKILL.md path (default ~/.claude/skills/sandbox-tools/SKILL.md).",
+    ),
+) -> None:
+    """Write (or --check) the sandbox-tools skill from the image's installed tools."""
+    dest = path or (Path.home() / ".claude" / "skills" / "sandbox-tools" / "SKILL.md")
+    _ensure_sandbox_image()
+    content = _render_sandbox_skill(_sandbox_installed_tools())
+    if check:
+        current = dest.read_text() if dest.exists() else ""
+        if current != content:
+            err_console.print(
+                f"[red]{dest} is out of date.[/red] Run: claude-profile sandbox-skill"
+            )
+            raise typer.Exit(code=1)
+        console.print(f"[green]{dest} is up to date.[/green]")
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(content)
+    console.print(f"[green]Wrote {dest}[/green]")
+
+
+def _data_dir() -> Path:
+    """Host directory holding claude-profile's own cached data (XDG data)."""
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "claude-profile"
+
+
+def _image_cache_dir() -> Path:
+    """Host directory holding the shared, read-only MCP image store."""
+    return _data_dir() / "image-store"
+
+
+# podman/docker run options that take the next arg as their value (see
+# _image_ref_from_args).
+RUN_VALUE_FLAGS: frozenset[str] = frozenset(
+    {
+        "-e",
+        "--env",
+        "--env-file",
+        "-v",
+        "--volume",
+        "--mount",
+        "-w",
+        "--workdir",
+        "--name",
+        "--network",
+        "--entrypoint",
+        "-p",
+        "--publish",
+        "-l",
+        "--label",
+        "-u",
+        "--user",
+    }
+)
+
+
+def _image_ref_from_args(args: list) -> Optional[str]:
+    """Pick the container image ref out of a podman/docker ``run`` arg list.
+
+    The image is the first arg that is not a flag, a flag's value or a path, and whose
+    first path segment looks like a registry host (has a ``.`` or ``:``), as in a
+    fully-qualified ref like ``ghcr.io/o/i:tag``. Values of RUN_VALUE_FLAGS are skipped
+    because they can look the same (``-e URL=https://h/x``, ``-v cache:/data``).
+    """
+    skip_value = False
+    for arg in args:
+        if skip_value or not isinstance(arg, str):
+            skip_value = False
+            continue
+        if arg in RUN_VALUE_FLAGS:
+            skip_value = True
+            continue
+        if arg.startswith(("-", "/")) or "/" not in arg:
+            continue
+        host = arg.split("/", 1)[0]
+        if "." in host or ":" in host:
+            return arg
+    return None
+
+
+def _mcp_server_blocks(config: Path) -> list[Any]:
+    """Return every ``mcpServers`` block in one MCP config file.
+
+    Covers both the user-scope block and the per-project ones ``.claude.json`` nests
+    under ``projects``. An unreadable or malformed file yields nothing: a broken config
+    should not abort a launch that has other places to look.
+    """
+    try:
+        data = json.loads(config.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    blocks = [data.get("mcpServers")]
+    projects = data.get("projects")
+    if isinstance(projects, dict):
+        blocks += [
+            p.get("mcpServers") for p in projects.values() if isinstance(p, dict)
+        ]
+    return blocks
+
+
+def _mcp_container_images(profile_dir: Path, cwd: Path) -> list[str]:
+    """Return the image refs used by the profile's podman/docker MCP servers.
+
+    Reads the profile's ``.claude.json`` plus the ``.mcp.json`` files claude picks up
+    from directories above ``cwd``, which the sandbox mounts and so can run too.
+    Extracts the image from each stdio server run via podman/docker. De-duplicated.
+    """
+    blocks: list[Any] = []
+    for config in [profile_dir / ".claude.json", *_ancestor_mcp_json(cwd)]:
+        blocks += _mcp_server_blocks(config)
+    images: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        for server in block.values():
+            if not isinstance(server, dict) or server.get("command") not in (
+                "podman",
+                "docker",
+            ):
+                continue
+            image = _image_ref_from_args(server.get("args") or [])
+            if image and image not in images:
+                images.append(image)
+    return images
+
+
+def _image_store_populated(store: Path) -> bool:
+    """True if the host image store has been populated with images."""
+    return (store / "overlay-images").is_dir()
+
+
+def _run_checked(cmd: list[str]) -> None:
+    """Run a command, exiting with a clear message on failure."""
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError:
+        err_console.print(f"[red]'{cmd[0]}' not found.[/red]")
+        raise typer.Exit(code=1) from None
+    except subprocess.CalledProcessError as exc:
+        err_console.print(f"[red]{cmd[0]} failed (exit {exc.returncode}).[/red]")
+        raise typer.Exit(code=1) from None
+
+
+def _cache_driver_args(fuse: str) -> list[str]:
+    return [
+        "--storage-driver",
+        "overlay",
+        "--storage-opt",
+        f"overlay.mount_program={fuse}",
+    ]
+
+
+def _cache_pull(store: Path, fuse: str, images: list[str]) -> None:
+    """Pull images into the store and make it readable by the VM's mapped root."""
+    store.mkdir(parents=True, exist_ok=True)
+    console.print(f"Caching {len(images)} image(s) into [cyan]{store}[/cyan] ...")
+    for image in images:
+        console.print(f"  pulling {image}")
+        _run_checked(
+            [
+                settings.podman_bin,
+                "--root",
+                str(store),
+                *_cache_driver_args(fuse),
+                "pull",
+                image,
+            ]
+        )
+    # The VM's rootful podman runs as a mapped uid, so the store must be world-readable.
+    _run_checked([settings.podman_bin, "unshare", "chmod", "-R", "a+rX", str(store)])
+    console.print(
+        f"[green]Cached {len(images)} image(s); the sandbox mounts them read-only.[/green]"
+    )
+
+
+@app.command("sandbox-cache")
+def sandbox_cache(
+    name: str = typer.Argument(..., help="Profile whose MCP images to cache"),
+    clear: bool = typer.Option(False, "--clear", help="Empty the image cache instead."),
+) -> None:
+    """Pre-pull a profile's podman-run MCP images into a shared store the sandbox mounts
+    read-only, so they are not re-pulled on every microVM launch."""
+    store = _image_cache_dir()
+    if clear:
+        if store.exists():
+            # Delete just the store (its files belong to subuids, hence unshare).
+            # `podman system reset` would also stop the user's rootless pause process
+            # and wipe the run root their other rootless containers share.
+            _run_checked([settings.podman_bin, "unshare", "rm", "-rf", str(store)])
+        console.print(f"[green]Image cache cleared ({store}).[/green]")
+        return
+    fuse = shutil.which("fuse-overlayfs")
+    if fuse is None:
+        err_console.print(
+            "[red]'fuse-overlayfs' not found on host.[/red] Install it "
+            "(dnf install fuse-overlayfs)."
+        )
+        raise typer.Exit(code=1)
+    profile_dir = settings.profiles_base / name
+    if not profile_dir.exists():
+        err_console.print(f"[red]Profile '{name}' does not exist.[/red]")
+        raise typer.Exit(code=1)
+    images = _mcp_container_images(profile_dir, Path.cwd())
+    if not images:
+        console.print(f"No podman/docker MCP images found in profile '{name}'.")
+        return
+    _cache_pull(store, fuse, images)
+
+
+@app.command("sandbox")
+def manage_sandbox(
+    name: str = typer.Argument(..., help="Profile name"),
+    on: bool = typer.Option(False, "--on", help="Enable sandbox (microVM) mode."),
+    off: bool = typer.Option(
+        False, "--off", help="Disable sandbox mode (run on host)."
+    ),
+) -> None:
+    """Enable, disable, or show microVM sandbox mode for a profile."""
+    if on and off:
+        err_console.print("[red]Error: --on and --off are mutually exclusive.[/red]")
+        raise typer.Exit(code=1)
+
+    d = settings.profiles_base / name
+    if not d.exists():
+        err_console.print(f"[red]Profile '{name}' does not exist.[/red]")
+        raise typer.Exit(code=1)
+
+    marker = d / SANDBOX_MARKER
+    if not on and not off:
+        state = "microVM" if marker.exists() else "host"
+        console.print(f"Profile '{name}' launches on: {state}")
+        return
+
+    if on:
+        marker.touch()
+        console.print(f"[green]Sandbox enabled for '{name}'.[/green]")
+        if not _sandbox_image_exists():
+            console.print("Build the image first: claude-profile build")
+    else:
+        marker.unlink(missing_ok=True)
+        console.print(f"[green]Sandbox disabled for '{name}' (runs on host).[/green]")
 
 
 @app.command("remove")
@@ -177,11 +753,23 @@ def manage_links(
         return
 
     if link:
-        for dn in dirs:
-            _do_link(d, dn)
+        _link_dirs(d, dirs, named=dir_name is not None)
     else:
         for dn in dirs:
             _do_unlink(d, dn)
+
+
+def _link_dirs(profile_dir: Path, dirs: tuple[str, ...], *, named: bool) -> None:
+    """Link each dir to its ~/.claude counterpart.
+
+    Linking every dir skips the ones with no global counterpart (most people have no
+    ~/.claude/hooks); a dir named on the command line must exist.
+    """
+    for dn in dirs:
+        if not named and not (Path.home() / ".claude" / dn).exists():
+            console.print(f"Skipping '{dn}': ~/.claude/{dn} does not exist.")
+            continue
+        _do_link(profile_dir, dn)
 
 
 def _show_links_table(name: str, profile_dir: Path, dirs: tuple[str, ...]) -> None:
@@ -225,6 +813,83 @@ def _do_link(profile_dir: Path, dir_name: str) -> None:
     console.print(f"[green]Linked '{dir_name}' → {global_dir}[/green]")
 
 
+@app.command("env")
+def manage_env(
+    name: str = typer.Argument(..., help="Profile name"),
+    set_var: Optional[list[str]] = typer.Option(
+        None, "--set", help="Set a variable: KEY=VALUE"
+    ),
+    unset_var: Optional[list[str]] = typer.Option(
+        None, "--unset", help="Unset a variable by name"
+    ),
+) -> None:
+    """Manage per-profile environment variables stored in .env."""
+    d = settings.profiles_base / name
+    if not d.exists():
+        err_console.print(f"[red]Profile '{name}' does not exist.[/red]")
+        raise typer.Exit(code=1)
+
+    env_file = d / ".env"
+    existing = _load_profile_env(d)
+
+    if not set_var and not unset_var:
+        _show_env_table(name, existing)
+        return
+
+    _apply_env_changes(existing, set_var or [], unset_var or [])
+    _write_env_file(env_file, existing)
+    console.print(f"[green]Updated .env for profile '{name}'.[/green]")
+
+
+def _apply_env_changes(
+    env_vars: dict[str, str], set_var: list[str], unset_var: list[str]
+) -> None:
+    """Apply ``--set KEY=VALUE`` and ``--unset KEY`` entries to env_vars in place."""
+    for entry in set_var:
+        if "=" not in entry:
+            err_console.print(
+                f"[red]Error: '{entry}' is not valid. Use KEY=VALUE.[/red]"
+            )
+            raise typer.Exit(code=1)
+        key, _, value = entry.partition("=")
+        key = key.strip()
+        if not ENV_NAME.fullmatch(key):
+            err_console.print(
+                f"[red]Error: '{key}' is not a variable name (letters, digits and _, not "
+                f"starting with a digit).[/red]"
+            )
+            raise typer.Exit(code=1)
+        env_vars[key] = value.strip()
+    for key in unset_var:
+        if key not in env_vars:
+            err_console.print(f"[yellow]Warning: '{key}' is not set.[/yellow]")
+            continue
+        del env_vars[key]
+
+
+def _show_env_table(name: str, env_vars: dict[str, str]) -> None:
+    if not env_vars:
+        console.print(f"No environment variables set for profile '{name}'.")
+        return
+    table = Table(title=f"Environment for profile '{name}'")
+    table.add_column("Variable", style="cyan")
+    table.add_column("Value")
+    for key, value in sorted(env_vars.items()):
+        table.add_row(key, value)
+    console.print(table)
+
+
+def _write_env_file(env_file: Path, env_vars: dict[str, str]) -> None:
+    """Write .env readable by the user only: it holds tokens, and the profile dir is not
+    private (it is world-readable by default, like ~/.claude). An existing file is
+    tightened to 0600 before the new contents go in."""
+    lines = [f"{key}={value}" for key, value in sorted(env_vars.items())]
+    fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    os.fchmod(fd, 0o600)
+    with open(fd, "w") as handle:
+        handle.write("\n".join(lines) + "\n" if lines else "")
+
+
 def _do_unlink(profile_dir: Path, dir_name: str) -> None:
     path = profile_dir / dir_name
 
@@ -241,6 +906,1581 @@ def _do_unlink(profile_dir: Path, dir_name: str) -> None:
         console.print(f"[green]Created isolated '{dir_name}' directory.[/green]")
 
 
+def _load_profile_env(profile_dir: Path) -> dict[str, str]:
+    """Parse the profile's .env, refusing one that is a symlink.
+
+    The profile dir is writable from inside the sandbox. A .env planted there as a link
+    (to ~/.aws/credentials, say) would feed that file's KEY=VALUE lines into the next VM,
+    and `env --set` would overwrite the link's target. claude-profile only ever writes a
+    regular file.
+    """
+    env_file = profile_dir / ".env"
+    if env_file.is_symlink():
+        err_console.print(
+            f"[red]Refusing to use {env_file}: it is a symlink (to "
+            f"{os.readlink(env_file)}), not a file claude-profile wrote. Check it and "
+            f"remove it before launching this profile.[/red]"
+        )
+        sys.exit(1)
+    return _parse_env_file(env_file) if env_file.exists() else {}
+
+
+def _parse_env_file(env_path: Path) -> dict[str, str]:
+    """Parse a .env file into a dict of KEY=VALUE pairs.
+
+    Skips blank lines and comments. Strips optional quoting from values.
+    """
+    result: dict[str, str] = {}
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        result[key] = value
+    return result
+
+
+def _ensure_sandbox_image() -> None:
+    """Exit with a clear message if the sandbox image has not been built."""
+    if not _sandbox_image_exists():
+        err_console.print(
+            f"[red]Sandbox image '{settings.sandbox_image}' not found.[/red] "
+            f"Build it with: claude-profile build"
+        )
+        sys.exit(1)
+
+
+def _git_toplevel(cwd: Path) -> Optional[Path]:
+    """Root of the git work tree containing cwd, or None outside one."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    out = result.stdout.strip()
+    return Path(out).resolve() if result.returncode == 0 and out else None
+
+
+def _sandbox_work_root(cwd: Path) -> Path:
+    """The directory mounted read-write for cwd: its git work tree's root, if any.
+
+    Mounting only a repo subdirectory while the repo's .git is mounted read-write
+    showed git every other tracked file as deleted, and `git commit -a` in the VM
+    recorded those deletions in the host repo.
+    """
+    return _git_toplevel(cwd) or cwd
+
+
+def _git_common_dir(cwd: Path) -> Optional[Path]:
+    """Return the absolute git common dir for cwd, or None if not in a repo.
+
+    For a worktree this is the main repo's .git dir, which lives outside the
+    worktree and must be mounted so git works inside the microVM.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    out = result.stdout.strip()
+    if result.returncode != 0 or not out:
+        return None
+    common = Path(out)
+    return common.resolve() if common.is_absolute() else (cwd / common).resolve()
+
+
+def _sandbox_state_dir(profile_dir: Path) -> Path:
+    """Host-only dir for the files the launcher generates for a profile's sandbox.
+
+    The profile dir is mounted read-write into the VM, so a generated file kept there
+    can be swapped for a symlink by the agent, and the next launch would write through
+    it or mount its target (~/.bashrc as known_hosts, ~/.ssh as the chrome dir). Files
+    in this dir are bind-mounted individually: the VM can change their contents but
+    cannot replace them.
+    """
+    state = _data_dir() / "profiles" / profile_dir.name
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return state
+
+
+def _sandbox_settings_overlay(profile_dir: Path) -> Optional[Path]:
+    """Write a sandbox-tuned settings.json (host sudo deny stripped) to mount in the VM.
+
+    The profile's settings.json is copied from the host and carries host-oriented deny
+    rules (e.g. ``Bash(sudo *)``) that still apply inside the VM — deny wins even under
+    --dangerously-skip-permissions. The microVM is the isolation boundary and grants
+    scoped sudo, so we strip those denies into an overlay mounted only in the VM; the
+    profile's real settings.json (used by host launches) is untouched. Returns the
+    overlay path, or None when there is no settings.json or nothing to strip.
+    """
+    src = profile_dir / "settings.json"
+    if not src.exists():
+        return None
+    try:
+        data = json.loads(src.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    perms = data.get("permissions")
+    if not isinstance(perms, dict) or not isinstance(perms.get("deny"), list):
+        return None
+    deny = perms["deny"]
+    kept = [
+        rule
+        for rule in deny
+        if not (isinstance(rule, str) and rule.startswith(SANDBOX_STRIP_DENY_PREFIXES))
+    ]
+    if len(kept) == len(deny):
+        return None
+    perms["deny"] = kept
+    overlay = _sandbox_state_dir(profile_dir) / "settings.json"
+    try:
+        overlay.write_text(json.dumps(data, indent=2))
+    except OSError as exc:
+        err_console.print(
+            f"[yellow]Warning: could not write {overlay} ({exc}), so the profile's "
+            f"deny rules, including Bash(sudo …), stay in force in the sandbox.[/yellow]"
+        )
+        return None
+    return overlay
+
+
+def _has_option(args: list[str], name: str) -> bool:
+    """True if args carry the option ``name``, as ``name value`` or ``name=value``."""
+    return any(arg == name or arg.startswith(f"{name}=") for arg in args)
+
+
+def _shared_settings_args(
+    name: str, claude_args: list[str], *, sandbox: bool
+) -> tuple[list[str], bool]:
+    """``--settings`` args for the shared settings file, and whether the VM needs host loopback.
+
+    ``shared-settings.json`` in the profiles base holds settings every profile gets, such
+    as hooks. claude merges ``--settings`` over the profile's own settings.json, and hook
+    entries from both run. ``{profile}`` in any string becomes the profile name; in the
+    sandbox, HTTP hooks aimed at the host's loopback are re-pointed so they still reach it.
+    """
+    path = settings.profiles_base / SHARED_SETTINGS
+    if not path.exists():
+        return [], False
+    if _has_option(claude_args, "--settings"):
+        err_console.print(
+            f"[yellow]--settings was given, so {path} is not applied.[/yellow]"
+        )
+        return [], False
+    try:
+        data = _fill_profile(json.loads(path.read_text()), name)
+    except (OSError, json.JSONDecodeError) as err:
+        err_console.print(f"[red]Can't read {path}: {err}[/red]")
+        sys.exit(1)
+    if not isinstance(data, dict):
+        err_console.print(f"[red]{path} must hold a JSON object.[/red]")
+        sys.exit(1)
+    host_loopback = sandbox and _rewrite_loopback_hooks(data)
+    return ["--settings", json.dumps(data)], host_loopback
+
+
+def _fill_profile(value: Any, name: str) -> Any:
+    """Replace ``{profile}`` with the profile name in every string inside ``value``."""
+    if isinstance(value, str):
+        return value.replace(PROFILE_PLACEHOLDER, name)
+    if isinstance(value, list):
+        return [_fill_profile(item, name) for item in value]
+    if isinstance(value, dict):
+        return {key: _fill_profile(item, name) for key, item in value.items()}
+    return value
+
+
+def _rewrite_loopback_hooks(data: dict[str, Any]) -> bool:
+    """Point HTTP hooks aimed at the host's loopback at the VM's route to it.
+
+    Inside the microVM 127.0.0.1 is the VM itself; under --map-host-loopback the host's
+    loopback answers at SANDBOX_HOST_LOOPBACK instead. Returns whether any hook moved, so
+    the caller knows the VM needs that mapping even without an agent bridge.
+    """
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    rewrote = False
+    for groups in hooks.values():
+        for handler in _http_hook_handlers(groups):
+            url = urlsplit(handler["url"])
+            # Swap only the host, keeping any user:password@ and the port as written
+            # (url.port would raise on a malformed port and abort the launch).
+            userinfo, at, hostport = url.netloc.rpartition("@")
+            host, colon, port = hostport.partition(":")
+            if host.lower() in LOOPBACK_HOSTS:
+                netloc = f"{userinfo}{at}{SANDBOX_HOST_LOOPBACK}{colon}{port}"
+                handler["url"] = urlunsplit(url._replace(netloc=netloc))
+                rewrote = True
+    return rewrote
+
+
+def _http_hook_handlers(groups: Any) -> list[dict[str, Any]]:
+    """The ``"type": "http"`` handlers in one hook event's list of matcher groups."""
+    if not isinstance(groups, list):
+        return []
+    return [
+        handler
+        for group in groups
+        if isinstance(group, dict)
+        for handler in group.get("hooks") or []
+        if isinstance(handler, dict)
+        and handler.get("type") == "http"
+        and isinstance(handler.get("url"), str)
+    ]
+
+
+def _sandbox_chrome_overlay(profile_dir: Path) -> Path:
+    """Throwaway dir mounted over the profile's ``chrome/`` inside the VM.
+
+    The profile is mounted as the in-VM config dir, so claude's "Install Chrome extension"
+    run *inside* the sandbox rewrites ``chrome/chrome-native-host`` to an in-VM path
+    (``/home/appuser/...``). Chrome's native-messaging manifest on the host points at that
+    same wrapper, so the in-VM install silently breaks the **host's** Chrome integration —
+    Chrome can no longer spawn the native host. Masking the dir keeps in-VM installs inside
+    the VM while leaving the host's wrapper intact.
+    """
+    overlay = _sandbox_state_dir(profile_dir) / "chrome"
+    overlay.mkdir(exist_ok=True)
+    return overlay
+
+
+def _storage_cache_conf(profile_dir: Path) -> Path:
+    """Write the storage.conf overlay adding the mounted store as a read-only
+    additionalimagestore (regenerated each launch), and return its path."""
+    conf = _sandbox_state_dir(profile_dir) / "storage.conf"
+    conf.write_text(
+        "[storage]\n"
+        'driver = "overlay"\n'
+        'graphroot = "/var/lib/containers/storage"\n'
+        'runroot = "/run/containers/storage"\n'
+        "[storage.options]\n"
+        f'additionalimagestores = ["{SANDBOX_IMAGE_STORE}"]\n'
+        "[storage.options.overlay]\n"
+        'mount_program = "/usr/bin/fuse-overlayfs"\n'
+    )
+    return conf
+
+
+def _image_cache_mounts(profile_dir: Path) -> list[str]:
+    """Mounts exposing the shared MCP image store to the VM, when it is populated.
+
+    Bind-mounts the host store read-only at the additionalimagestore path and a
+    storage.conf overlay pointing podman at it, so podman/MCP servers find images
+    locally instead of pulling. Returns [] when the store is empty/absent, leaving
+    the image's default storage config (pull-on-demand) in place.
+    """
+    store = _image_cache_dir()
+    if not _image_store_populated(store):
+        return []
+    conf = _storage_cache_conf(profile_dir)
+    return [
+        "-v",
+        f"{store}:{SANDBOX_IMAGE_STORE}:ro,z",
+        "-v",
+        f"{conf}:/etc/containers/storage.conf:ro,z",
+    ]
+
+
+def _sandbox_known_hosts(profile_dir: Path) -> Path:
+    """Per-profile user known_hosts the sandbox records accepted host keys into.
+
+    Created empty if absent and mounted read-write, so host keys ssh accepts inside the
+    VM persist across launches. The host's own known_hosts is mounted read-only as the
+    global known_hosts (see _sandbox_mounts), so already-trusted hosts still verify and
+    the host's real file is never written by the sandbox.
+    """
+    dest = _sandbox_state_dir(profile_dir) / "known_hosts"
+    if not dest.exists():
+        dest.touch()
+    return dest
+
+
+def _host_claude_binary() -> Optional[Path]:
+    """The host's Claude Code binary, when it came from the native installer.
+
+    ``claude.ai/install.sh`` drops a self-contained executable at
+    ``<data dir>/claude/versions/<version>`` and points ``claude`` on PATH at it, so that
+    one file runs anywhere with a glibc — including inside the sandbox. Returns None for
+    every other install method (npm, a distro package), whose entry point is a launcher
+    that needs the rest of its tree, leaving the image's own claude to run.
+    """
+    found = shutil.which(settings.claude_bin)
+    if found is None:
+        return None
+    binary = Path(found).resolve()
+    if binary.parent.name != "versions" or binary.parent.parent.name != "claude":
+        return None
+    return binary if os.access(binary, os.X_OK) else None
+
+
+def _stale_claude_copy(entry: Path) -> bool:
+    """Whether a file in the host-claude cache can be deleted.
+
+    Older versions can. A ``.<version>.<pid>.partial`` copy can only once the launch
+    writing it is gone: sandboxes in parallel worktrees start together, and deleting a
+    copy mid-write sent that launch back to the image's own claude.
+    """
+    if not entry.name.endswith(".partial"):
+        return True
+    pid = entry.name.rsplit(".", 2)[-2]
+    if not pid.isdigit():
+        return True
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False  # alive, owned by someone else
+    return False
+
+
+def _sandbox_claude_binary() -> Optional[Path]:
+    """Cache the host's Claude Code binary for the VM and return the cached copy.
+
+    Without this the sandbox runs whatever version was baked into the image, which ages
+    with every release until someone rebuilds; mounting the host's binary makes each VM
+    track the host's own auto-updated install. The mount needs an SELinux relabel (``:z``)
+    to be readable in the VM, and relabelling the user's real install is not ours to do,
+    so the binary is copied into our data dir and that copy is relabelled instead. Version
+    directories are immutable, so the copy happens only when the host updates; the
+    previous version is pruned. Returns None when the host has no native install.
+    """
+    source = _host_claude_binary()
+    if source is None:
+        return None
+    cache = _data_dir() / "claude"
+    dest = cache / source.name
+    # Named per process: sandboxes launch in parallel (one per worktree), and two of them
+    # sharing a temp file would interleave writes into one torn binary.
+    partial = cache / f".{source.name}.{os.getpid()}.partial"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        if not dest.exists():
+            # Copy to a temp name and rename, so an interrupted launch can't leave a
+            # truncated binary that later launches would mistake for a complete one.
+            shutil.copy(source, partial)
+            os.replace(partial, dest)
+        for entry in cache.iterdir():
+            if entry != dest and _stale_claude_copy(entry):
+                # Another launch may be pruning the same file.
+                with contextlib.suppress(FileNotFoundError):
+                    entry.unlink()
+    except OSError as exc:
+        err_console.print(
+            f"[yellow]Warning: could not cache {source} for the sandbox ({exc}); "
+            f"the VM will run the image's own claude.[/yellow]"
+        )
+        return None
+    return dest
+
+
+def _ancestor_mcp_json(cwd: Path) -> list[Path]:
+    """Return the ``.mcp.json`` files claude reads from directories above the CWD.
+
+    claude discovers project-scoped MCP servers by walking up from the working
+    directory, so a ``.mcp.json`` in an ancestor (commonly ``~/.mcp.json``) configures
+    every project beneath it. Only the CWD itself is mounted into the VM, so those
+    ancestors are invisible there and their servers silently vanish from the sandbox.
+    Files at or below the CWD are already covered by its mount and are skipped.
+    """
+    return [f for parent in cwd.parents if (f := parent / ".mcp.json").is_file()]
+
+
+def _mcp_json_mounts(cwd: Path) -> list[str]:
+    """Read-only mounts for the ancestor ``.mcp.json`` files (see _ancestor_mcp_json).
+
+    Mounted at their host paths so claude's upward walk finds them exactly as it does
+    on the host, and read-only because a sandboxed agent has no business rewriting the
+    MCP config shared by every project under that directory.
+    """
+    mounts: list[str] = []
+    for config in _ancestor_mcp_json(cwd):
+        mounts += ["-v", f"{config}:{config}:ro,z"]
+    return mounts
+
+
+def _ca_trust_mounts() -> list[str]:
+    """Read-only mount of the host's custom CA anchors, when it has any.
+
+    Internal services signed by a private CA fail TLS in the VM otherwise: the image
+    ships only public roots. Mounted at the same path because ``update-ca-trust`` (run
+    by the entrypoint) reads that location and nowhere else, and the image's own anchor
+    dir is empty, so the mount masks nothing.
+
+    No ``:z`` here, unlike every other mount: relabelling is for paths the container
+    must *write*, and this one is read-only system state. SELinux already lets
+    containers read ``cert_t``, while ``:z`` would relabel a root-owned system
+    directory out from under the host's own TLS clients (and fail for a rootless
+    podman that cannot chcon it in the first place).
+    """
+    anchors = Path(SANDBOX_CA_ANCHORS)
+    try:
+        if not any(anchors.iterdir()):
+            return []
+    except OSError:
+        return []
+    return ["-v", f"{anchors}:{anchors}:ro"]
+
+
+def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
+    """Build podman -v args: profile config, cwd, and the git common dir.
+
+    Mounts use ``:z`` (SELinux relabel) only. ``:U`` is deliberately omitted:
+    ``--userns=keep-id`` already maps the host UID into the VM, while ``:U`` would
+    recursively chown the mounted tree to the container's run-user (root, which maps
+    to a subuid), wrecking ownership of the user's project on the host.
+    """
+    root = _sandbox_work_root(cwd)
+    mounts = [
+        "-v",
+        f"{profile_dir}:{SANDBOX_CONFIG_DIR}:z",
+        "-v",
+        f"{root}:{root}:z",
+    ]
+    # Mask the profile's chrome/ dir: an in-VM native-host install must not rewrite the
+    # host's wrapper, which Chrome's manifest points at (see _sandbox_chrome_overlay).
+    mounts += [
+        "-v",
+        f"{_sandbox_chrome_overlay(profile_dir)}:{SANDBOX_CONFIG_DIR}/chrome:z",
+    ]
+    overlay = _sandbox_settings_overlay(profile_dir)
+    if overlay is not None:
+        # Override just settings.json inside the VM; writes land in the throwaway
+        # overlay (regenerated each launch), not the profile's real settings.json.
+        mounts += ["-v", f"{overlay}:{SANDBOX_CONFIG_DIR}/settings.json:z"]
+    git_dir = _git_common_dir(cwd)
+    if git_dir is not None and git_dir != root and root not in git_dir.parents:
+        mounts += ["-v", f"{git_dir}:{git_dir}:z"]
+    gitconfig = Path.home() / ".gitconfig"
+    if gitconfig.exists():
+        mounts += ["-v", f"{gitconfig}:/home/appuser/.gitconfig:ro,z"]
+    host_known_hosts = Path.home() / ".ssh" / "known_hosts"
+    if host_known_hosts.exists():
+        # Read-only *global* known_hosts: ssh verifies already-trusted hosts against it
+        # but never writes it, so the sandbox can't modify the host's real file.
+        mounts += ["-v", f"{host_known_hosts}:/etc/ssh/ssh_known_hosts:ro,z"]
+    # Writable per-profile *user* known_hosts: ssh records newly accepted host keys here,
+    # so they persist across launches instead of vanishing with the VM.
+    mounts += [
+        "-v",
+        f"{_sandbox_known_hosts(profile_dir)}:/home/appuser/.ssh/known_hosts:z",
+    ]
+    host_claude = _sandbox_claude_binary()
+    if host_claude is not None:
+        # Run the host's current claude instead of the image's baked one, so the sandbox
+        # follows the host's auto-updates (see _sandbox_claude_binary).
+        mounts += ["-v", f"{host_claude}:{SANDBOX_HOST_CLAUDE}:ro,z"]
+    mounts += _mcp_json_mounts(root)
+    mounts += _ca_trust_mounts()
+    mounts += _linked_mounts(profile_dir)
+    mounts += _launch_state_mounts(profile_dir)
+    mounts += _image_cache_mounts(profile_dir)
+    return mounts
+
+
+def _launch_state_mounts(profile_dir: Path) -> list[str]:
+    """Read-only mounts pinning the profile files that decide how it launches.
+
+    The VM sees the profile dir read-write. Deleting .sandbox would turn the next plain
+    launch into a host launch, and .env is loaded into that launch's environment
+    (LD_PRELOAD, say). Mounted read-only over themselves, neither can be changed or
+    removed from inside. A missing .env is created empty so there is a file to pin; the
+    VM gets the values through the env file (see _secret_env_file).
+    """
+    env_file = profile_dir / ".env"
+    if not os.path.lexists(env_file):
+        os.close(os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    mounts: list[str] = []
+    for name in (SANDBOX_MARKER, ".env"):
+        path = profile_dir / name
+        if path.is_file() and not path.is_symlink():
+            mounts += ["-v", f"{path}:{SANDBOX_CONFIG_DIR}/{name}:ro,z"]
+    return mounts
+
+
+def _linked_mounts(profile_dir: Path) -> list[str]:
+    """Read-only mounts for the profile entries symlinked into the global ~/.claude.
+
+    The profile dir is mounted as the in-VM config dir, but a symlinked commands/,
+    skills/ or statusline.sh points at an absolute host path (e.g. ~/.claude/skills)
+    that is not otherwise mounted, so the link dangles inside the VM. Mount the real
+    target at the link's path, read-only so a sandboxed agent cannot modify what every
+    profile shares.
+
+    Only links pointing at the global ``~/.claude/<name>`` that ``add`` and ``links``
+    create are mounted. The profile dir is writable from inside the VM, so a link aimed
+    anywhere else may have been planted there to get that host path mounted next launch.
+    """
+    mounts: list[str] = []
+    for name in (*LINKABLE_DIRS, STATUSLINE_FILE):
+        link = profile_dir / name
+        if not link.is_symlink():
+            continue
+        target = Path(os.readlink(link))
+        expected = Path.home() / ".claude" / name
+        if target != expected:
+            err_console.print(
+                f"[yellow]Warning: not mounting {link} into the sandbox: it points at "
+                f"{target}, not {expected}. Re-point it with: "
+                f"ln -sfn {expected} {link}[/yellow]"
+            )
+            continue
+        real = link.resolve()
+        if real.exists():
+            mounts += ["-v", f"{real}:{target}:ro,z"]
+    return mounts
+
+
+@dataclass
+class _Forwarding:
+    """Plan for bridging host agents into the VM via socat over pasta."""
+
+    forwards: list[tuple[Path, Path, int]]  # (host_socket, guest_path, tcp_port)
+    _: KW_ONLY
+    ssh_auth_sock: Optional[Path] = None
+    gpg_pubkeys: Optional[bytes] = None  # host public keyring (gpg --export)
+    clipboard_port: Optional[int] = None  # host TCP port serving the clipboard bridge
+    browser_port: Optional[int] = (
+        None  # host TCP port serving the Claude in Chrome socket bridge
+    )
+    browser_open_port: Optional[int] = (
+        None  # host TCP port serving the browser-open bridge
+    )
+
+    def gpg(self) -> bool:
+        """True when the host gpg-agent is bridged into the VM."""
+        agent = Path(SANDBOX_GNUPGHOME) / "S.gpg-agent"
+        return any(guest == agent for _host, guest, _port in self.forwards)
+
+    def active(self) -> bool:
+        """True when any host-side bridge (agent socket, clipboard, browser) is needed."""
+        return (
+            bool(self.forwards)
+            or self.clipboard_port is not None
+            or self.browser_port is not None
+            or self.browser_open_port is not None
+        )
+
+
+def _build_sandbox_argv(
+    profile_dir: Path,
+    cwd: Path,
+    claude_args: list[str],
+    extra_env: dict[str, str],
+    forwarding: Optional[_Forwarding] = None,
+    *,
+    host_loopback: bool = False,
+) -> list[str]:
+    """Assemble the `podman run` argv that boots claude in a krun microVM."""
+    # A TTY only when both ends are terminals: with one, the in-VM claude takes its stdin
+    # for a TTY and drops piped input (`git diff | claude-profile work -p "review"`).
+    tty = ["-t"] if sys.stdin.isatty() and sys.stdout.isatty() else []
+    argv = [
+        settings.podman_bin,
+        "run",
+        "--rm",
+        "-i",
+        *tty,
+        "--annotation",
+        "run.oci.handler=krun",
+        "--annotation",
+        f"krun.ram_mib={settings.sandbox_ram_mib}",
+        "--annotation",
+        f"krun.cpus={settings.sandbox_cpus}",
+        # passt networking (virtio-net + a real guest kernel netstack) instead of
+        # libkrun's default TSI socket impersonation. TSI stubs setsockopt — SO_REUSEADDR
+        # reads back 0, which aborts gRPC (and any set-then-verify sockopt) — and
+        # intercepts the guest's AF_INET sockets, which breaks nested-container DNS.
+        # passt fixes both. Needs `passt` on the host and a crun/libkrun with passt
+        # support (crun >= 1.21-ish, libkrun >= 1.9); older runtimes ignore it (→ TSI).
+        "--annotation",
+        "krun.use_passt=1",
+        "--userns=keep-id",
+        "--device",
+        "/dev/kvm",
+    ]
+    if host_loopback or (forwarding and forwarding.active()):
+        # pasta gives the VM a route to the host (TSI cannot); --map-host-loopback
+        # makes host.containers.internal reach the host's loopback, so the agent
+        # bridge can bind to 127.0.0.1 rather than every host interface. Shared HTTP
+        # hooks aimed at the host's loopback (host_loopback) need the same route.
+        argv.append(f"--network=pasta:--map-host-loopback,{SANDBOX_HOST_LOOPBACK}")
+    argv += [
+        "-e",
+        f"HOST_UID={os.getuid()}",
+        "-e",
+        f"HOST_GID={os.getgid()}",
+        "-e",
+        f"CLAUDE_CONFIG_DIR={SANDBOX_CONFIG_DIR}",
+        "-e",
+        "TERM",
+        "-e",
+        "COLORTERM",
+    ]
+    argv += _git_identity_mounts(
+        cwd, signing=forwarding is not None and forwarding.gpg()
+    )
+    argv += _forwarding_env(forwarding)
+    if extra_env:
+        argv += ["--env-file", _secret_env_file(extra_env)]
+    mounts = _sandbox_mounts(profile_dir, cwd)
+    if any(spec.split(":")[1:2] == [SANDBOX_HOST_CLAUDE] for spec in mounts):
+        # The VM runs the host's binary from a read-only mount and is thrown away at
+        # exit, so an in-VM self-update would download a release only to discard it —
+        # and would move the session off the host's version mid-run. Without the mount
+        # (no native install, or the copy failed) the image's claude may update itself.
+        argv += ["-e", "DISABLE_AUTOUPDATER=1"]
+    argv += mounts
+    argv += _gpg_pubkeys_mounts(forwarding)
+    argv += ["-w", str(cwd), settings.sandbox_image, "claude"]
+    args = list(claude_args)
+    # The sandbox's own flags go before the user's args: after a subcommand's `--` they
+    # would become that command's arguments (`claude mcp add NAME -- CMD ...` saved them
+    # into the server definition).
+    session: list[str] = []
+    # An explicit --permission-mode wins: claude ranks the skip flag above it, so adding
+    # the flag would silently turn e.g. a plan-mode run into bypassPermissions.
+    if (
+        settings.sandbox_skip_permissions
+        and SKIP_PERMISSIONS_FLAG not in args
+        and not _has_option(args, "--permission-mode")
+    ):
+        session.append(SKIP_PERMISSIONS_FLAG)
+    # claude force-disables Chrome in a non-interactive session (dn()=!isInteractive),
+    # which the sandbox launch trips, so claudeInChromeDefaultEnabled never applies. The
+    # explicit --chrome flag is checked first, so add it to actually enable the
+    # integration when the user opted into sandbox_chrome.
+    if settings.sandbox_chrome and "--chrome" not in args and "--no-chrome" not in args:
+        session.append("--chrome")
+    if not _has_option(args, "--append-system-prompt"):
+        session += [
+            "--append-system-prompt",
+            SANDBOX_BRIEFING + _infisical_briefing(extra_env),
+        ]
+    return argv + session + args
+
+
+def _git_config_get(cwd: Path, key: str) -> Optional[str]:
+    """The value git resolves for key in cwd on the host, or None if unset."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "config", "--get", key],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    return result.stdout.rstrip("\n") if result.returncode == 0 else None
+
+
+def _git_identity_mounts(cwd: Path, *, signing: bool) -> list[str]:
+    """Mount and env args giving the VM the git identity git uses for cwd on the host.
+
+    Only ~/.gitconfig is mounted into the VM. The files it pulls in with include or
+    includeIf are not, and an ``includeIf "gitdir:~/..."`` could not match there anyway
+    (``~`` is /home/appuser in the VM), so sandbox commits fell back to the default
+    identity. GIT_CONFIG_GLOBAL points the VM at a file that includes the mounted
+    ~/.gitconfig and then sets the values resolved here, so they act as global config
+    and a repo's own config still overrides them. Signing settings come along only when
+    GPG is forwarded and the format is openpgp: an SSH or X.509 setup can't sign in the
+    VM, and passing it would only make commits fail.
+    """
+    keys = GIT_IDENTITY_KEYS + (GIT_SIGNING_KEYS if signing else ())
+    values = {
+        key: value for key in keys if (value := _git_config_get(cwd, key)) is not None
+    }
+    if values.get("gpg.format", "openpgp") != "openpgp":
+        values = {key: v for key, v in values.items() if key not in GIT_SIGNING_KEYS}
+    if not values:
+        return []
+    lines = ["[include]", f"\tpath = {SANDBOX_GITCONFIG}"]
+    for key, value in values.items():
+        section, name = key.split(".", 1)
+        quoted = value.replace("\\", "\\\\").replace('"', '\\"')
+        lines += [f"[{section}]", f'\t{name} = "{quoted}"']
+    content = "\n".join(lines) + "\n"
+    digest = hashlib.sha256(content.encode()).hexdigest()[:16]
+    identity = _data_dir() / "git" / f"identity-{digest}"
+    if not identity.exists():
+        identity.parent.mkdir(parents=True, exist_ok=True)
+        partial = identity.with_name(f".{identity.name}.{os.getpid()}.partial")
+        partial.write_text(content)
+        os.replace(partial, identity)
+    return [
+        "-v",
+        f"{identity}:{SANDBOX_GIT_IDENTITY}:ro,z",
+        "-e",
+        f"GIT_CONFIG_GLOBAL={SANDBOX_GIT_IDENTITY}",
+    ]
+
+
+def _secret_env_file(env: dict[str, str]) -> str:
+    """Write env to an unlinked podman ``--env-file`` and return its ``/dev/fd`` path.
+
+    These values include tokens and the profile's ``.env``. Given as ``-e KEY=VALUE``
+    they would sit in podman's argv for the whole session, readable by every local user
+    in /proc/<pid>/cmdline. Putting them in podman's own environment instead would let
+    a ``.env`` written from inside the VM set LD_PRELOAD and the like for the host
+    podman. The file lives in the per-user tmpfs runtime dir and is unlinked at once,
+    so it never reaches disk and has no name: podman reads it through the inherited fd.
+    (os.memfd_create would do the same, but uv's standalone Pythons lack it.)
+    """
+    multiline = sorted(key for key, value in env.items() if "\n" in value)
+    if multiline:
+        err_console.print(
+            f"[red]Can't pass {', '.join(multiline)} into the sandbox: the value "
+            f"contains a newline, and podman reads one variable per line.[/red]"
+        )
+        sys.exit(1)
+    fd, path = tempfile.mkstemp(dir=os.environ.get("XDG_RUNTIME_DIR"))
+    os.unlink(path)
+    with open(fd, "w", closefd=False) as env_file:
+        env_file.writelines(f"{key}={value}\n" for key, value in env.items())
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.set_inheritable(fd, True)
+    return f"/dev/fd/{fd}"
+
+
+def _forwarding_env(forwarding: Optional[_Forwarding]) -> list[str]:
+    """Env args telling the entrypoint which sockets to bridge and how."""
+    if forwarding is None or not forwarding.active():
+        return []
+    env: list[str] = []
+    if forwarding.forwards:
+        spec = ",".join(f"{guest}={port}" for _host, guest, port in forwarding.forwards)
+        env += ["-e", f"CLAUDE_SANDBOX_FORWARDS={spec}"]
+    if forwarding.ssh_auth_sock is not None:
+        env += ["-e", f"SSH_AUTH_SOCK={forwarding.ssh_auth_sock}"]
+    if forwarding.gpg_pubkeys is not None:
+        env += [
+            "-e",
+            f"GNUPGHOME={SANDBOX_GNUPGHOME}",
+            "-e",
+            f"CLAUDE_SANDBOX_GPG_PUBKEYS_FILE={SANDBOX_GPG_PUBKEYS}",
+        ]
+    if forwarding.clipboard_port is not None:
+        env += ["-e", f"{SANDBOX_CLIPBOARD_PORT_ENV}={forwarding.clipboard_port}"]
+    if forwarding.browser_port is not None:
+        env += ["-e", f"{SANDBOX_BROWSER_BRIDGE_PORT_ENV}={forwarding.browser_port}"]
+    if forwarding.browser_open_port is not None:
+        env += ["-e", f"{SANDBOX_BROWSER_OPEN_PORT_ENV}={forwarding.browser_open_port}"]
+    return env
+
+
+def _free_tcp_port() -> int:
+    """Return an unused localhost TCP port for an agent bridge."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _ssh_agent_status(sock: Path) -> int:
+    """Probe an ssh-agent socket: 2 = live with keys, 1 = live but empty, 0 = dead.
+
+    ``ssh-add -l`` exits 0 when it lists keys, 1 when the agent is live but has none, and
+    2 when it cannot connect — a stale/dead socket (e.g. a gnome-keyring stub whose agent
+    isn't running, common when the real keys live in 1Password). Forwarding a dead socket
+    puts a broken agent behind the VM's SSH_AUTH_SOCK ("communication with agent failed"),
+    and forwarding a live-but-empty one first would shadow the agent that actually holds
+    the keys — so callers skip dead sockets and prefer keyed ones.
+    """
+    try:
+        result = subprocess.run(
+            ["ssh-add", "-l"],
+            env={**os.environ, "SSH_AUTH_SOCK": str(sock)},
+            capture_output=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return 0
+    return {0: 2, 1: 1}.get(result.returncode, 0)
+
+
+def _ssh_agent_sockets() -> list[Path]:
+    """Live host SSH agent sockets to bridge, agents holding keys first.
+
+    Candidates are the active agent (SSH_AUTH_SOCK) and the 1Password agent. A socket
+    file can exist while its agent is dead (a stale gnome-keyring stub), so each is
+    probed: dead ones are dropped and the rest are ordered keyed-agents-first, so the
+    VM's SSH_AUTH_SOCK lands on an agent that actually has keys.
+    """
+    candidates: list[Path] = []
+    auth = os.environ.get("SSH_AUTH_SOCK")
+    if auth:
+        candidates.append(Path(auth))
+    onepassword = Path.home() / ".1password" / "agent.sock"
+    if onepassword not in candidates:
+        candidates.append(onepassword)
+    live = [
+        (sock, status)
+        for sock in candidates
+        if sock.exists() and (status := _ssh_agent_status(sock)) > 0
+    ]
+    live.sort(
+        key=lambda pair: -pair[1]
+    )  # stable: keyed agents first, else insertion order
+    return [sock for sock, _ in live]
+
+
+def _gpg_extra_socket() -> Optional[Path]:
+    """Path to the host gpg-agent restricted (signing-only) socket, starting one if needed.
+
+    gpgconf reports the path whether or not an agent is running, but the socket only
+    exists while one is, and nothing guarantees the host has used gpg yet this login.
+    Without the launch a sandbox started at the wrong moment forwards no GPG at all for
+    its whole life, so ask gpgconf to bring the agent up before giving up.
+    """
+    try:
+        result = subprocess.run(
+            ["gpgconf", "--list-dirs", "agent-extra-socket"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    path = result.stdout.strip()
+    if result.returncode != 0 or not path:
+        return None
+    sock = Path(path)
+    if not sock.exists():
+        subprocess.run(["gpgconf", "--launch", "gpg-agent"], capture_output=True)
+    return sock if sock.exists() else None
+
+
+def _export_gpg_pubkeys() -> Optional[bytes]:
+    """Export of the host public keyring (no secret material), or None."""
+    try:
+        result = subprocess.run(["gpg", "--export"], capture_output=True)
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    return result.stdout
+
+
+def _gpg_pubkeys_mounts(forwarding: Optional[_Forwarding]) -> list[str]:
+    """Read-only mount of the host public keyring for the entrypoint to import.
+
+    A file rather than an env var: Linux caps a single argv or env string at 128 KiB,
+    and a keyring with a few dozen keys passes that, failing the launch with E2BIG.
+    Written to our data dir (not the VM-writable profile dir) under a temp name and
+    renamed, so parallel launches never mount a half-written file.
+    """
+    if forwarding is None or forwarding.gpg_pubkeys is None:
+        return []
+    keyring = _data_dir() / "gpg-pubkeys"
+    partial = keyring.with_name(f".gpg-pubkeys.{os.getpid()}.partial")
+    try:
+        keyring.parent.mkdir(parents=True, exist_ok=True)
+        partial.write_bytes(forwarding.gpg_pubkeys)
+        os.replace(partial, keyring)
+    except OSError as exc:
+        err_console.print(
+            f"[red]Can't write your GPG public keys for the sandbox to {keyring}: "
+            f"{exc}[/red]"
+        )
+        sys.exit(1)
+    return ["-v", f"{keyring}:{SANDBOX_GPG_PUBKEYS}:ro,z"]
+
+
+def _browser_bridge_dir() -> Path:
+    """Host dir where Claude in Chrome native hosts bind their sockets.
+
+    Chrome spawns ``claude --chrome-native-host`` (stdio to the extension), which
+    binds ``/tmp/claude-mcp-browser-bridge-<username>/<pid>.sock``; claude sessions
+    discover the bridge by scanning that dir at startup. The username comes from the
+    uid, matching claude's own ``os.userInfo().username``.
+    """
+    return Path(f"/tmp/claude-mcp-browser-bridge-{pwd.getpwuid(os.getuid()).pw_name}")
+
+
+def _browser_bridge_live() -> bool:
+    """True when some Claude in Chrome native-host socket accepts connections.
+
+    A socket file can outlive its native host (nothing unlinks it after a crash or
+    browser exit), so each candidate is probed with a real connect — a directory
+    holding only stale sockets means no bridge.
+    """
+    for sock_path in sorted(_browser_bridge_dir().glob("*.sock")):
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(1.0)
+        try:
+            probe.connect(str(sock_path))
+        except OSError:
+            continue
+        finally:
+            probe.close()
+        return True
+    return False
+
+
+def _build_forwarding() -> _Forwarding:
+    """Collect the agent forwards requested via settings."""
+    forwards: list[tuple[Path, Path, int]] = []
+    ssh_auth: Optional[Path] = None
+    if settings.sandbox_ssh_agent:
+        ssh = [
+            (
+                sock,
+                Path(SANDBOX_AGENT_DIR) / f"ssh-agent-{index}.sock",
+                _free_tcp_port(),
+            )
+            for index, sock in enumerate(_ssh_agent_sockets())
+        ]
+        forwards += ssh
+        if ssh:
+            ssh_auth = ssh[0][1]
+        else:
+            err_console.print(
+                "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_SSH_AGENT is set but no live SSH "
+                "agent was found (SSH_AUTH_SOCK or ~/.1password/agent.sock), so ssh in the "
+                "sandbox has no keys. Check 'ssh-add -l'.[/yellow]"
+            )
+    pubkeys: Optional[bytes] = None
+    if settings.sandbox_gpg_agent:
+        extra = _gpg_extra_socket()
+        if extra is not None:
+            guest = Path(SANDBOX_GNUPGHOME) / "S.gpg-agent"
+            forwards.append((extra, guest, _free_tcp_port()))
+            pubkeys = _export_gpg_pubkeys()
+        else:
+            err_console.print(
+                "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_GPG_AGENT is set but no host "
+                "gpg-agent socket is available, so GPG is not forwarded and signing will "
+                "fail in the sandbox. Check 'gpgconf --launch gpg-agent'.[/yellow]"
+            )
+    clipboard_port = _free_tcp_port() if settings.sandbox_clipboard else None
+    browser_port: Optional[int] = None
+    browser_open_port: Optional[int] = None
+    if settings.sandbox_chrome:
+        browser_port = _free_tcp_port()
+        browser_open_port = _free_tcp_port()
+        if not _browser_bridge_live():
+            err_console.print(
+                "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_CHROME is set but no Claude in "
+                "Chrome native host is listening on the host yet. Make sure Chrome is "
+                "running with the Claude extension; in the sandbox, run /chrome and pick "
+                "'Reconnect extension' to wake it (that opens the connect page in your "
+                "host Chrome via the browser-open bridge).[/yellow]"
+            )
+    return _Forwarding(
+        forwards,
+        ssh_auth_sock=ssh_auth,
+        gpg_pubkeys=pubkeys,
+        clipboard_port=clipboard_port,
+        browser_port=browser_port,
+        browser_open_port=browser_open_port,
+    )
+
+
+def _start_host_bridge(agent_sock: Path, port: int) -> subprocess.Popen[bytes]:
+    """Bridge a host agent socket to a localhost TCP port the VM can reach."""
+    return subprocess.Popen(
+        [
+            "socat",
+            f"TCP-LISTEN:{port},bind=127.0.0.1,reuseaddr,fork",
+            f"UNIX-CONNECT:{agent_sock}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _clipboard_host_handler() -> Path:
+    """Path to the packaged host-side clipboard handler script."""
+    return Path(str(resources.files("claude_profile") / "clipboard_host.sh"))
+
+
+def _start_clipboard_host_bridge(port: int) -> subprocess.Popen[bytes]:
+    """Serve the host clipboard to the VM: socat execs a read-only wl-paste handler.
+
+    Each guest connection runs the handler with the socket on stdin/stdout; it reads
+    one request line (whitelisted wl-paste args) and streams the clipboard bytes
+    back. Only clipboard reads cross the boundary — no Wayland access is exposed to
+    the sandbox, unlike forwarding the compositor wholesale.
+    """
+    handler = _clipboard_host_handler()
+    return subprocess.Popen(
+        [
+            "socat",
+            f"TCP-LISTEN:{port},bind=127.0.0.1,reuseaddr,fork",
+            f"EXEC:bash {handler}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _browser_bridge_host_handler() -> Path:
+    """Path to the packaged host-side Claude-in-Chrome bridge proxy."""
+    return Path(str(resources.files("claude_profile") / "browser_bridge_host.py"))
+
+
+def _start_browser_host_bridge(port: int) -> subprocess.Popen[bytes]:
+    """Serve the host Claude in Chrome native-host socket to the VM.
+
+    socat execs the proxy per guest connection; it resolves the newest
+    ``claude --chrome-native-host`` socket (so the bridge follows Chrome's native host
+    across restarts, its pid changing each spawn), relays the framed messages, and
+    injects a keepalive during idle gaps so Chrome's MV3 service worker does not go idle
+    and kill the native host mid-session.
+    """
+    handler = _browser_bridge_host_handler()
+    return subprocess.Popen(
+        [
+            "socat",
+            f"TCP-LISTEN:{port},bind=127.0.0.1,reuseaddr,fork",
+            f"EXEC:python3 {handler}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _chrome_extension_guest_path() -> Optional[str]:
+    """In-VM path to create so claude detects the extension, or None if it isn't installed.
+
+    claude reports "Extension: Installed" by readdir'ing
+    ``<chrome-user-data>/<profile>/Extensions/<id>``; the VM has no Chrome install, so it
+    always reports "Not detected" even with the bridge working. Find the extension in a
+    host browser profile and return the equivalent in-VM path — only the directory's
+    existence is checked, so the entrypoint just creates it. Returning None when the
+    extension is genuinely absent keeps the reported status honest, and the host's Chrome
+    profile (cookies, history, passwords) is never exposed to the VM.
+    """
+    config = Path.home() / ".config"
+    for browser in CHROME_USER_DATA_DIRS:
+        user_data = config / browser
+        if not user_data.is_dir():
+            continue
+        for profile in sorted(user_data.iterdir()):
+            if not profile.is_dir():
+                continue
+            if profile.name != "Default" and not profile.name.startswith("Profile "):
+                continue
+            if (profile / "Extensions" / CHROME_EXTENSION_ID).is_dir():
+                return (
+                    f"/home/appuser/.config/{browser}/{profile.name}"
+                    f"/Extensions/{CHROME_EXTENSION_ID}"
+                )
+    return None
+
+
+def _profile_oauth_scopes(profile_dir: Path) -> Optional[list[str]]:
+    """Return the profile's OAuth scopes, or None if credentials are absent/unreadable."""
+    try:
+        data = json.loads((profile_dir / ".credentials.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    scopes = oauth.get("scopes")
+    return scopes if isinstance(scopes, list) else None
+
+
+def _warn_missing_chrome_scope(profile_dir: Path) -> None:
+    """Warn when sandbox_chrome is on but the profile's token can't enable Chrome.
+
+    claude checks the OAuth scope first, ahead of ``--chrome`` and every other condition,
+    so a profile authenticated with a setup-token (``user:inference`` only) reports
+    "Status: Disabled" with no hint as to why. Surface that here instead, since the fix is
+    a re-login rather than anything the bridge can do. Unreadable credentials are left
+    alone — claude reports auth problems itself.
+    """
+    scopes = _profile_oauth_scopes(profile_dir)
+    if scopes is None or CHROME_OAUTH_SCOPES & set(scopes):
+        return
+    err_console.print(
+        f"[yellow]Warning: CLAUDE_PROFILE_SANDBOX_CHROME is set but profile "
+        f"'{profile_dir.name}' has OAuth scopes {sorted(scopes)}, none of which claude "
+        f"accepts for Claude in Chrome (needs one of {sorted(CHROME_OAUTH_SCOPES)}). "
+        f"Chrome will report 'Disabled' regardless of the bridge. A setup-token login "
+        f"grants user:inference only — re-authenticate with a full OAuth login: "
+        f"CLAUDE_PROFILE_SANDBOX=0 claude-profile {profile_dir.name} /login[/yellow]"
+    )
+
+
+def _browser_open_host_handler() -> Path:
+    """Path to the packaged host-side browser-open handler script."""
+    return Path(str(resources.files("claude_profile") / "browser_open_host.sh"))
+
+
+def _start_browser_open_host_bridge(port: int) -> subprocess.Popen[bytes]:
+    """Serve the host browser-open bridge to the VM.
+
+    socat execs the handler per guest connection; the handler opens a Claude connect
+    URL (relayed by the in-VM ``google-chrome`` shim) in the host's real Chrome, so the
+    sandboxed Claude Code can wake the extension itself. The handler whitelists only
+    Anthropic's clau.de/claude.ai chrome URLs.
+    """
+    handler = _browser_open_host_handler()
+    return subprocess.Popen(
+        [
+            "socat",
+            f"TCP-LISTEN:{port},bind=127.0.0.1,reuseaddr,fork",
+            f"EXEC:bash {handler}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _gh_token() -> Optional[str]:
+    """Return the host's GitHub token via ``gh auth token``, or None if unavailable.
+
+    Reads from wherever gh stores it (system keyring or hosts.yml). A short timeout
+    avoids hanging if the keyring needs an interactive unlock.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    token = result.stdout.strip()
+    return token if result.returncode == 0 and token else None
+
+
+def _with_gh_token(extra_env: dict[str, str]) -> dict[str, str]:
+    """Add ``GH_TOKEN`` from the host gh login when ``sandbox_gh`` is enabled.
+
+    gh keeps its token in the keyring or hosts.yml; a microVM can reach neither, so
+    we read it on the host and forward it as the GH_TOKEN env var gh reads natively.
+    Returns extra_env unchanged when disabled or no token is found.
+    """
+    if not settings.sandbox_gh:
+        return extra_env
+    token = _gh_token()
+    if not token:
+        err_console.print(
+            "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_GH is set but no GitHub token "
+            "was found (`gh auth token` failed). gh will be unauthenticated in the "
+            "sandbox.[/yellow]"
+        )
+        return extra_env
+    return {**extra_env, "GH_TOKEN": token}
+
+
+@dataclass
+class _InfisicalLogin:
+    email: str
+    domain: str
+    token: str
+    active: bool
+
+
+def _jwt_expired(token: str) -> bool:
+    """True if a JWT is malformed or past its exp (30s buffer, matching the CLI)."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return True
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+    except (ValueError, json.JSONDecodeError):
+        return True
+    exp = payload.get("exp")
+    if not isinstance(exp, (int, float)):
+        return True
+    return exp <= time.time() + 30
+
+
+def _infisical_token(email: str) -> Optional[str]:
+    """Return the live access token for an infisical login from the OS keyring.
+
+    The CLI stores each login as a JSON ``UserCredentials`` blob under the keyring
+    service ``infisical-cli`` keyed by email. Returns the access JWT only when it is
+    present and unexpired — the CLI cannot refresh, so an expired token is dead.
+    """
+    try:
+        result = subprocess.run(
+            ["secret-tool", "lookup", "service", "infisical-cli", "username", email],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    try:
+        blob = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    token = blob.get("JTWToken")
+    if not isinstance(token, str) or _jwt_expired(token):
+        return None
+    return token
+
+
+def _infisical_config() -> dict:
+    """Parse the host infisical config, or an empty dict if absent/unreadable."""
+    path = Path.home() / ".infisical" / "infisical-config.json"
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _infisical_login_matches(entry: str, user: dict) -> bool:
+    """True if an allowlist entry names this login.
+
+    An entry with an @ must equal the login's email. Any other entry is a domain that
+    must equal, or be a parent of, the email's domain or the login's Infisical host.
+    Matching substrings forwarded tokens for logins the user never named (bob@ also
+    picked up jimbob@).
+    """
+    email = (user.get("email") or "").lower()
+    if "@" in entry:
+        return entry == email
+    host = (urlsplit(user.get("domain") or "").hostname or "").lower()
+    names = [name for name in (email.rpartition("@")[2], host) if name]
+    return any(name == entry or name.endswith(f".{entry}") for name in names)
+
+
+def _infisical_logins() -> list[_InfisicalLogin]:
+    """Resolve the allowlisted, still-valid infisical logins to forward.
+
+    ``sandbox_infisical`` is a comma-separated allowlist of emails or domains (see
+    _infisical_login_matches). Each entry is matched against the host's logged-in users;
+    matches whose keyring token is live are returned. Entries matching nothing, and
+    matched logins whose token has expired, are warned about and skipped.
+    """
+    allow = [
+        a.strip().lower() for a in settings.sandbox_infisical.split(",") if a.strip()
+    ]
+    if not allow:
+        return []
+    if shutil.which("secret-tool") is None:
+        err_console.print(
+            "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_INFISICAL is set but 'secret-tool' "
+            "is not installed, so infisical tokens can't be read from the keyring. "
+            "Install libsecret (provides secret-tool).[/yellow]"
+        )
+        return []
+    config = _infisical_config()
+    users = config.get("loggedInUsers") or []
+    active_email = config.get("loggedInUserEmail") or ""
+    logins: list[_InfisicalLogin] = []
+    seen: set[str] = set()
+    for entry in allow:
+        matches = [u for u in users if _infisical_login_matches(entry, u)]
+        if not matches:
+            err_console.print(
+                f"[yellow]Warning: no logged-in infisical user matches '{entry}' "
+                f"(from CLAUDE_PROFILE_SANDBOX_INFISICAL).[/yellow]"
+            )
+            continue
+        for user in matches:
+            email = user.get("email", "")
+            if not email or email in seen:
+                continue
+            token = _infisical_token(email)
+            if token is None:
+                err_console.print(
+                    f"[yellow]Warning: infisical login '{email}' has no valid token "
+                    f"(expired — run `infisical login` on the host); skipping.[/yellow]"
+                )
+                continue
+            seen.add(email)
+            logins.append(
+                _InfisicalLogin(
+                    email, user.get("domain", ""), token, email == active_email
+                )
+            )
+    return logins
+
+
+def _with_infisical_env(extra_env: dict[str, str]) -> dict[str, str]:
+    """Forward allowlisted infisical logins into the sandbox as env vars.
+
+    infisical keeps login tokens in the OS keyring, which a microVM can't reach, so
+    we read them on the host and forward: the primary (the active login if it is
+    allowlisted, else the first match) as INFISICAL_TOKEN plus INFISICAL_API_URL/
+    INFISICAL_DOMAIN so infisical works with no extra flags, and every allowlisted
+    login as CLAUDE_SANDBOX_INFISICAL (JSON) so the agent can target a specific one
+    with --token/--domain. The host keyring is left untouched.
+    """
+    if not settings.sandbox_infisical:
+        return extra_env
+    logins = _infisical_logins()
+    if not logins:
+        return extra_env
+    primary = next((login for login in logins if login.active), logins[0])
+    profiles = [
+        {"email": login.email, "domain": login.domain, "token": login.token}
+        for login in logins
+    ]
+    return {
+        **extra_env,
+        "INFISICAL_TOKEN": primary.token,
+        "INFISICAL_API_URL": primary.domain,
+        "INFISICAL_DOMAIN": primary.domain,
+        "CLAUDE_SANDBOX_INFISICAL": json.dumps(profiles),
+    }
+
+
+def _infisical_briefing(extra_env: dict[str, str]) -> str:
+    """System-prompt note describing the forwarded infisical logins, or ''."""
+    raw = extra_env.get("CLAUDE_SANDBOX_INFISICAL")
+    if not raw:
+        return ""
+    try:
+        profiles = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    listing = ", ".join(f"{p['email']} ({p['domain']})" for p in profiles)
+    primary_domain = extra_env.get("INFISICAL_DOMAIN", "")
+    return (
+        " The infisical CLI is authenticated: INFISICAL_TOKEN and INFISICAL_API_URL "
+        f"point at your primary org ({primary_domain}), so `infisical secrets "
+        "--projectId … --env …` works as-is. Allowlisted logins (JSON in "
+        f"$CLAUDE_SANDBOX_INFISICAL): {listing}. To use a non-primary org, pass its "
+        "--token and --domain from that JSON — the env domain overrides any repo "
+        ".infisical.json, so always pass --domain for non-primary orgs. Forwarded "
+        "tokens expire in ~10 days and the keyring stays on the host, so re-launch to "
+        "refresh them."
+    )
+
+
+def _pulumi_token() -> Optional[str]:
+    """Return the Pulumi Cloud access token from ~/.pulumi/credentials.json, or None.
+
+    pulumi stores a token per backend; we return the one for the current backend only
+    when it is a Pulumi Cloud (https) backend. Self-managed backends (s3://, file://, …)
+    carry no token and yield None.
+    """
+    path = Path.home() / ".pulumi" / "credentials.json"
+    try:
+        creds = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    current = creds.get("current") or ""
+    if not current.startswith("https://"):
+        return None
+    token = (creds.get("accessTokens") or {}).get(current)
+    return token if isinstance(token, str) and token else None
+
+
+def _with_pulumi_token(extra_env: dict[str, str]) -> dict[str, str]:
+    """Add PULUMI_ACCESS_TOKEN from the host Pulumi Cloud login when sandbox_pulumi is set.
+
+    pulumi keeps the token in ~/.pulumi/credentials.json, which a microVM can't reach,
+    so we read it on the host and forward it as the env var pulumi reads natively.
+    Returns extra_env unchanged when disabled or no token is found.
+    """
+    if not settings.sandbox_pulumi:
+        return extra_env
+    token = _pulumi_token()
+    if not token:
+        err_console.print(
+            "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_PULUMI is set but no Pulumi Cloud "
+            "token was found in ~/.pulumi/credentials.json. pulumi will be "
+            "unauthenticated in the sandbox.[/yellow]"
+        )
+        return extra_env
+    return {**extra_env, "PULUMI_ACCESS_TOKEN": token}
+
+
+def _with_forwarded_env(extra_env: dict[str, str]) -> dict[str, str]:
+    """Forward named host env vars into the sandbox (sandbox_forward_env).
+
+    A comma-separated list of variable names; each one present in the host environment
+    is copied into the VM. Lets host-oriented MCP servers that pass secrets through as
+    ``-e VAR`` (e.g. BUILDKITE_API_TOKEN, GITHUB_PERSONAL_ACCESS_TOKEN) find them inside
+    the VM. A name the profile's ``.env`` already supplies (``claude-profile env --set``)
+    is left alone — it reaches the VM either way, so warning about it would be wrong. Only
+    names available from neither source are warned about and skipped.
+    """
+    names = [n.strip() for n in settings.sandbox_forward_env.split(",") if n.strip()]
+    if not names:
+        return extra_env
+    forwarded = dict(extra_env)
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None:
+            forwarded[name] = value
+            continue
+        if name in extra_env:
+            continue  # already provided by the profile's .env
+        err_console.print(
+            f"[yellow]Warning: CLAUDE_PROFILE_SANDBOX_FORWARD_ENV lists '{name}' but it "
+            f"is set neither in the environment nor in the profile's .env; skipping. Set "
+            f"it with: claude-profile env <name> --set {name}=…[/yellow]"
+        )
+    return forwarded
+
+
+def _launch_sandbox(
+    profile_dir: Path, claude_args: list[str], extra_env: dict[str, str]
+) -> None:
+    """Launch a podman krun microVM running claude (optionally bridging agents)."""
+    _refuse_home_mount(Path.cwd())
+    _ensure_sandbox_image()
+    image_user = _sandbox_image_user()
+    if image_user and image_user not in ("root", "0"):
+        err_console.print(
+            f"[yellow]Warning: sandbox image '{settings.sandbox_image}' runs as "
+            f"'{image_user}', not root — the entrypoint must start as root to map your "
+            f"UID and forward SSH/GPG agents. End your Containerfile with `USER root`."
+            f"[/yellow]"
+        )
+    if settings.sandbox_chrome:
+        _warn_missing_chrome_scope(profile_dir)
+        ext_path = _chrome_extension_guest_path()
+        if ext_path is not None:
+            extra_env = {**extra_env, SANDBOX_CHROME_EXT_PATH_ENV: ext_path}
+    extra_env = _with_gh_token(extra_env)
+    extra_env = _with_infisical_env(extra_env)
+    extra_env = _with_pulumi_token(extra_env)
+    extra_env = _with_forwarded_env(extra_env)
+    shared, host_loopback = _shared_settings_args(
+        profile_dir.name, claude_args, sandbox=True
+    )
+    claude_args = [*shared, *claude_args]
+    cwd = Path.cwd()
+    forwarding = _build_forwarding()
+    if forwarding.active():
+        _run_sandbox_supervised(profile_dir, cwd, claude_args, extra_env, forwarding)
+        return
+    argv = _build_sandbox_argv(
+        profile_dir, cwd, claude_args, extra_env, host_loopback=host_loopback
+    )
+    os.execvpe(settings.podman_bin, argv, os.environ.copy())
+
+
+def _refuse_home_mount(cwd: Path) -> None:
+    """Exit when the directory mounted for cwd is the home directory or above it.
+
+    The sandbox mounts cwd's work tree (see _sandbox_work_root) read-write, so ~ or /
+    would hand the VM the whole home directory: ~/.ssh private keys, keyrings and every
+    profile's credentials. A dotfiles repo at ~ makes ~ the work tree of any directory
+    under it. A root inside the profiles dir, or around it, is refused for the same
+    reason.
+    """
+    root = _sandbox_work_root(cwd).resolve()
+    home = Path.home().resolve()
+    if root == home or root in home.parents:
+        err_console.print(
+            f"[red]Refusing to start the sandbox in {cwd}: it would mount {root} "
+            f"read-write, which includes your whole home directory. cd into a project "
+            f"directory first.[/red]"
+        )
+        sys.exit(1)
+    profiles = settings.profiles_base.resolve()
+    if root == profiles or profiles in root.parents or root in profiles.parents:
+        err_console.print(
+            f"[red]Refusing to start the sandbox in {cwd}: it would mount {root} "
+            f"read-write, which overlaps the profiles dir {profiles} and with it every "
+            f"profile's credentials. cd into a project directory first.[/red]"
+        )
+        sys.exit(1)
+
+
+def _run_sandbox_supervised(
+    profile_dir: Path,
+    cwd: Path,
+    claude_args: list[str],
+    extra_env: dict[str, str],
+    forwarding: _Forwarding,
+) -> None:
+    """Run the VM as a child so the host agent bridges are torn down on exit.
+
+    The exec model cannot manage the socat bridges' lifetime, so agent-forwarding
+    mode supervises podman instead. podman keeps the terminal in raw mode, so the
+    TUI behaves the same as the exec path.
+    """
+    if shutil.which("socat") is None:
+        err_console.print(
+            "[red]'socat' not found on host.[/red] Install it (e.g. dnf install socat) "
+            "or disable the sandbox agent-forwarding settings."
+        )
+        sys.exit(1)
+    if forwarding.clipboard_port is not None and shutil.which("wl-paste") is None:
+        err_console.print(
+            "[red]'wl-paste' not found on host.[/red] Install wl-clipboard (e.g. "
+            "dnf install wl-clipboard) or unset CLAUDE_PROFILE_SANDBOX_CLIPBOARD."
+        )
+        sys.exit(1)
+    # Build the argv before any bridge listens: building it can exit (see
+    # _secret_env_file), and a bridge started first would be left running.
+    argv = _build_sandbox_argv(profile_dir, cwd, claude_args, extra_env, forwarding)
+    bridges: list[subprocess.Popen[bytes]] = []
+    try:
+        for host, _guest, port in forwarding.forwards:
+            bridges.append(_start_host_bridge(host, port))
+        if forwarding.clipboard_port is not None:
+            bridges.append(_start_clipboard_host_bridge(forwarding.clipboard_port))
+        if forwarding.browser_port is not None:
+            bridges.append(_start_browser_host_bridge(forwarding.browser_port))
+        if forwarding.browser_open_port is not None:
+            bridges.append(
+                _start_browser_open_host_bridge(forwarding.browser_open_port)
+            )
+        # close_fds=False: podman reads its --env-file through an inherited fd (see
+        # _secret_env_file); Python opens every other fd non-inheritable.
+        returncode = _wait_forwarding_signals(
+            subprocess.Popen(argv, env=os.environ.copy(), close_fds=False)
+        )
+    finally:
+        for bridge in bridges:
+            bridge.terminate()
+    sys.exit(128 - returncode if returncode < 0 else returncode)
+
+
+def _wait_forwarding_signals(proc: subprocess.Popen[bytes]) -> int:
+    """Wait for proc, passing SIGTERM and SIGHUP on to it rather than dying from them.
+
+    Both signals kill this process outright by default, which skips the caller's
+    cleanup and leaves the host bridges listening after the session has ended; closing
+    the terminal window is enough to send SIGHUP. Forwarding them lets podman stop the
+    VM and exit normally, so the caller's ``finally`` still runs.
+    """
+
+    def forward(signum: int, _frame: object) -> None:
+        proc.send_signal(signum)
+
+    previous = {
+        sig: signal.signal(sig, forward) for sig in (signal.SIGTERM, signal.SIGHUP)
+    }
+    try:
+        return proc.wait()
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _sandbox_enabled(profile_dir: Path) -> bool:
+    """Decide whether to launch in a sandbox.
+
+    The ``CLAUDE_PROFILE_SANDBOX`` env override wins when set; otherwise the
+    profile's ``.sandbox`` marker decides.
+    """
+    if settings.sandbox is not None:
+        return settings.sandbox
+    # lexists: a marker planted as a dangling link still counts, failing safe.
+    return os.path.lexists(profile_dir / SANDBOX_MARKER)
+
+
 def _launch_profile(name: str, claude_args: list[str]) -> None:
     d = settings.profiles_base / name
     if not d.exists():
@@ -249,17 +2489,22 @@ def _launch_profile(name: str, claude_args: list[str]) -> None:
             f"Create it with: claude-profile add {name}"
         )
         sys.exit(1)
+    extra_env = _load_profile_env(d)
+    if _sandbox_enabled(d):
+        _launch_sandbox(d, claude_args, extra_env)
+        return
+    shared, _host_loopback = _shared_settings_args(name, claude_args, sandbox=False)
     env = os.environ.copy()
     env["CLAUDE_CONFIG_DIR"] = str(d)
+    env.update(extra_env)
     # exec replaces this process - no wrapper in between, which matters for
     # claude's TUI (raw terminal mode, signal handling, etc.)
-    os.execvpe(settings.claude_bin, [settings.claude_bin] + claude_args, env)
+    os.execvpe(settings.claude_bin, [settings.claude_bin, *shared, *claude_args], env)
 
 
 def main() -> None:
-    _KNOWN_COMMANDS = {"list", "add", "remove", "links"}
     args = sys.argv[1:]
-    if args and args[0] not in _KNOWN_COMMANDS and not args[0].startswith("-"):
+    if args and args[0] not in KNOWN_COMMANDS and not args[0].startswith("-"):
         _launch_profile(args[0], args[1:])
     else:
         app()

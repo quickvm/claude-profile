@@ -1,0 +1,17 @@
+#!/bin/sh
+# Installed as `podman` ahead of /usr/bin/podman on PATH inside the claude-profile
+# microVM. Rootless podman can't run here (the nested user namespace can't be mapped
+# and native overlay isn't backable on the virtiofs root), so podman must run rootful.
+# This wrapper routes callers through the scoped passwordless sudo; an already-root
+# caller (e.g. an explicit `sudo podman`, which resolves to /usr/bin/podman via
+# secure_path) execs the real binary directly to avoid a second sudo.
+#
+# It exists so MCP servers configured as `podman run …` (github, buildkite, the
+# victoria* servers) launch without rewriting their config. `sudo -E` preserves the
+# environment because those servers pass tokens through as `-e VAR` (with the value
+# in the environment, not on the command line); a plain sudo would strip them. The
+# matching sudoers rule carries the SETENV tag to allow -E.
+if [ "$(id -u)" = 0 ]; then
+	exec /usr/bin/podman "$@"
+fi
+exec sudo -E /usr/bin/podman "$@"
