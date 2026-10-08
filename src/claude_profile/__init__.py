@@ -261,14 +261,7 @@ def add_profile(
         err_console.print(f"[yellow]Profile '{name}' already exists at {d}[/yellow]")
         raise typer.Exit(code=1)
     d.mkdir(parents=True)
-    claude_dir = Path.home() / ".claude"
-    for fname in ("settings.json", "CLAUDE.md"):
-        src = claude_dir / fname
-        if src.exists():
-            shutil.copy2(src, d / fname)
-    statusline = claude_dir / STATUSLINE_FILE
-    if statusline.exists():
-        (d / STATUSLINE_FILE).symlink_to(statusline)
+    _seed_from_global(d)
 
     for dir_name in LINKABLE_DIRS:
         link = typer.confirm(
@@ -288,6 +281,19 @@ def add_profile(
                 f"(image '{settings.sandbox_image}' not found)"
             )
     console.print(f"Authenticate with: claude-profile {name} /login")
+
+
+def _seed_from_global(profile_dir: Path) -> None:
+    """Copy settings.json and CLAUDE.md from ~/.claude into a new profile, and link
+    its statusline.sh to the global one (see STATUSLINE_FILE)."""
+    claude_dir = Path.home() / ".claude"
+    for fname in ("settings.json", "CLAUDE.md"):
+        src = claude_dir / fname
+        if src.exists():
+            shutil.copy2(src, profile_dir / fname)
+    statusline = claude_dir / STATUSLINE_FILE
+    if statusline.exists():
+        (profile_dir / STATUSLINE_FILE).symlink_to(statusline)
 
 
 def _sandbox_data_dir() -> Path:
