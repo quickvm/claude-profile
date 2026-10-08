@@ -59,6 +59,13 @@ def read_frame(recv) -> bytes | None:
     return hdr + body
 
 
+def write_all(fd: int, data: bytes) -> None:
+    """Write every byte of data to fd; a single os.write may write only part of it."""
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view) :]
+
+
 def _is_keepalive_response(frame: bytes) -> bool:
     """True if a native-host frame is the echo of our own keepalive (to swallow)."""
     try:
@@ -109,7 +116,7 @@ def main() -> None:
                 if _is_keepalive_response(frame):
                     continue  # swallow our own keepalive echo
                 last_activity[0] = time.monotonic()
-                os.write(1, frame)
+                write_all(1, frame)
         except OSError:
             pass
         finally:

@@ -19,6 +19,7 @@ import pytest
 from typer.testing import CliRunner
 
 import claude_profile
+from claude_profile import browser_bridge_host
 from claude_profile import (
     SANDBOX_MARKER,
     SKIP_PERMISSIONS_FLAG,
@@ -2399,6 +2400,22 @@ def test_browser_bridge_host_handler_is_packaged() -> None:
     handler = claude_profile._browser_bridge_host_handler()
     assert handler.name == "browser_bridge_host.py"
     assert handler.exists()
+
+
+def test_browser_bridge_write_all_delivers_every_byte(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # os.write may write only part of a buffer; a dropped tail would corrupt the
+    # length-prefixed frame stream the in-VM claude reads.
+    written: list[bytes] = []
+
+    def short_write(fd: int, data: bytes) -> int:
+        written.append(bytes(data[:3]))
+        return len(written[-1])
+
+    monkeypatch.setattr(browser_bridge_host.os, "write", short_write)
+    browser_bridge_host.write_all(1, b"\x0a\x00\x00\x000123456789")
+    assert b"".join(written) == b"\x0a\x00\x00\x000123456789"
 
 
 def test_launch_supervised_chrome_only(
