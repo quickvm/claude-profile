@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import shutil
 import signal
 import socket
@@ -140,6 +141,9 @@ SANDBOX_GIT_IDENTITY = "/home/appuser/.gitconfig-identity"
 SHARED_SETTINGS = "shared-settings.json"
 PROFILE_PLACEHOLDER = "{profile}"
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
+# Names `env --set` accepts, and names a profile can have (see _check_profile_name).
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 SANDBOX_BRIEFING = (
     "You are running inside the claude-profile microVM sandbox — an ephemeral "
     "podman/krun VM (confirm with /run/.containerenv). The host filesystem is visible "
@@ -273,6 +277,7 @@ def add_profile(
     ),
 ) -> None:
     """Create a new profile."""
+    _check_profile_name(name)
     d = settings.profiles_base / name
     if d.exists():
         err_console.print(f"[yellow]Profile '{name}' already exists at {d}[/yellow]")
@@ -298,6 +303,25 @@ def add_profile(
                 f"(image '{settings.sandbox_image}' not found)"
             )
     console.print(f"Authenticate with: claude-profile {name} /login")
+
+
+def _check_profile_name(name: str) -> None:
+    """Exit unless name can be launched as `claude-profile <name>`.
+
+    A subcommand's name would run that command instead, a path-like name would land
+    outside the profiles dir, and shared-settings.json is the shared settings file.
+    """
+    if (
+        not PROFILE_NAME.fullmatch(name)
+        or name in KNOWN_COMMANDS
+        or name == SHARED_SETTINGS
+    ):
+        err_console.print(
+            f"[red]Error: '{name}' can't be a profile name. Use letters, digits, '.', '_' "
+            f"and '-', starting with a letter or digit, and not a claude-profile "
+            f"command.[/red]"
+        )
+        raise typer.Exit(code=1)
 
 
 def _seed_from_global(profile_dir: Path) -> None:
@@ -786,7 +810,14 @@ def _apply_env_changes(
             )
             raise typer.Exit(code=1)
         key, _, value = entry.partition("=")
-        env_vars[key.strip()] = value.strip()
+        key = key.strip()
+        if not ENV_NAME.fullmatch(key):
+            err_console.print(
+                f"[red]Error: '{key}' is not a variable name (letters, digits and _, not "
+                f"starting with a digit).[/red]"
+            )
+            raise typer.Exit(code=1)
+        env_vars[key] = value.strip()
     for key in unset_var:
         if key not in env_vars:
             err_console.print(f"[yellow]Warning: '{key}' is not set.[/yellow]")

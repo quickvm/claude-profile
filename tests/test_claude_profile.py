@@ -189,6 +189,20 @@ def test_add_skips_missing_source_files(profiles_base: Path, fake_home: Path) ->
     assert not (profile / "CLAUDE.md").exists()
 
 
+@pytest.mark.parametrize(
+    "name", ["build", "sandbox-cache", "shared-settings.json", "../x", ".hidden"]
+)
+def test_add_rejects_names_that_cannot_be_launched(
+    profiles_base: Path, fake_home: Path, name: str
+) -> None:
+    # `claude-profile build` runs the build command, so a profile named build could
+    # never be launched; path-like names would land outside the profiles dir.
+    result = runner.invoke(app, ["add", name], input="n\nn\nn\n")
+    assert result.exit_code == 1
+    assert not (profiles_base / name).exists()
+    assert not (profiles_base.parent / "x").exists()
+
+
 def test_add_fails_if_profile_exists(profiles_base: Path, fake_home: Path) -> None:
     (profiles_base / "work").mkdir(parents=True)
     result = runner.invoke(app, ["add", "work"])
@@ -706,6 +720,17 @@ def test_env_set_invalid_format(profiles_base: Path) -> None:
     result = runner.invoke(app, ["env", "work", "--set", "BADFORMAT"])
     assert result.exit_code == 1
     assert "KEY=VALUE" in result.output
+
+
+@pytest.mark.parametrize("entry", ["=x", " =x", "MY VAR=x", "1ST=x"])
+def test_env_set_rejects_names_that_are_not_variables(
+    profiles_base: Path, entry: str
+) -> None:
+    # An empty or malformed name made every later launch of the profile fail.
+    (profiles_base / "work").mkdir(parents=True)
+    result = runner.invoke(app, ["env", "work", "--set", entry])
+    assert result.exit_code == 1
+    assert not (profiles_base / "work" / ".env").exists()
 
 
 def test_env_nonexistent_profile(profiles_base: Path) -> None:
