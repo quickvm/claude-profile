@@ -11,6 +11,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from importlib import resources
@@ -1291,8 +1292,8 @@ def _build_sandbox_argv(
         # and would move the session off the host's version mid-run.
         argv += ["-e", "DISABLE_AUTOUPDATER=1"]
     argv += _forwarding_env(forwarding)
-    for key, value in extra_env.items():
-        argv += ["-e", f"{key}={value}"]
+    if extra_env:
+        argv += ["--env-file", _secret_env_file(extra_env)]
     argv += _sandbox_mounts(profile_dir, cwd)
     argv += ["-w", str(cwd), settings.sandbox_image, "claude"]
     args = list(claude_args)
@@ -1310,6 +1311,33 @@ def _build_sandbox_argv(
             SANDBOX_BRIEFING + _infisical_briefing(extra_env),
         ]
     return argv + args
+
+
+def _secret_env_file(env: dict[str, str]) -> str:
+    """Write env to an unlinked podman ``--env-file`` and return its ``/dev/fd`` path.
+
+    These values include tokens and the profile's ``.env``. Given as ``-e KEY=VALUE``
+    they would sit in podman's argv for the whole session, readable by every local user
+    in /proc/<pid>/cmdline. Putting them in podman's own environment instead would let
+    a ``.env`` written from inside the VM set LD_PRELOAD and the like for the host
+    podman. The file lives in the per-user tmpfs runtime dir and is unlinked at once,
+    so it never reaches disk and has no name: podman reads it through the inherited fd.
+    (os.memfd_create would do the same, but uv's standalone Pythons lack it.)
+    """
+    multiline = sorted(key for key, value in env.items() if "\n" in value)
+    if multiline:
+        err_console.print(
+            f"[red]Can't pass {', '.join(multiline)} into the sandbox: the value "
+            f"contains a newline, and podman reads one variable per line.[/red]"
+        )
+        sys.exit(1)
+    fd, path = tempfile.mkstemp(dir=os.environ.get("XDG_RUNTIME_DIR"))
+    os.unlink(path)
+    with open(fd, "w", closefd=False) as env_file:
+        env_file.writelines(f"{key}={value}\n" for key, value in env.items())
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.set_inheritable(fd, True)
+    return f"/dev/fd/{fd}"
 
 
 def _forwarding_env(forwarding: Optional[_Forwarding]) -> list[str]:
@@ -2007,8 +2035,10 @@ def _run_sandbox_supervised(
         bridges.append(_start_browser_open_host_bridge(forwarding.browser_open_port))
     argv = _build_sandbox_argv(profile_dir, cwd, claude_args, extra_env, forwarding)
     try:
+        # close_fds=False: podman reads its --env-file through an inherited fd (see
+        # _secret_env_file); Python opens every other fd non-inheritable.
         returncode = _wait_forwarding_signals(
-            subprocess.Popen(argv, env=os.environ.copy())
+            subprocess.Popen(argv, env=os.environ.copy(), close_fds=False)
         )
     finally:
         for bridge in bridges:

@@ -1239,9 +1239,46 @@ def test_argv_skip_permissions_opt_out(
     assert SKIP_PERMISSIONS_FLAG not in argv
 
 
-def test_argv_passes_env_vars(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def _env_file_text(argv: list[str]) -> str:
+    """What podman reads from the argv's --env-file, read the way podman opens it."""
+    return Path(argv[argv.index("--env-file") + 1]).read_text()
+
+
+def test_argv_passes_env_vars_off_the_command_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # podman's argv is readable by every local user in /proc/<pid>/cmdline.
     argv = _make_argv(monkeypatch, tmp_path, [], {"ANTHROPIC_API_KEY": "sk-test"})
-    assert "ANTHROPIC_API_KEY=sk-test" in argv
+    assert not any("sk-test" in arg for arg in argv)
+    assert _env_file_text(argv) == "ANTHROPIC_API_KEY=sk-test\n"
+
+
+def test_argv_env_file_has_no_path_and_survives_exec(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    argv = _make_argv(monkeypatch, tmp_path, [], {"TOKEN": "a b=c # d"})
+    env_file = argv[argv.index("--env-file") + 1]
+    assert os.readlink(env_file).endswith("(deleted)")
+    # podman opens it after exec, so a child process must be able to read it too.
+    child = subprocess.run(["cat", env_file], close_fds=False, capture_output=True)
+    assert child.stdout == b"TOKEN=a b=c # d\n"
+
+
+def test_argv_env_value_with_newline_fails_without_echoing_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # podman reads one variable per line, so a newline would split the value.
+    with pytest.raises(SystemExit):
+        _make_argv(monkeypatch, tmp_path, [], {"TOKEN": "line1\nsecret-tail"})
+    err = capsys.readouterr().err
+    assert "TOKEN" in err
+    assert "secret-tail" not in err
+
+
+def test_argv_without_env_vars_has_no_env_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    assert "--env-file" not in _make_argv(monkeypatch, tmp_path, [])
 
 
 def test_argv_mounts_cwd_at_real_path(
@@ -1332,7 +1369,7 @@ def test_launch_sandbox_routes_to_podman(
     assert f"{expected_cwd}:{expected_cwd}:z" in argv
 
 
-def test_launch_sandbox_loads_env_into_argv(
+def test_launch_sandbox_passes_profile_env_to_podman(
     profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     profile = profiles_base / "work"
@@ -1344,8 +1381,12 @@ def test_launch_sandbox_loads_env_into_argv(
     monkeypatch.chdir(tmp_path)
     with patch("os.execvpe") as mock_exec:
         _launch_profile("work", [])
-    _binname, argv, _env = mock_exec.call_args[0]
-    assert "ANTHROPIC_API_KEY=sk-xyz" in argv
+    _binname, argv, env = mock_exec.call_args[0]
+    assert "ANTHROPIC_API_KEY=sk-xyz\n" in _env_file_text(argv)
+    assert not any("sk-xyz" in arg for arg in argv)
+    # Not podman's own environment either: the VM can write .env, and podman would
+    # honour LD_PRELOAD and friends set there.
+    assert "sk-xyz" not in env.values()
 
 
 def test_launch_sandbox_missing_image_exits(
@@ -1962,6 +2003,35 @@ def _poll(condition: Any, timeout: float) -> bool:
             return True
         time.sleep(0.05)
     return False
+
+
+def test_supervised_launch_lets_podman_read_the_env_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # podman opens --env-file /dev/fd/N, which only works if the fd is inherited.
+    seen = tmp_path / "seen"
+    env_file = claude_profile._secret_env_file({"TOKEN": "x"})
+    monkeypatch.setattr(
+        claude_profile,
+        "_build_sandbox_argv",
+        lambda *args, **kwargs: ["sh", "-c", f'cat "{env_file}" > "{seen}"'],
+    )
+    monkeypatch.setattr(claude_profile.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(claude_profile, "_start_host_bridge", lambda host, port: Mock())
+    sock = Path("/run/agent.sock")
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            claude_profile._run_sandbox_supervised(
+                tmp_path,
+                tmp_path,
+                [],
+                {},
+                claude_profile._Forwarding([(sock, sock, 1)]),
+            )
+    finally:
+        os.close(int(env_file.rsplit("/", 1)[1]))
+    assert exc_info.value.code == 0
+    assert seen.read_text() == "TOKEN=x\n"
 
 
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])

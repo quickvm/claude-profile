@@ -69,8 +69,13 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   (`-v $PWD:$PWD`, so each `wt` worktree keeps a distinct claude session key), the git
   common dir when it lives outside the CWD (so a worktree's `git`/`wt` work), and the
   profile dir at the in-VM config dir. VM sizing uses `krun.ram_mib`/`krun.cpus`
-  annotations, not `--memory`/`--cpus`. `.env` vars plus `TERM`/`COLORTERM` are
-  forwarded with `-e`; the rest of the host environment is not.
+  annotations, not `--memory`/`--cpus`. `TERM`/`COLORTERM` are forwarded with `-e`; the
+  rest of the host environment is not. `.env` vars and forwarded tokens go through
+  `_secret_env_file`: an unlinked file in the tmpfs `$XDG_RUNTIME_DIR` that podman reads
+  as `--env-file /dev/fd/N`, so no value appears in podman's argv (world-readable in
+  `/proc/<pid>/cmdline`) or in podman's own environment (where a `.env` written from inside
+  the VM could set `LD_PRELOAD` for the host podman). The supervised path passes
+  `close_fds=False` so the fd reaches podman.
 - **Claude Code version tracks the host:** the image's baked claude would age with every
   release until someone rebuilt, so the VM runs the *host's* binary instead. The native
   installer produces a self-contained executable at `<data>/claude/versions/<version>`
