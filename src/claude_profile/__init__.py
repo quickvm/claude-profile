@@ -1339,11 +1339,15 @@ def _build_sandbox_argv(
     host_loopback: bool = False,
 ) -> list[str]:
     """Assemble the `podman run` argv that boots claude in a krun microVM."""
+    # A TTY only when both ends are terminals: with one, the in-VM claude takes its stdin
+    # for a TTY and drops piped input (`git diff | claude-profile work -p "review"`).
+    tty = ["-t"] if sys.stdin.isatty() and sys.stdout.isatty() else []
     argv = [
         settings.podman_bin,
         "run",
         "--rm",
-        "-it",
+        "-i",
+        *tty,
         "--annotation",
         "run.oci.handler=krun",
         "--annotation",

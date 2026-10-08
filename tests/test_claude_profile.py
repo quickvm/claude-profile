@@ -3470,6 +3470,20 @@ def test_argv_includes_sandbox_briefing(
     assert "git hooks" in briefing
 
 
+@pytest.mark.parametrize("tty", [True, False])
+def test_argv_allocates_a_tty_only_for_a_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tty: bool
+) -> None:
+    # With -t the in-VM claude's stdin is a TTY, so `git diff | claude-profile work -p`
+    # silently dropped the piped diff.
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: tty, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: tty, raising=False)
+    argv = _make_argv(monkeypatch, tmp_path, [])
+    run_options = argv[: argv.index(claude_profile.settings.sandbox_image)]
+    assert "-i" in run_options
+    assert ("-t" in run_options) is tty
+
+
 def test_argv_puts_sandbox_flags_before_the_users_args(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
