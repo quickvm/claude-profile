@@ -2246,6 +2246,31 @@ def _poll(condition: Any, timeout: float) -> bool:
     return False
 
 
+def test_supervised_launch_leaves_no_bridge_when_argv_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Building the argv can exit (a value with a newline, an unwritable file). Bridges
+    # started before that kept relaying the SSH agent to any local process.
+    started: list[Mock] = []
+
+    def fake_bridge(host: Path, port: int) -> Mock:
+        started.append(Mock())
+        return started[-1]
+
+    def failing_argv(*args: object, **kwargs: object) -> list[str]:
+        raise SystemExit(1)
+
+    monkeypatch.setattr(claude_profile, "_build_sandbox_argv", failing_argv)
+    monkeypatch.setattr(claude_profile.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(claude_profile, "_start_host_bridge", fake_bridge)
+    sock = Path("/run/agent.sock")
+    with pytest.raises(SystemExit):
+        claude_profile._run_sandbox_supervised(
+            tmp_path, tmp_path, [], {}, claude_profile._Forwarding([(sock, sock, 1)])
+        )
+    assert all(bridge.terminate.called for bridge in started)
+
+
 def test_supervised_launch_lets_podman_read_the_env_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

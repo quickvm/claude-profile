@@ -2241,17 +2241,21 @@ def _run_sandbox_supervised(
             "dnf install wl-clipboard) or unset CLAUDE_PROFILE_SANDBOX_CLIPBOARD."
         )
         sys.exit(1)
-    bridges = [
-        _start_host_bridge(host, port) for host, _guest, port in forwarding.forwards
-    ]
-    if forwarding.clipboard_port is not None:
-        bridges.append(_start_clipboard_host_bridge(forwarding.clipboard_port))
-    if forwarding.browser_port is not None:
-        bridges.append(_start_browser_host_bridge(forwarding.browser_port))
-    if forwarding.browser_open_port is not None:
-        bridges.append(_start_browser_open_host_bridge(forwarding.browser_open_port))
+    # Build the argv before any bridge listens: building it can exit (see
+    # _secret_env_file), and a bridge started first would be left running.
     argv = _build_sandbox_argv(profile_dir, cwd, claude_args, extra_env, forwarding)
+    bridges: list[subprocess.Popen[bytes]] = []
     try:
+        for host, _guest, port in forwarding.forwards:
+            bridges.append(_start_host_bridge(host, port))
+        if forwarding.clipboard_port is not None:
+            bridges.append(_start_clipboard_host_bridge(forwarding.clipboard_port))
+        if forwarding.browser_port is not None:
+            bridges.append(_start_browser_host_bridge(forwarding.browser_port))
+        if forwarding.browser_open_port is not None:
+            bridges.append(
+                _start_browser_open_host_bridge(forwarding.browser_open_port)
+            )
         # close_fds=False: podman reads its --env-file through an inherited fd (see
         # _secret_env_file); Python opens every other fd non-inheritable.
         returncode = _wait_forwarding_signals(
