@@ -139,7 +139,8 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
 - **Sandbox settings overlay:** the profile's `settings.json` is copied from the host and carries
   host-oriented deny rules; `deny` wins even under `--dangerously-skip-permissions`, so a blanket
   `Bash(sudo *)` deny blocks the sandbox's own scoped `sudo dnf`/`sudo podman`.
-  `_sandbox_settings_overlay` writes `settings.sandbox.json` (the profile settings with any deny
+  `_sandbox_settings_overlay` writes `settings.json` in the profile's state dir (the profile
+  settings with any deny
   matching `SANDBOX_STRIP_DENY_PREFIXES` — `Bash(sudo`, `Read(~/.ssh`, `Edit(~/.ssh` and
   `Read(~/.aws` — removed) and `_sandbox_mounts`
   bind-mounts it over `settings.json` **inside the VM only**, read-write so in-VM setting writes
@@ -173,7 +174,8 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   killing the launcher, so the teardown still runs when the terminal window is closed.
 - **known_hosts persistence:** `_sandbox_mounts` mounts the host's `~/.ssh/known_hosts`
   read-only as the VM's *global* known_hosts (`/etc/ssh/ssh_known_hosts`, for verification)
-  and a per-profile writable `known_hosts` (`_sandbox_known_hosts`) as the *user* file, so
+  and a per-profile writable `known_hosts` (`_sandbox_known_hosts`, in the state dir) as the
+  *user* file, so
   ssh records newly accepted host keys there and they persist across launches — the host's
   real file is never written by the sandbox.
 - **GPG agent forwarding (`sandbox_gpg_agent`):** same bridge, forwarding the host
@@ -296,7 +298,15 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   in-VM path (`/home/appuser/…`). Chrome's manifest on the **host** points at that same wrapper,
   so the in-VM install silently breaks the host's Chrome integration — Chrome can no longer spawn
   the native host. `_sandbox_chrome_overlay` masks the dir with a per-launch throwaway
-  (`<profile>/chrome.sandbox`) mounted over `<config>/chrome`, keeping in-VM installs in the VM.
+  (`chrome/` in the profile's state dir) mounted over `<config>/chrome`, keeping in-VM installs
+  in the VM.
+- **Sandbox state dir (`_sandbox_state_dir`):** every file the launcher generates for a
+  profile's sandbox (the settings overlay, the chrome dir, the user `known_hosts`, the
+  storage.conf overlay) lives in `<data dir>/profiles/<name>/`, never in the profile dir.
+  The profile dir is mounted read-write, so a generated file kept there could be swapped for
+  a symlink from inside the VM, and the next launch would write through it or mount its
+  target (`~/.bashrc` as known_hosts, `~/.ssh` as the chrome dir). Files in the state dir
+  are bind-mounted one by one: the VM can change their contents but not replace them.
 - **GitHub CLI (`sandbox_gh`):** the image bakes `gh`, and enabling `sandbox_gh` forwards your
   GitHub login into the VM. `gh` keeps its token in the system keyring (or `hosts.yml`), which a
   microVM can't reach, so `_with_gh_token` reads it on the host via `gh auth token` and injects it

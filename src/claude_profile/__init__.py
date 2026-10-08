@@ -863,6 +863,20 @@ def _git_common_dir(cwd: Path) -> Optional[Path]:
     return common.resolve() if common.is_absolute() else (cwd / common).resolve()
 
 
+def _sandbox_state_dir(profile_dir: Path) -> Path:
+    """Host-only dir for the files the launcher generates for a profile's sandbox.
+
+    The profile dir is mounted read-write into the VM, so a generated file kept there
+    can be swapped for a symlink by the agent, and the next launch would write through
+    it or mount its target (~/.bashrc as known_hosts, ~/.ssh as the chrome dir). Files
+    in this dir are bind-mounted individually: the VM can change their contents but
+    cannot replace them.
+    """
+    state = _data_dir() / "profiles" / profile_dir.name
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return state
+
+
 def _sandbox_settings_overlay(profile_dir: Path) -> Optional[Path]:
     """Write a sandbox-tuned settings.json (host sudo deny stripped) to mount in the VM.
 
@@ -892,7 +906,7 @@ def _sandbox_settings_overlay(profile_dir: Path) -> Optional[Path]:
     if len(kept) == len(deny):
         return None
     perms["deny"] = kept
-    overlay = profile_dir / "settings.sandbox.json"
+    overlay = _sandbox_state_dir(profile_dir) / "settings.json"
     try:
         overlay.write_text(json.dumps(data, indent=2))
     except OSError as exc:
@@ -991,7 +1005,7 @@ def _sandbox_chrome_overlay(profile_dir: Path) -> Path:
     Chrome can no longer spawn the native host. Masking the dir keeps in-VM installs inside
     the VM while leaving the host's wrapper intact.
     """
-    overlay = profile_dir / "chrome.sandbox"
+    overlay = _sandbox_state_dir(profile_dir) / "chrome"
     overlay.mkdir(exist_ok=True)
     return overlay
 
@@ -999,7 +1013,7 @@ def _sandbox_chrome_overlay(profile_dir: Path) -> Path:
 def _storage_cache_conf(profile_dir: Path) -> Path:
     """Write the storage.conf overlay adding the mounted store as a read-only
     additionalimagestore (regenerated each launch), and return its path."""
-    conf = profile_dir / "storage.sandbox.conf"
+    conf = _sandbox_state_dir(profile_dir) / "storage.conf"
     conf.write_text(
         "[storage]\n"
         'driver = "overlay"\n'
@@ -1041,7 +1055,7 @@ def _sandbox_known_hosts(profile_dir: Path) -> Path:
     global known_hosts (see _sandbox_mounts), so already-trusted hosts still verify and
     the host's real file is never written by the sandbox.
     """
-    dest = profile_dir / "known_hosts"
+    dest = _sandbox_state_dir(profile_dir) / "known_hosts"
     if not dest.exists():
         dest.touch()
     return dest

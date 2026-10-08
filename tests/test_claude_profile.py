@@ -1134,7 +1134,7 @@ def test_sandbox_settings_overlay_strips_sudo(tmp_path: Path) -> None:
     )
     overlay = claude_profile._sandbox_settings_overlay(prof)
     assert overlay is not None
-    assert overlay == prof / "settings.sandbox.json"
+    assert overlay == claude_profile._sandbox_state_dir(prof) / "settings.json"
     deny = json.loads(overlay.read_text())["permissions"]["deny"]
     # sudo + ssh/aws guards stripped inside the VM.
     assert not any(
@@ -1166,7 +1166,9 @@ def test_sandbox_settings_overlay_warns_when_it_cannot_be_written(
     (prof / "settings.json").write_text(
         json.dumps({"permissions": {"deny": ["Bash(sudo *)"]}})
     )
-    (prof / "settings.sandbox.json").mkdir()  # writing over a directory fails
+    (
+        claude_profile._sandbox_state_dir(prof) / "settings.json"
+    ).mkdir()  # writing over a directory fails
     assert claude_profile._sandbox_settings_overlay(prof) is None
     assert "deny rules" in " ".join(capsys.readouterr().err.split())
 
@@ -1189,7 +1191,7 @@ def test_sandbox_mounts_adds_settings_overlay(
     cwd.mkdir()
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
     mounts = _sandbox_mounts(prof, cwd)
-    overlay = prof / "settings.sandbox.json"
+    overlay = claude_profile._sandbox_state_dir(prof) / "settings.json"
     assert f"{overlay}:{claude_profile.SANDBOX_CONFIG_DIR}/settings.json:z" in mounts
 
 
@@ -2565,7 +2567,7 @@ def test_sandbox_mounts_masks_profile_chrome_dir(
     cwd.mkdir()
     mounts = _sandbox_mounts(profile, cwd)
     assert (
-        f"{profile / 'chrome.sandbox'}:{claude_profile.SANDBOX_CONFIG_DIR}/chrome:z"
+        f"{claude_profile._sandbox_state_dir(profile) / 'chrome'}:{claude_profile.SANDBOX_CONFIG_DIR}/chrome:z"
         in mounts
     )
     # the real wrapper is untouched on the host
@@ -3316,7 +3318,7 @@ def test_image_cache_dir_respects_xdg(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_storage_cache_conf_written(tmp_path: Path) -> None:
     conf = claude_profile._storage_cache_conf(tmp_path)
-    assert conf == tmp_path / "storage.sandbox.conf"
+    assert conf == claude_profile._sandbox_state_dir(tmp_path) / "storage.conf"
     text = conf.read_text()
     assert claude_profile.SANDBOX_IMAGE_STORE in text
     assert "additionalimagestores" in text
@@ -3333,9 +3335,7 @@ def test_image_cache_mounts_when_populated(
     profile.mkdir()
     mounts = claude_profile._image_cache_mounts(profile)
     assert f"{store}:{claude_profile.SANDBOX_IMAGE_STORE}:ro,z" in mounts
-    assert any(
-        "storage.sandbox.conf:/etc/containers/storage.conf:ro,z" in m for m in mounts
-    )
+    assert any("storage.conf:/etc/containers/storage.conf:ro,z" in m for m in mounts)
 
 
 def test_image_cache_mounts_empty_when_absent(
@@ -3485,6 +3485,43 @@ def test_launch_warns_nonroot_image_but_proceeds(
     assert mock_exec.called
 
 
+def test_sandbox_mounts_ignore_links_planted_in_the_profile_dir(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The profile dir is writable from inside the VM. A file the launcher generated
+    # there could be swapped for a symlink that the next launch writes through or
+    # mounts: ~/.bashrc as known_hosts (read-write), ~/.ssh as the chrome dir.
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    (claude_profile._image_cache_dir() / "overlay-images").mkdir(parents=True)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    (profile / "settings.json").write_text(
+        json.dumps({"permissions": {"deny": ["Bash(sudo *)"]}})
+    )
+    bashrc = fake_home / ".bashrc"
+    bashrc.write_text("# untouched\n")
+    keys = fake_home / ".ssh"
+    keys.mkdir()
+    victims = [fake_home / "victim-settings", fake_home / "victim-storage"]
+    for victim in victims:
+        victim.write_text("untouched")
+    planted = {
+        "known_hosts": bashrc,
+        "chrome.sandbox": keys,
+        "settings.sandbox.json": victims[0],
+        "storage.sandbox.conf": victims[1],
+    }
+    for name, target in planted.items():
+        (profile / name).symlink_to(target)
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    sources = {spec.split(":")[0] for spec in mounts if spec != "-v"}
+    assert not sources & {str(profile / name) for name in planted}
+    assert all(victim.read_text() == "untouched" for victim in victims)
+    assert bashrc.read_text() == "# untouched\n"
+
+
 def test_sandbox_mounts_known_hosts_global_ro_and_user_rw(
     fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3500,8 +3537,11 @@ def test_sandbox_mounts_known_hosts_global_ro_and_user_rw(
     # host file is the read-only global known_hosts (verification only)
     assert f"{ssh / 'known_hosts'}:/etc/ssh/ssh_known_hosts:ro,z" in mounts
     # per-profile writable user known_hosts persists newly accepted keys
-    assert f"{profile / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z" in mounts
-    assert (profile / "known_hosts").exists()
+    assert (
+        f"{claude_profile._sandbox_state_dir(profile) / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z"
+        in mounts
+    )
+    assert (claude_profile._sandbox_state_dir(profile) / "known_hosts").exists()
 
 
 def test_sandbox_mounts_user_known_hosts_without_host_file(
@@ -3515,21 +3555,26 @@ def test_sandbox_mounts_user_known_hosts_without_host_file(
     mounts = _sandbox_mounts(profile, cwd)
     # no host known_hosts -> no global mount, but the writable user file is still provided
     assert not any("/etc/ssh/ssh_known_hosts" in m for m in mounts)
-    assert f"{profile / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z" in mounts
+    assert (
+        f"{claude_profile._sandbox_state_dir(profile) / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z"
+        in mounts
+    )
 
 
 def test_sandbox_known_hosts_creates_empty(tmp_path: Path) -> None:
     profile = tmp_path / "prof"
     profile.mkdir()
     kh = claude_profile._sandbox_known_hosts(profile)
-    assert kh == profile / "known_hosts"
+    assert kh == claude_profile._sandbox_state_dir(profile) / "known_hosts"
     assert kh.exists() and kh.read_text() == ""
 
 
 def test_sandbox_known_hosts_preserves_existing(tmp_path: Path) -> None:
     profile = tmp_path / "prof"
     profile.mkdir()
-    (profile / "known_hosts").write_text("host1 ssh-ed25519 KEY\n")
+    (claude_profile._sandbox_state_dir(profile) / "known_hosts").write_text(
+        "host1 ssh-ed25519 KEY\n"
+    )
     assert (
         claude_profile._sandbox_known_hosts(profile).read_text()
         == "host1 ssh-ed25519 KEY\n"
