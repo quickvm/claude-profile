@@ -57,7 +57,9 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
 - **`env` subcommand:** manages per-profile environment variables stored in
   `<profile_dir>/.env`. Supports `--set KEY=VALUE` (repeatable) and `--unset KEY`
   (repeatable). With no flags, displays a table of current variables.
-  `_launch_profile()` loads `.env` into the environment before `execvpe`.
+  `_launch_profile()` loads `.env` into the environment before `execvpe`. `_write_env_file`
+  keeps `.env` at mode 0600: it holds tokens, and profile dirs are world-readable like
+  `~/.claude`.
 - **Sandbox mode (microVM):** a profile marked with a `.sandbox` file (created by
   `add --sandbox`) launches inside a podman + `krun` microVM instead of on the host.
   `_launch_profile()` checks the marker and routes to `_launch_sandbox()`, which

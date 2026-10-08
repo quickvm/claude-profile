@@ -655,6 +655,22 @@ def test_env_set_multiple(profiles_base: Path) -> None:
     assert parsed == {"A": "1", "B": "2"}
 
 
+@pytest.mark.parametrize("existing_mode", [None, 0o644])
+def test_env_file_is_readable_by_the_user_only(
+    profiles_base: Path, existing_mode: int | None
+) -> None:
+    # .env holds tokens, and the profile dir is world-readable like ~/.claude.
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    env_file = profile / ".env"
+    if existing_mode is not None:
+        env_file.write_text("A=1\n")
+        env_file.chmod(existing_mode)
+    result = runner.invoke(app, ["env", "work", "--set", "TOKEN=abc123"])
+    assert result.exit_code == 0
+    assert env_file.stat().st_mode & 0o777 == 0o600
+
+
 def test_env_unset(profiles_base: Path) -> None:
     profile = profiles_base / "work"
     profile.mkdir(parents=True)

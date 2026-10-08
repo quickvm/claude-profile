@@ -776,8 +776,14 @@ def _show_env_table(name: str, env_vars: dict[str, str]) -> None:
 
 
 def _write_env_file(env_file: Path, env_vars: dict[str, str]) -> None:
+    """Write .env readable by the user only: it holds tokens, and the profile dir is not
+    private (it is world-readable by default, like ~/.claude). An existing file is
+    tightened to 0600 before the new contents go in."""
     lines = [f"{key}={value}" for key, value in sorted(env_vars.items())]
-    env_file.write_text("\n".join(lines) + "\n" if lines else "")
+    fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with open(fd, "w") as handle:
+        handle.write("\n".join(lines) + "\n" if lines else "")
 
 
 def _do_unlink(profile_dir: Path, dir_name: str) -> None:
