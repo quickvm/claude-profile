@@ -78,6 +78,9 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     # A podman nobody can find, so a launch that a test forgot to stub fails fast
     # instead of booting a real microVM on the developer's machine.
     monkeypatch.setattr(claude_profile.settings, "podman_bin", "podman-stub-me")
+    # Keep launches away from the developer's real claude-profile data dir: its MCP
+    # image store would add mounts, and launches write files there.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
     # Default the git identity probe to none, so launch tests never read the
     # developer's git config. The identity tests use the git_identity fixture.
     monkeypatch.setattr(claude_profile, "_git_identity_env", lambda cwd: [])
