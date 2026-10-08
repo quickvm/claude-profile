@@ -1845,6 +1845,12 @@ def _build_forwarding() -> _Forwarding:
         forwards += ssh
         if ssh:
             ssh_auth = ssh[0][1]
+        else:
+            err_console.print(
+                "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_SSH_AGENT is set but no live SSH "
+                "agent was found (SSH_AUTH_SOCK or ~/.1password/agent.sock), so ssh in the "
+                "sandbox has no keys. Check 'ssh-add -l'.[/yellow]"
+            )
     pubkeys: Optional[bytes] = None
     if settings.sandbox_gpg_agent:
         extra = _gpg_extra_socket()

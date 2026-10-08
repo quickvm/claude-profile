@@ -2281,6 +2281,16 @@ def test_build_forwarding_gpg_only(
     assert fwd.gpg_pubkeys == b"ABC"
 
 
+def test_build_forwarding_ssh_warns_when_no_agent_is_live(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", True)
+    monkeypatch.setattr(claude_profile, "_ssh_agent_sockets", lambda: [])
+    fwd = claude_profile._build_forwarding()
+    assert fwd.forwards == []
+    assert "ssh" in capsys.readouterr().err.lower()
+
+
 def test_build_forwarding_gpg_warns_when_agent_unavailable(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
