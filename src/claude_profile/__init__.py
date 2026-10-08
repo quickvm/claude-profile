@@ -937,6 +937,11 @@ def _sandbox_settings_overlay(profile_dir: Path) -> Optional[Path]:
     return overlay
 
 
+def _has_option(args: list[str], name: str) -> bool:
+    """True if args carry the option ``name``, as ``name value`` or ``name=value``."""
+    return any(arg == name or arg.startswith(f"{name}=") for arg in args)
+
+
 def _shared_settings_args(
     name: str, claude_args: list[str], *, sandbox: bool
 ) -> tuple[list[str], bool]:
@@ -950,7 +955,7 @@ def _shared_settings_args(
     path = settings.profiles_base / SHARED_SETTINGS
     if not path.exists():
         return [], False
-    if any(arg == "--settings" or arg.startswith("--settings=") for arg in claude_args):
+    if _has_option(claude_args, "--settings"):
         err_console.print(
             f"[yellow]--settings was given, so {path} is not applied.[/yellow]"
         )
@@ -1386,7 +1391,13 @@ def _build_sandbox_argv(
     # would become that command's arguments (`claude mcp add NAME -- CMD ...` saved them
     # into the server definition).
     session: list[str] = []
-    if settings.sandbox_skip_permissions and SKIP_PERMISSIONS_FLAG not in args:
+    # An explicit --permission-mode wins: claude ranks the skip flag above it, so adding
+    # the flag would silently turn e.g. a plan-mode run into bypassPermissions.
+    if (
+        settings.sandbox_skip_permissions
+        and SKIP_PERMISSIONS_FLAG not in args
+        and not _has_option(args, "--permission-mode")
+    ):
         session.append(SKIP_PERMISSIONS_FLAG)
     # claude force-disables Chrome in a non-interactive session (dn()=!isInteractive),
     # which the sandbox launch trips, so claudeInChromeDefaultEnabled never applies. The
@@ -1394,7 +1405,7 @@ def _build_sandbox_argv(
     # integration when the user opted into sandbox_chrome.
     if settings.sandbox_chrome and "--chrome" not in args and "--no-chrome" not in args:
         session.append("--chrome")
-    if "--append-system-prompt" not in args:
+    if not _has_option(args, "--append-system-prompt"):
         session += [
             "--append-system-prompt",
             SANDBOX_BRIEFING + _infisical_briefing(extra_env),

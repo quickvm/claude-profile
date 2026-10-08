@@ -3392,6 +3392,26 @@ def test_argv_puts_sandbox_flags_before_the_users_args(
     assert "--chrome" in claude_args[: -len(user_args)]
 
 
+@pytest.mark.parametrize(
+    "mode", [["--permission-mode", "plan"], ["--permission-mode=plan"]]
+)
+def test_argv_keeps_an_explicit_permission_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: list[str]
+) -> None:
+    # claude ranks --dangerously-skip-permissions above --permission-mode, so adding it
+    # would silently turn a requested plan-mode run into bypassPermissions.
+    argv = _make_argv(monkeypatch, tmp_path, ["-p", *mode, "draft a plan"])
+    assert SKIP_PERMISSIONS_FLAG not in argv
+
+
+def test_argv_respects_user_system_prompt_given_with_equals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    argv = _make_argv(monkeypatch, tmp_path, ["--append-system-prompt=mine"])
+    assert "--append-system-prompt" not in argv
+    assert "--append-system-prompt=mine" in argv
+
+
 def test_argv_respects_user_system_prompt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
