@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import pwd
@@ -120,13 +121,13 @@ SANDBOX_STRIP_DENY_PREFIXES: tuple[str, ...] = (
 # podman's default host.containers.internal address under pasta; mapping it to the
 # host loopback lets the agent bridge bind to 127.0.0.1 instead of all interfaces.
 SANDBOX_HOST_LOOPBACK = "169.254.1.2"
-# Git settings resolved on the host and passed into the VM (see _git_identity_env).
-GIT_IDENTITY_KEYS: tuple[str, ...] = (
-    "user.name",
-    "user.email",
-    "user.signingkey",
-    "commit.gpgsign",
-)
+# Git settings resolved on the host for the CWD and given to the VM (see
+# _git_identity_mounts). Signing settings go only when GPG is forwarded.
+GIT_IDENTITY_KEYS: tuple[str, ...] = ("user.name", "user.email")
+GIT_SIGNING_KEYS: tuple[str, ...] = ("user.signingkey", "commit.gpgsign", "gpg.format")
+# In-VM paths: the mounted ~/.gitconfig, and the generated global config that includes it.
+SANDBOX_GITCONFIG = "/home/appuser/.gitconfig"
+SANDBOX_GIT_IDENTITY = "/home/appuser/.gitconfig-identity"
 # Settings every profile gets (e.g. hooks), in the profiles base and passed to each launch
 # with --settings; "{profile}" in any string becomes the profile name.
 SHARED_SETTINGS = "shared-settings.json"
@@ -1313,6 +1314,11 @@ class _Forwarding:
         None  # host TCP port serving the browser-open bridge
     )
 
+    def gpg(self) -> bool:
+        """True when the host gpg-agent is bridged into the VM."""
+        agent = Path(SANDBOX_GNUPGHOME) / "S.gpg-agent"
+        return any(guest == agent for _host, guest, _port in self.forwards)
+
     def active(self) -> bool:
         """True when any host-side bridge (agent socket, clipboard, browser) is needed."""
         return (
@@ -1374,7 +1380,9 @@ def _build_sandbox_argv(
         "-e",
         "COLORTERM",
     ]
-    argv += _git_identity_env(cwd)
+    argv += _git_identity_mounts(
+        cwd, signing=forwarding is not None and forwarding.gpg()
+    )
     if _host_claude_binary() is not None:
         # The VM runs the host's binary from a read-only mount and is thrown away at
         # exit, so an in-VM self-update would download a release only to discard it —
@@ -1413,34 +1421,58 @@ def _build_sandbox_argv(
     return argv + session + args
 
 
-def _git_identity_env(cwd: Path) -> list[str]:
-    """``-e`` args carrying the git identity and signing settings in effect for cwd.
+def _git_config_get(cwd: Path, key: str) -> Optional[str]:
+    """The value git resolves for key in cwd on the host, or None if unset."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "config", "--get", key],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    return result.stdout.rstrip("\n") if result.returncode == 0 else None
+
+
+def _git_identity_mounts(cwd: Path, *, signing: bool) -> list[str]:
+    """Mount and env args giving the VM the git identity git uses for cwd on the host.
 
     Only ~/.gitconfig is mounted into the VM. The files it pulls in with include or
-    includeIf are not, and an ``includeIf "gitdir:~/..."`` would not match there anyway
+    includeIf are not, and an ``includeIf "gitdir:~/..."`` could not match there anyway
     (``~`` is /home/appuser in the VM), so sandbox commits fell back to the default
-    identity. Resolve GIT_IDENTITY_KEYS on the host as git would for cwd, and pass them
-    in through git's GIT_CONFIG_COUNT/KEY/VALUE environment.
+    identity. GIT_CONFIG_GLOBAL points the VM at a file that includes the mounted
+    ~/.gitconfig and then sets the values resolved here, so they act as global config
+    and a repo's own config still overrides them. Signing settings come along only when
+    GPG is forwarded and the format is openpgp: an SSH or X.509 setup can't sign in the
+    VM, and passing it would only make commits fail.
     """
-    values: dict[str, str] = {}
-    for key in GIT_IDENTITY_KEYS:
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(cwd), "config", "--get", key],
-                capture_output=True,
-                text=True,
-            )
-        except FileNotFoundError:
-            return []
-        if result.returncode == 0:
-            values[key] = result.stdout.rstrip("\n")
+    keys = GIT_IDENTITY_KEYS + (GIT_SIGNING_KEYS if signing else ())
+    values = {
+        key: value for key in keys if (value := _git_config_get(cwd, key)) is not None
+    }
+    if values.get("gpg.format", "openpgp") != "openpgp":
+        values = {key: v for key, v in values.items() if key not in GIT_SIGNING_KEYS}
     if not values:
         return []
-    env = ["-e", f"GIT_CONFIG_COUNT={len(values)}"]
-    for index, (key, value) in enumerate(values.items()):
-        env += ["-e", f"GIT_CONFIG_KEY_{index}={key}"]
-        env += ["-e", f"GIT_CONFIG_VALUE_{index}={value}"]
-    return env
+    lines = ["[include]", f"\tpath = {SANDBOX_GITCONFIG}"]
+    for key, value in values.items():
+        section, name = key.split(".", 1)
+        quoted = value.replace("\\", "\\\\").replace('"', '\\"')
+        lines += [f"[{section}]", f'\t{name} = "{quoted}"']
+    content = "\n".join(lines) + "\n"
+    digest = hashlib.sha256(content.encode()).hexdigest()[:16]
+    identity = _data_dir() / "git" / f"identity-{digest}"
+    if not identity.exists():
+        identity.parent.mkdir(parents=True, exist_ok=True)
+        partial = identity.with_name(f".{identity.name}.{os.getpid()}.partial")
+        partial.write_text(content)
+        os.replace(partial, identity)
+    return [
+        "-v",
+        f"{identity}:{SANDBOX_GIT_IDENTITY}:ro,z",
+        "-e",
+        f"GIT_CONFIG_GLOBAL={SANDBOX_GIT_IDENTITY}",
+    ]
 
 
 def _secret_env_file(env: dict[str, str]) -> str:

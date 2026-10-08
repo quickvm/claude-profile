@@ -12,7 +12,7 @@ import sys
 import textwrap
 import time
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, Generator, Optional
 from unittest.mock import Mock, patch
 
 import pytest
@@ -83,7 +83,7 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
     # Default the git identity probe to none, so launch tests never read the
     # developer's git config. The identity tests use the git_identity fixture.
-    monkeypatch.setattr(claude_profile, "_git_identity_env", lambda cwd: [])
+    monkeypatch.setattr(claude_profile, "_git_identity_mounts", lambda cwd, signing: [])
 
 
 # ---------------------------------------------------------------------------
@@ -1309,27 +1309,58 @@ def test_argv_env_value_with_newline_fails_without_echoing_it(
     assert "secret-tail" not in err
 
 
-_REAL_GIT_IDENTITY_ENV = claude_profile._git_identity_env
+_REAL_GIT_IDENTITY_MOUNTS = claude_profile._git_identity_mounts
 
 
 @pytest.fixture()
 def git_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Run the real git identity probe against an isolated global git config."""
-    monkeypatch.setattr(claude_profile, "_git_identity_env", _REAL_GIT_IDENTITY_ENV)
+    monkeypatch.setattr(
+        claude_profile, "_git_identity_mounts", _REAL_GIT_IDENTITY_MOUNTS
+    )
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     global_config = tmp_path / "gitconfig"
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
     return global_config
 
 
-def _git_config_env(argv: list[str]) -> dict[str, str]:
-    """The git config entries passed into the VM through GIT_CONFIG_COUNT/KEY/VALUE."""
-    pairs = [argv[i + 1] for i, arg in enumerate(argv) if arg == "-e"]
-    env = dict(pair.split("=", 1) for pair in pairs if "=" in pair)
-    count = int(env.get("GIT_CONFIG_COUNT", "0"))
-    return {
-        env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(count)
-    }
+def _vm_git_config(argv: list[str]) -> Optional[Path]:
+    """Host path of the file the VM's git reads as its global config, if any."""
+    prefix = "GIT_CONFIG_GLOBAL="
+    guest = next((a.removeprefix(prefix) for a in argv if a.startswith(prefix)), None)
+    if guest is None:
+        return None
+    return next(
+        Path(argv[i + 1].split(":")[0])
+        for i, arg in enumerate(argv)
+        if arg == "-v" and argv[i + 1].split(":")[1] == guest
+    )
+
+
+def _git_get(key: str, config: Path, repo: Optional[Path] = None) -> Optional[str]:
+    """What the VM's git would resolve for key, given its global config file."""
+    cmd = ["git", *(["-C", str(repo)] if repo else []), "config", "--get", key]
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": str(config)}
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _repo_with_work_identity(
+    git_identity: Path, tmp_path: Path, extra: str = ""
+) -> Path:
+    """A repo whose identity and signing key come from an includeIf file."""
+    repo = tmp_path / "work"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    work_config = tmp_path / "gitconfig-work"
+    work_config.write_text(
+        "[user]\n\temail = alice@corp.example\n\tsigningkey = 0xC0FFEE\n" + extra
+    )
+    git_identity.write_text(
+        "[user]\n\tname = Alice Example\n\temail = alice@home.example\n"
+        f'[includeIf "gitdir:{repo}/"]\n\tpath = {work_config}\n'
+        "[commit]\n\tgpgsign = true\n"
+    )
+    return repo
 
 
 def test_argv_carries_the_git_identity_resolved_for_the_cwd(
@@ -1337,29 +1368,55 @@ def test_argv_carries_the_git_identity_resolved_for_the_cwd(
 ) -> None:
     # Only ~/.gitconfig is mounted, so identity it pulls in through includeIf must be
     # resolved on the host or sandbox commits get the default identity.
-    repo = tmp_path / "work"
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    work_config = tmp_path / "gitconfig-work"
-    work_config.write_text(
-        "[user]\n\temail = alice@corp.example\n\tsigningkey = 0xC0FFEE\n"
+    _repo_with_work_identity(git_identity, tmp_path)
+    config = _vm_git_config(_make_argv(monkeypatch, tmp_path, []))
+    assert config is not None
+    assert _git_get("user.name", config) == "Alice Example"
+    assert _git_get("user.email", config) == "alice@corp.example"
+    # Signing settings only travel when GPG is forwarded.
+    assert _git_get("user.signingkey", config) is None
+
+
+def test_git_identity_includes_signing_when_gpg_is_forwarded(
+    git_identity: Path, tmp_path: Path
+) -> None:
+    repo = _repo_with_work_identity(git_identity, tmp_path)
+    mounts = claude_profile._git_identity_mounts(repo, signing=True)
+    config = _vm_git_config(mounts)
+    assert config is not None
+    assert _git_get("user.signingkey", config) == "0xC0FFEE"
+    assert _git_get("commit.gpgsign", config) == "true"
+
+
+def test_git_identity_skips_signing_that_cannot_work_in_the_vm(
+    git_identity: Path, tmp_path: Path
+) -> None:
+    # An SSH signing key file lives on the host; forwarding the setup only breaks commits.
+    repo = _repo_with_work_identity(git_identity, tmp_path, "[gpg]\n\tformat = ssh\n")
+    config = _vm_git_config(claude_profile._git_identity_mounts(repo, signing=True))
+    assert config is not None
+    assert _git_get("user.email", config) == "alice@corp.example"
+    assert _git_get("user.signingkey", config) is None
+    assert _git_get("gpg.format", config) is None
+
+
+def test_git_identity_lets_repo_config_override_it(
+    git_identity: Path, tmp_path: Path
+) -> None:
+    # Passed as global config, so `git config commit.gpgsign false` in a repo still wins.
+    repo = _repo_with_work_identity(git_identity, tmp_path)
+    config = _vm_git_config(claude_profile._git_identity_mounts(repo, signing=True))
+    assert config is not None
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "commit.gpgsign", "false"], check=True
     )
-    git_identity.write_text(
-        "[user]\n\tname = Alice Example\n\temail = alice@home.example\n"
-        f'[includeIf "gitdir:{repo}/"]\n\tpath = {work_config}\n'
-        "[commit]\n\tgpgsign = true\n"
-    )
-    assert _git_config_env(_make_argv(monkeypatch, tmp_path, [])) == {
-        "user.name": "Alice Example",
-        "user.email": "alice@corp.example",
-        "user.signingkey": "0xC0FFEE",
-        "commit.gpgsign": "true",
-    }
+    assert _git_get("commit.gpgsign", config, repo) == "false"
 
 
 def test_argv_without_git_identity_sets_no_git_config(
     git_identity: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    assert _git_config_env(_make_argv(monkeypatch, tmp_path, [])) == {}
+    assert _vm_git_config(_make_argv(monkeypatch, tmp_path, [])) is None
 
 
 def test_argv_without_env_vars_has_no_env_file(

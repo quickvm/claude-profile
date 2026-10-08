@@ -187,8 +187,11 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   so secret keys/smartcard never enter the VM. `_sandbox_mounts` also bind-mounts
   `~/.gitconfig` read-only so signing config applies. Its `include`/`includeIf` files are not
   mounted, and a `gitdir:~/` condition could not match in the VM anyway (`~` is
-  /home/appuser there), so `_git_identity_env` resolves `GIT_IDENTITY_KEYS` for the CWD on
-  the host and passes them through `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n`. `_Forwarding` carries
+  /home/appuser there), so `_git_identity_mounts` resolves `GIT_IDENTITY_KEYS` for the CWD on
+  the host, writes them to a file in the data dir that first includes the mounted
+  `~/.gitconfig`, mounts it and points `GIT_CONFIG_GLOBAL` at it, so the values act as global
+  config and a repo's own config still wins. `GIT_SIGNING_KEYS` join only when GPG is
+  forwarded (`_Forwarding.gpg()`) and `gpg.format` is openpgp. `_Forwarding` carries
   `(host_socket, guest_path, port)` tuples shared by both SSH and GPG plus a
   `clipboard_port` for the clipboard bridge; `active()` reports whether any host bridge is
   needed. The in-VM env (`CLAUDE_SANDBOX_FORWARDS`, `SSH_AUTH_SOCK`, `GNUPGHOME`,

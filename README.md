@@ -288,10 +288,12 @@ PIN and touch policy: with the PIN cached and no touch requirement, the sandbox 
 without any prompt. The restricted socket also allows decryption, so the sandbox can
 decrypt data encrypted to your keys, and like the SSH bridge its port is reachable by any
 local process while the VM runs. Your `~/.gitconfig` is mounted read-only too. Files it
-pulls in with `include` or `includeIf` are not, so the launcher resolves `user.name`,
-`user.email`, `user.signingkey` and `commit.gpgsign` for the working directory on the host
-and passes them in: commits in the VM get the identity and key git would use for that
-directory on the host. Note: `gpg --list-secret-keys` looks empty
+pulls in with `include` or `includeIf` are not, so the launcher resolves `user.name` and
+`user.email` for the working directory on the host and passes them in as global config,
+together with `user.signingkey`, `commit.gpgsign` and `gpg.format` when GPG forwarding is
+on and the format is openpgp. Commits in the VM get the identity and key git would use for
+that directory on the host, and a repo's own config still overrides them. Note:
+`gpg --list-secret-keys` looks empty
 inside the VM (the restricted socket hides key listing) — that's expected; signing still
 works.
 
