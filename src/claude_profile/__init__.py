@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import KW_ONLY, dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Any, Optional
@@ -1230,6 +1230,7 @@ class _Forwarding:
     """Plan for bridging host agents into the VM via socat over pasta."""
 
     forwards: list[tuple[Path, Path, int]]  # (host_socket, guest_path, tcp_port)
+    _: KW_ONLY
     ssh_auth_sock: Optional[Path] = None
     gpg_pubkeys: Optional[bytes] = None  # host public keyring (gpg --export)
     clipboard_port: Optional[int] = None  # host TCP port serving the clipboard bridge
@@ -1597,7 +1598,12 @@ def _build_forwarding() -> _Forwarding:
                 "host Chrome via the browser-open bridge).[/yellow]"
             )
     return _Forwarding(
-        forwards, ssh_auth, pubkeys, clipboard_port, browser_port, browser_open_port
+        forwards,
+        ssh_auth_sock=ssh_auth,
+        gpg_pubkeys=pubkeys,
+        clipboard_port=clipboard_port,
+        browser_port=browser_port,
+        browser_open_port=browser_open_port,
     )
 
 
