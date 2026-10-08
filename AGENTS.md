@@ -74,7 +74,8 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   (`_sandbox_work_root`: the repo root from a subdirectory, since mounting only the subdir
   beside the real `.git` made git see the rest of the tree as deleted; the CWD itself outside
   a repo), with `-w` still the CWD. `_launch_sandbox` first refuses when that root is `$HOME`
-  or above it (`_refuse_home_mount`; a dotfiles repo at `~` makes `~` the root). It
+  or above it, or overlaps the profiles dir (`_refuse_home_mount`; a dotfiles repo at `~`
+  makes `~` the root). It
   mounts the root at its real host path
   (`-v $PWD:$PWD`, so each `wt` worktree keeps a distinct claude session key), the git
   common dir when it lives outside the CWD (so a worktree's `git`/`wt` work), and the

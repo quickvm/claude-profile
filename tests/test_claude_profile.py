@@ -1274,6 +1274,14 @@ def test_sandbox_mounts_adds_settings_overlay(
 # ---------------------------------------------------------------------------
 
 
+def _project(tmp_path: Path) -> Path:
+    """A working dir for launch tests, apart from the profiles dir in tmp_path (the
+    sandbox refuses to mount a dir that overlaps it)."""
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
+    return project
+
+
 def _make_argv(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1576,7 +1584,7 @@ def test_launch_sandbox_routes_to_podman(
     (profile / SANDBOX_MARKER).touch()
     monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(_project(tmp_path))
     expected_cwd = Path.cwd()
     with patch("os.execvpe") as mock_exec:
         _launch_profile("work", ["--resume"])
@@ -1599,7 +1607,7 @@ def test_launch_sandbox_passes_profile_env_to_podman(
     (profile / ".env").write_text("ANTHROPIC_API_KEY=sk-xyz\n")
     monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(_project(tmp_path))
     with patch("os.execvpe") as mock_exec:
         _launch_profile("work", [])
     _binname, argv, env = mock_exec.call_args[0]
@@ -1638,6 +1646,22 @@ def test_launch_sandbox_refuses_to_mount_the_home_dir(
     assert exc_info.value.code == 1
     mock_exec.assert_not_called()
     assert "whole home directory" in " ".join(capsys.readouterr().err.split())
+
+
+def test_launch_sandbox_refuses_to_mount_the_profiles_dir(
+    profiles_base: Path,
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # From inside the profiles dir the read-write mount would hold every profile's
+    # credentials, not just the one being launched.
+    _sandbox_profile_in(profiles_base, monkeypatch, profiles_base)
+    monkeypatch.chdir(profiles_base / "work")
+    with patch("os.execvpe") as mock_exec, pytest.raises(SystemExit):
+        _launch_profile("work", [])
+    mock_exec.assert_not_called()
+    assert "profiles" in " ".join(capsys.readouterr().err.split())
 
 
 def test_launch_sandbox_allows_a_project_dir_under_home(
@@ -1859,7 +1883,7 @@ def test_override_forces_sandbox_without_marker(
     monkeypatch.setattr(claude_profile.settings, "sandbox", True)
     monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(_project(tmp_path))
     with patch("os.execvpe") as mock_exec:
         _launch_profile("work", [])
     binname, _argv, _env = mock_exec.call_args[0]
@@ -2357,7 +2381,7 @@ def test_launch_supervised_when_forwarding(
         return Mock()
 
     monkeypatch.setattr(claude_profile, "_start_host_bridge", fake_bridge)
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(_project(tmp_path))
     with (
         patch("subprocess.Popen") as popen,
         patch("os.execvpe") as mock_exec,
@@ -2532,7 +2556,7 @@ def test_launch_no_forwards_uses_exec(
     monkeypatch.setattr(
         claude_profile, "_build_forwarding", lambda: claude_profile._Forwarding([])
     )
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(_project(tmp_path))
     with patch("os.execvpe") as mock_exec:
         _launch_profile("work", [])
     binname, argv, _env = mock_exec.call_args[0]
@@ -2615,7 +2639,7 @@ def test_launch_supervised_clipboard_only(
     monkeypatch.setattr(
         claude_profile, "_start_clipboard_host_bridge", fake_clip_bridge
     )
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(_project(tmp_path))
     with (
         patch("subprocess.Popen") as popen,
         patch("os.execvpe") as mock_exec,
@@ -3068,7 +3092,7 @@ def test_launch_supervised_chrome_only(
     monkeypatch.setattr(
         claude_profile, "_start_browser_open_host_bridge", fake_browser_open_bridge
     )
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(_project(tmp_path))
     with (
         patch("subprocess.Popen") as popen,
         patch("os.execvpe") as mock_exec,
@@ -3908,7 +3932,7 @@ def test_launch_warns_nonroot_image_but_proceeds(
     monkeypatch.setattr(
         claude_profile, "_build_forwarding", lambda: claude_profile._Forwarding([])
     )
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(_project(tmp_path))
     with patch("os.execvpe") as mock_exec:
         _launch_profile("work", [])
     assert mock_exec.called
@@ -4213,7 +4237,7 @@ def test_sandbox_launch_with_loopback_hooks_maps_host_loopback(
     monkeypatch.setattr(
         claude_profile, "_build_forwarding", lambda: claude_profile._Forwarding([])
     )
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(_project(tmp_path))
     with patch("os.execvpe") as mock_exec:
         _launch_profile("personal", [])
     _bin, argv, _env = mock_exec.call_args[0]

@@ -2374,7 +2374,8 @@ def _refuse_home_mount(cwd: Path) -> None:
     The sandbox mounts cwd's work tree (see _sandbox_work_root) read-write, so ~ or /
     would hand the VM the whole home directory: ~/.ssh private keys, keyrings and every
     profile's credentials. A dotfiles repo at ~ makes ~ the work tree of any directory
-    under it.
+    under it. A root inside the profiles dir, or around it, is refused for the same
+    reason.
     """
     root = _sandbox_work_root(cwd).resolve()
     home = Path.home().resolve()
@@ -2383,6 +2384,14 @@ def _refuse_home_mount(cwd: Path) -> None:
             f"[red]Refusing to start the sandbox in {cwd}: it would mount {root} "
             f"read-write, which includes your whole home directory. cd into a project "
             f"directory first.[/red]"
+        )
+        sys.exit(1)
+    profiles = settings.profiles_base.resolve()
+    if root == profiles or profiles in root.parents or root in profiles.parents:
+        err_console.print(
+            f"[red]Refusing to start the sandbox in {cwd}: it would mount {root} "
+            f"read-write, which overlaps the profiles dir {profiles} and with it every "
+            f"profile's credentials. cd into a project directory first.[/red]"
         )
         sys.exit(1)
 
