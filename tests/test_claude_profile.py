@@ -1236,6 +1236,17 @@ def test_sandbox_settings_overlay_warns_when_it_cannot_be_written(
     assert "deny rules" in " ".join(capsys.readouterr().err.split())
 
 
+@pytest.mark.parametrize("content", ["null", "[]", '"text"'])
+def test_sandbox_settings_overlay_ignores_settings_that_are_not_an_object(
+    tmp_path: Path, content: str
+) -> None:
+    # Valid JSON that is not an object crashed every sandbox launch.
+    prof = tmp_path / "prof"
+    prof.mkdir()
+    (prof / "settings.json").write_text(content)
+    assert claude_profile._sandbox_settings_overlay(prof) is None
+
+
 def test_sandbox_settings_overlay_none_when_no_settings(tmp_path: Path) -> None:
     prof = tmp_path / "prof"
     prof.mkdir()

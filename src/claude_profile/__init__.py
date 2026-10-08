@@ -1032,6 +1032,8 @@ def _sandbox_settings_overlay(profile_dir: Path) -> Optional[Path]:
         data = json.loads(src.read_text())
     except (json.JSONDecodeError, OSError):
         return None
+    if not isinstance(data, dict):
+        return None
     perms = data.get("permissions")
     if not isinstance(perms, dict) or not isinstance(perms.get("deny"), list):
         return None
