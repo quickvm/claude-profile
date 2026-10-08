@@ -84,6 +84,8 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     # Default the git identity probe to none, so launch tests never read the
     # developer's git config. The identity tests use the git_identity fixture.
     monkeypatch.setattr(claude_profile, "_git_identity_mounts", lambda cwd, signing: [])
+    # Likewise the work-tree probe; the tests about it restore the real one.
+    monkeypatch.setattr(claude_profile, "_git_toplevel", lambda cwd: None)
 
 
 # ---------------------------------------------------------------------------
@@ -1601,6 +1603,76 @@ def test_launch_sandbox_allows_a_project_dir_under_home(
     with patch("os.execvpe") as mock_exec:
         _launch_profile("work", [])
     mock_exec.assert_called_once()
+
+
+_REAL_GIT_TOPLEVEL = claude_profile._git_toplevel
+
+
+@pytest.fixture()
+def real_git_toplevel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Use the real work-tree probe instead of the autouse stub."""
+    monkeypatch.setattr(claude_profile, "_git_toplevel", _REAL_GIT_TOPLEVEL)
+
+
+def _git(*args: str) -> None:
+    """Run git without the developer's config (no identity, no commit signing)."""
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+def test_sandbox_mounts_whole_work_tree_for_a_subdirectory(
+    real_git_toplevel: None, tmp_path: Path
+) -> None:
+    # Mounting only the subdir, but the repo's real .git read-write, showed git every
+    # other tracked file as deleted; `git commit -a` in the VM recorded that.
+    repo = tmp_path / "repo"
+    _git("init", "-q", str(repo))
+    sub = repo / "backend"
+    sub.mkdir()
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    mounts = _sandbox_mounts(profile, sub)
+    assert f"{repo}:{repo}:z" in mounts
+    assert not any(spec.startswith(f"{sub}:") for spec in mounts)
+    assert not any(spec.startswith(f"{repo / '.git'}:") for spec in mounts)
+
+
+def test_sandbox_mounts_worktree_and_its_common_dir(
+    real_git_toplevel: None, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    _git("init", "-q", str(repo))
+    _git("-C", str(repo), "commit", "-q", "--allow-empty", "-m", "init")
+    worktree = tmp_path / "feature"
+    _git("-C", str(repo), "worktree", "add", "-q", str(worktree))
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    mounts = _sandbox_mounts(profile, worktree / ".")
+    assert f"{worktree}:{worktree}:z" in mounts
+    assert f"{repo / '.git'}:{repo / '.git'}:z" in mounts
+
+
+def test_launch_sandbox_refuses_a_work_tree_rooted_at_home(
+    real_git_toplevel: None,
+    profiles_base: Path,
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # With a dotfiles repo at ~, the work tree of any directory under it is ~ itself.
+    _git("init", "-q", str(fake_home))
+    project = fake_home / "src" / "notes"
+    project.mkdir(parents=True)
+    _sandbox_profile_in(profiles_base, monkeypatch, project)
+    with patch("os.execvpe") as mock_exec, pytest.raises(SystemExit):
+        _launch_profile("work", [])
+    mock_exec.assert_not_called()
+    assert "whole home directory" in " ".join(capsys.readouterr().err.split())
 
 
 def test_launch_sandbox_missing_image_exits(

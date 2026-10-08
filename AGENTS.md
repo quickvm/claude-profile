@@ -67,9 +67,12 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
 - **`build` command:** builds the sandbox image (`settings.sandbox_image`) from the
   packaged build context `src/claude_profile/sandbox/` (`Containerfile` +
   `entrypoint.sh`, shipped as wheel data, located via `importlib.resources`).
-- **Sandbox launch (`_build_sandbox_argv`):** `_launch_sandbox` first refuses a CWD that is
-  `$HOME` or above it (`_refuse_home_cwd`), since the CWD mount is read-write. Then it
-  mounts the CWD at its real host path
+- **Sandbox launch (`_build_sandbox_argv`):** the read-write mount is the CWD's git work tree
+  (`_sandbox_work_root`: the repo root from a subdirectory, since mounting only the subdir
+  beside the real `.git` made git see the rest of the tree as deleted; the CWD itself outside
+  a repo), with `-w` still the CWD. `_launch_sandbox` first refuses when that root is `$HOME`
+  or above it (`_refuse_home_mount`; a dotfiles repo at `~` makes `~` the root). It
+  mounts the root at its real host path
   (`-v $PWD:$PWD`, so each `wt` worktree keeps a distinct claude session key), the git
   common dir when it lives outside the CWD (so a worktree's `git`/`wt` work), and the
   profile dir at the in-VM config dir. VM sizing uses `krun.ram_mib`/`krun.cpus`

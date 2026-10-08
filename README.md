@@ -195,10 +195,12 @@ wt switch feature-a && claude-profile work   # microVM #1, sees only this worktr
 wt switch feature-b && claude-profile work   # microVM #2, isolated from #1
 ```
 
-The launcher mounts the current directory at its real path, read-write, so it refuses to
-start from your home directory or anything above it (such as `/`), which would expose your
-whole home directory. It also mounts the repo's git common
-dir when it lives outside the worktree, so `git` and `wt` work inside the VM and each
+The launcher mounts the current directory's git work tree at its real path, read-write: the
+whole repo when you start in a subdirectory (the session still starts in that directory),
+and just the directory outside a repo. It refuses when that would be your home directory or
+anything above it (such as `/`), which would expose your whole home directory. It also mounts
+the repo's git common dir when it lives outside the work tree, so `git` and `wt` work inside
+the VM and each
 worktree keeps its own session history. A profile's credentials and config are shared
 across its VMs, just as they already are across host terminals. If the profile links
 `commands`, `skills` or `statusline.sh` to your global `~/.claude`, those targets are

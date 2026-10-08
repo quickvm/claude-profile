@@ -863,6 +863,30 @@ def _ensure_sandbox_image() -> None:
         sys.exit(1)
 
 
+def _git_toplevel(cwd: Path) -> Optional[Path]:
+    """Root of the git work tree containing cwd, or None outside one."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    out = result.stdout.strip()
+    return Path(out).resolve() if result.returncode == 0 and out else None
+
+
+def _sandbox_work_root(cwd: Path) -> Path:
+    """The directory mounted read-write for cwd: its git work tree's root, if any.
+
+    Mounting only a repo subdirectory while the repo's .git is mounted read-write
+    showed git every other tracked file as deleted, and `git commit -a` in the VM
+    recorded those deletions in the host repo.
+    """
+    return _git_toplevel(cwd) or cwd
+
+
 def _git_common_dir(cwd: Path) -> Optional[Path]:
     """Return the absolute git common dir for cwd, or None if not in a repo.
 
@@ -1226,11 +1250,12 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
     recursively chown the mounted tree to the container's run-user (root, which maps
     to a subuid), wrecking ownership of the user's project on the host.
     """
+    root = _sandbox_work_root(cwd)
     mounts = [
         "-v",
         f"{profile_dir}:{SANDBOX_CONFIG_DIR}:z",
         "-v",
-        f"{cwd}:{cwd}:z",
+        f"{root}:{root}:z",
     ]
     # Mask the profile's chrome/ dir: an in-VM native-host install must not rewrite the
     # host's wrapper, which Chrome's manifest points at (see _sandbox_chrome_overlay).
@@ -1244,7 +1269,7 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
         # overlay (regenerated each launch), not the profile's real settings.json.
         mounts += ["-v", f"{overlay}:{SANDBOX_CONFIG_DIR}/settings.json:z"]
     git_dir = _git_common_dir(cwd)
-    if git_dir is not None and git_dir != cwd and cwd not in git_dir.parents:
+    if git_dir is not None and git_dir != root and root not in git_dir.parents:
         mounts += ["-v", f"{git_dir}:{git_dir}:z"]
     gitconfig = Path.home() / ".gitconfig"
     if gitconfig.exists():
@@ -1265,7 +1290,7 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
         # Run the host's current claude instead of the image's baked one, so the sandbox
         # follows the host's auto-updates (see _sandbox_claude_binary).
         mounts += ["-v", f"{host_claude}:{SANDBOX_HOST_CLAUDE}:ro,z"]
-    mounts += _mcp_json_mounts(cwd)
+    mounts += _mcp_json_mounts(root)
     mounts += _ca_trust_mounts()
     mounts += _linked_mounts(profile_dir)
     mounts += _launch_state_mounts(profile_dir)
@@ -2208,7 +2233,7 @@ def _launch_sandbox(
     profile_dir: Path, claude_args: list[str], extra_env: dict[str, str]
 ) -> None:
     """Launch a podman krun microVM running claude (optionally bridging agents)."""
-    _refuse_home_cwd(Path.cwd())
+    _refuse_home_mount(Path.cwd())
     _ensure_sandbox_image()
     image_user = _sandbox_image_user()
     if image_user and image_user not in ("root", "0"):
@@ -2242,19 +2267,21 @@ def _launch_sandbox(
     os.execvpe(settings.podman_bin, argv, os.environ.copy())
 
 
-def _refuse_home_cwd(cwd: Path) -> None:
-    """Exit when cwd is the home directory or above it, such as ``/``.
+def _refuse_home_mount(cwd: Path) -> None:
+    """Exit when the directory mounted for cwd is the home directory or above it.
 
-    The sandbox mounts the working directory read-write, so either one would hand the
-    VM the whole home directory: ~/.ssh private keys, keyrings and every profile's
-    credentials.
+    The sandbox mounts cwd's work tree (see _sandbox_work_root) read-write, so ~ or /
+    would hand the VM the whole home directory: ~/.ssh private keys, keyrings and every
+    profile's credentials. A dotfiles repo at ~ makes ~ the work tree of any directory
+    under it.
     """
+    root = _sandbox_work_root(cwd).resolve()
     home = Path.home().resolve()
-    if cwd.resolve() == home or cwd.resolve() in home.parents:
+    if root == home or root in home.parents:
         err_console.print(
-            f"[red]Refusing to start the sandbox in {cwd}: it mounts the working "
-            f"directory read-write, which here includes your whole home directory. "
-            f"cd into a project directory first.[/red]"
+            f"[red]Refusing to start the sandbox in {cwd}: it would mount {root} "
+            f"read-write, which includes your whole home directory. cd into a project "
+            f"directory first.[/red]"
         )
         sys.exit(1)
 
