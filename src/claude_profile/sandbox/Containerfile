@@ -37,10 +37,12 @@ RUN curl -fsSL -o /tmp/bk.rpm \
 # rootless podman can't unpack layers in the nested user namespace. The podman rule
 # carries SETENV so the `podman` wrapper's `sudo -E` can preserve pass-through env
 # (MCP servers pass tokens as `-e VAR` with the value taken from the environment).
+# The wrapper's own path is allowed too: sudo's secure_path resolves `sudo podman` to it,
+# and it just execs /usr/bin/podman when already root.
 RUN useradd -m -u 1000 -U appuser \
     && printf '%s\n' \
        'appuser ALL=(root) NOPASSWD: /usr/bin/dnf, /usr/bin/dnf5' \
-       'appuser ALL=(root) NOPASSWD:SETENV: /usr/bin/podman' \
+       'appuser ALL=(root) NOPASSWD:SETENV: /usr/bin/podman, /usr/local/bin/podman' \
        > /etc/sudoers.d/appuser \
     && chmod 0440 /etc/sudoers.d/appuser
 

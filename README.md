@@ -399,15 +399,15 @@ org.
 ### Nested containers (Podman)
 
 The image includes `podman`, so the agent can build and run containers inside the VM. They run
-**rootful** — use `sudo podman`:
+**rootful**: plain `podman` is wrapped to `sudo` automatically, and `sudo podman` works too:
 
 ```sh
-sudo podman run --rm docker.io/library/alpine echo hi
-sudo podman build -t myimage .
+podman run --rm docker.io/library/alpine echo hi
+podman build -t myimage .
 ```
 
 Rootless podman doesn't work here (the nested user namespace can't be mapped), but the krun guest
-kernel treats uid 0 as real root, so `sudo podman` behaves like podman on a normal Fedora host,
+kernel treats uid 0 as real root, so podman behaves like rootful podman on a normal Fedora host,
 with fuse-overlayfs storage. Container networking works normally — external DNS and
 container-to-container name resolution both resolve — because the sandbox runs the microVM with a
 real guest network stack (`krun.use_passt=1`) instead of libkrun's default TSI socket
