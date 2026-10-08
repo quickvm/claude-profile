@@ -66,6 +66,10 @@ SANDBOX_MARKER = ".sandbox"
 SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 SANDBOX_CONFIG_DIR = "/home/appuser/.claude"
 SANDBOX_GNUPGHOME = "/home/appuser/.gnupg"
+# In-VM dir for the forwarded SSH agent sockets. Not the host's own path: the entrypoint
+# chowns each socket's parent, and when that is /run/user/<uid> gpg moves its socket
+# dir there and never reaches the GPG bridge in GNUPGHOME.
+SANDBOX_AGENT_DIR = "/run/claude-sandbox"
 # In-VM path of the host's public keyring, which the entrypoint imports into GNUPGHOME.
 SANDBOX_GPG_PUBKEYS = "/opt/claude-host/gpg-pubkeys"
 # In-VM path where the host's Claude Code binary is mounted read-only. The entrypoint
@@ -1582,7 +1586,14 @@ def _build_forwarding() -> _Forwarding:
     forwards: list[tuple[Path, Path, int]] = []
     ssh_auth: Optional[Path] = None
     if settings.sandbox_ssh_agent:
-        ssh = [(sock, sock, _free_tcp_port()) for sock in _ssh_agent_sockets()]
+        ssh = [
+            (
+                sock,
+                Path(SANDBOX_AGENT_DIR) / f"ssh-agent-{index}.sock",
+                _free_tcp_port(),
+            )
+            for index, sock in enumerate(_ssh_agent_sockets())
+        ]
         forwards += ssh
         if ssh:
             ssh_auth = ssh[0][1]

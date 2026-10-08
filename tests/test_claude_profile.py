@@ -2012,9 +2012,25 @@ def test_build_forwarding_ssh_only(
     )  # live w/ keys
     monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 5000)
     fwd = claude_profile._build_forwarding()
-    assert fwd.forwards == [(auth, auth, 5000)]
-    assert fwd.ssh_auth_sock == auth
+    guest = Path(claude_profile.SANDBOX_AGENT_DIR) / "ssh-agent-0.sock"
+    assert fwd.forwards == [(auth, guest, 5000)]
+    assert fwd.ssh_auth_sock == guest
     assert fwd.gpg_pubkeys is None
+
+
+def test_build_forwarding_ssh_guest_path_stays_out_of_run_user(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The entrypoint chowns each guest socket's parent dir. If that is /run/user/<uid>,
+    # gpg moves its socket dir under it and never reaches the GPG bridge.
+    auth = Path(f"/run/user/{os.getuid()}/ssh-agent.socket")
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(auth))
+    monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", True)
+    monkeypatch.setattr(claude_profile, "_ssh_agent_sockets", lambda: [auth])
+    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 5000)
+    fwd = claude_profile._build_forwarding()
+    guests = [guest for _host, guest, _port in fwd.forwards]
+    assert guests and not any(str(g).startswith("/run/user/") for g in guests)
 
 
 def test_build_forwarding_gpg_only(

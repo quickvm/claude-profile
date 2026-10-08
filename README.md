@@ -251,9 +251,10 @@ claude-profile personal
 
 This forwards your active agent (`$SSH_AUTH_SOCK`) and, if present, the 1Password agent
 (`~/.1password/agent.sock`) into the VM — hardware/security keys included — so `ssh-add -l`
-and `git push` work there. Dead agent sockets (e.g. a stale gnome-keyring stub) are skipped,
-and the agent that actually holds keys is used by default. To switch to 1Password inside the
-VM, `export SSH_AUTH_SOCK=~/.1password/agent.sock`.
+and `git push` work there. Dead agent sockets (e.g. a stale gnome-keyring stub) are skipped.
+Inside the VM the agents appear as `/run/claude-sandbox/ssh-agent-0.sock`, `-1.sock` and so
+on, agents holding keys first, and `SSH_AUTH_SOCK` points at `ssh-agent-0.sock`. To use the
+other one, `export SSH_AUTH_SOCK=/run/claude-sandbox/ssh-agent-1.sock`.
 
 Host-key checking persists per profile: your `~/.ssh/known_hosts` is mounted read-only for
 verification, and host keys ssh accepts inside the VM are saved to a per-profile

@@ -164,7 +164,10 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   orders keyed agents first so the VM's `SSH_AUTH_SOCK` holds keys. `_start_host_bridge()`
   runs a host `socat` (TCP on 127.0.0.1 → the agent socket), and
   `--network=pasta:--map-host-loopback,…` lets the guest reach it; `entrypoint.sh` starts a
-  guest `socat` per forward and sets `SSH_AUTH_SOCK`. Because the bridges need teardown,
+  guest `socat` per forward and sets `SSH_AUTH_SOCK`. The guest sockets live in
+  `SANDBOX_AGENT_DIR` (`/run/claude-sandbox/ssh-agent-N.sock`), not at the host's path: the
+  entrypoint chowns each socket's parent dir, and when the host socket sits directly in
+  `/run/user/<uid>` that made gpg move its socket dir there and miss the GPG bridge. Because the bridges need teardown,
   this path supervises podman (`_run_sandbox_supervised`) instead of `execvpe`. While it
   waits, SIGTERM and SIGHUP are passed on to podman (`_wait_forwarding_signals`) rather than
   killing the launcher, so the teardown still runs when the terminal window is closed.
