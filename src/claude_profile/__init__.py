@@ -999,8 +999,12 @@ def _rewrite_loopback_hooks(data: dict[str, Any]) -> bool:
     for groups in hooks.values():
         for handler in _http_hook_handlers(groups):
             url = urlsplit(handler["url"])
-            if url.hostname in LOOPBACK_HOSTS:
-                netloc = SANDBOX_HOST_LOOPBACK + (f":{url.port}" if url.port else "")
+            # Swap only the host, keeping any user:password@ and the port as written
+            # (url.port would raise on a malformed port and abort the launch).
+            userinfo, at, hostport = url.netloc.rpartition("@")
+            host, colon, port = hostport.partition(":")
+            if host.lower() in LOOPBACK_HOSTS:
+                netloc = f"{userinfo}{at}{SANDBOX_HOST_LOOPBACK}{colon}{port}"
                 handler["url"] = urlunsplit(url._replace(netloc=netloc))
                 rewrote = True
     return rewrote

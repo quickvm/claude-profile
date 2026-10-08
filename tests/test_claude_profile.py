@@ -3889,6 +3889,26 @@ def test_sandbox_repoints_loopback_hooks_at_the_host(profiles_base: Path) -> Non
     assert host_loopback is True
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("http://user:pw@127.0.0.1:3000/x", "http://user:pw@{loopback}:3000/x"),
+        ("http://LOCALHOST/x", "http://{loopback}/x"),
+        # A malformed port crashed every sandbox launch; claude reports it instead.
+        ("http://localhost:abc/x", "http://{loopback}:abc/x"),
+    ],
+)
+def test_sandbox_loopback_rewrite_changes_only_the_host(
+    url: str, expected: str
+) -> None:
+    data = {"hooks": {"Stop": [{"hooks": [{"type": "http", "url": url}]}]}}
+    assert claude_profile._rewrite_loopback_hooks(data) is True
+    loopback = claude_profile.SANDBOX_HOST_LOOPBACK
+    assert data["hooks"]["Stop"][0]["hooks"][0]["url"] == expected.format(
+        loopback=loopback
+    )
+
+
 def test_host_launch_keeps_loopback_hooks(profiles_base: Path) -> None:
     _write_shared(profiles_base, SHARED)
     args, host_loopback = claude_profile._shared_settings_args(
