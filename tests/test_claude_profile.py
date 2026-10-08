@@ -2892,6 +2892,83 @@ def test_warn_missing_chrome_scope_silent_without_creds(
     assert capsys.readouterr().err == ""
 
 
+def _fake_tool(bin_dir: Path, name: str, record: Path) -> None:
+    """A stand-in for a host tool that records its arguments, one per line."""
+    bin_dir.mkdir(exist_ok=True)
+    tool = bin_dir / name
+    tool.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {record}\necho ran\n')
+    tool.chmod(0o755)
+
+
+def _run_handler(handler: Path, request: str, bin_dir: Path) -> str:
+    """Feed one request line to a host bridge handler, as socat does per connection."""
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    result = subprocess.run(
+        ["bash", str(handler)],
+        input=request + "\n",
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    return result.stdout
+
+
+@pytest.mark.parametrize(
+    ("request_line", "allowed"),
+    [
+        ("--list-types", True),
+        ("--no-newline --type image/png", True),
+        ("-t text/plain", True),
+        # --watch runs a command for every clipboard change: on the host.
+        ("--watch touch /tmp/pwned", False),
+        ("--primary", False),
+        ("--type image/png --watch sh", False),
+    ],
+)
+def test_clipboard_handler_runs_only_read_only_wl_paste(
+    tmp_path: Path, request_line: str, allowed: bool
+) -> None:
+    record = tmp_path / "wl-paste-args"
+    _fake_tool(tmp_path / "bin", "wl-paste", record)
+    handler = claude_profile._clipboard_host_handler()
+    output = _run_handler(handler, request_line, tmp_path / "bin")
+    assert record.exists() is allowed
+    if allowed:
+        assert record.read_text().split() == request_line.split()
+        assert output == "ran\n"
+
+
+@pytest.mark.parametrize(
+    ("url", "allowed"),
+    [
+        ("https://clau.de/chrome/reconnect", True),
+        ("https://claude.ai/chrome/connect", True),
+        ("https://example.com/chrome", False),
+        ("https://clau.de.example.com/chrome", False),
+        ("http://clau.de/chrome/reconnect", False),
+        ("javascript:alert(1)", False),
+    ],
+)
+def test_browser_open_handler_opens_only_claude_connect_pages(
+    tmp_path: Path, url: str, allowed: bool
+) -> None:
+    # It opens pages in the host's logged-in browser on the sandbox's say-so.
+    record = tmp_path / "chrome-args"
+    _fake_tool(tmp_path / "bin", "google-chrome", record)
+    handler = claude_profile._browser_open_host_handler()
+    output = _run_handler(handler, url, tmp_path / "bin")
+    assert output == ("OK\n" if allowed else "NO\n")
+    if allowed:
+        assert _poll(
+            record.exists, 5
+        )  # the handler starts the browser in the background
+        assert record.read_text() == url + "\n"
+    else:
+        time.sleep(0.2)
+        assert not record.exists()
+
+
 def test_browser_open_host_handler_is_packaged() -> None:
     handler = claude_profile._browser_open_host_handler()
     assert handler.name == "browser_open_host.sh"
