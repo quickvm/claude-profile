@@ -1,7 +1,8 @@
 # Sandbox image for `claude-profile` microVM mode (podman + krun runtime).
 # Build with: claude-profile build
 # Extend this file for project-specific tooling, then rebuild.
-FROM fedora:44
+# Tool versions and the base image are pinned; bump them deliberately.
+FROM registry.fedoraproject.org/fedora:44@sha256:b0b2ac1c4a682dea428ae05a0065824178ad951c304c3ac15c29daa8335e0599
 
 RUN dnf install -y \
       git gh ripgrep fd-find jq yq less ca-certificates openssh-clients socat \
@@ -15,14 +16,16 @@ RUN dnf install -y \
 # Go executable. claude-profile forwards your infisical login token into the VM via
 # env (CLAUDE_PROFILE_SANDBOX_INFISICAL); this provides the CLI that consumes it.
 RUN curl -1sLf https://artifacts-cli.infisical.com/setup.rpm.sh | bash \
-    && dnf install -y infisical \
+    && dnf install -y infisical-0.43.138 \
     && dnf clean all
 
 # Buildkite CLI (bk) — no dnf repo exists, so install the release RPM. It authenticates
 # from the BUILDKITE_API_TOKEN env var, which you forward with
 # CLAUDE_PROFILE_SANDBOX_FORWARD_ENV (the same token the buildkite MCP uses).
 RUN curl -fsSL -o /tmp/bk.rpm \
-      https://github.com/buildkite/cli/releases/download/v3.51.1/bk_3.51.1_linux_amd64.rpm \
+      https://github.com/buildkite/cli/releases/download/v3.59.1/bk_3.59.1_linux_amd64.rpm \
+    && echo 'e58e1982b7d4458bf80765d8296a81ec9c6e34e5718b3b0a45cc79327a6aa266  /tmp/bk.rpm' \
+      | sha256sum -c - \
     && dnf install -y /tmp/bk.rpm \
     && rm -f /tmp/bk.rpm \
     && dnf clean all
@@ -58,15 +61,14 @@ RUN chmod +x /usr/local/bin/podman
 # Install uv, the native claude binary, ty, and pulumi as the unprivileged user.
 # uv/claude/ty land in ~/.local/bin; pulumi installs to ~/.pulumi/bin (both on PATH
 # below). claude-profile forwards your Pulumi Cloud token via CLAUDE_PROFILE_SANDBOX_PULUMI.
-# claude is installed from the `latest` channel, the same one the host installer's
-# auto-updater tracks: launches normally run the host's own binary (mounted at
-# /opt/claude-host/claude, see claude_profile._sandbox_claude_binary), so this copy is the
-# fallback for hosts whose claude did not come from the native installer.
+# Launches normally run the host's own claude (mounted at /opt/claude-host/claude, see
+# claude_profile._sandbox_claude_binary), so this pinned copy is only the fallback for
+# hosts whose claude did not come from the native installer.
 USER appuser
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
-    && curl -fsSL https://claude.ai/install.sh | bash -s latest \
-    && /home/appuser/.local/bin/uv tool install ty \
-    && curl -fsSL https://get.pulumi.com | sh
+RUN curl -LsSf https://astral.sh/uv/0.12.21/install.sh | sh \
+    && curl -fsSL https://claude.ai/install.sh | bash -s 2.1.295 \
+    && /home/appuser/.local/bin/uv tool install ty==0.0.84 \
+    && curl -fsSL https://get.pulumi.com | sh -s -- --version 3.267.0
 USER root
 
 COPY entrypoint.sh /entrypoint.sh
