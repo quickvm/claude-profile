@@ -93,8 +93,9 @@ if [ -n "$(ls -A /etc/pki/ca-trust/source/anchors 2>/dev/null)" ] && [ -f "$_ca_
 fi
 
 # Seed a fresh GNUPGHOME with the host's public keys; signing uses the forwarded
-# gpg-agent (the secret keys/card stay on the host).
-if [ -n "$CLAUDE_SANDBOX_GPG_PUBKEYS" ]; then
+# gpg-agent (the secret keys/card stay on the host). The keyring arrives as a mounted
+# file: a whole keyring can outgrow the 128 KiB Linux allows a single env variable.
+if [ -n "$CLAUDE_SANDBOX_GPG_PUBKEYS_FILE" ]; then
   _gnupghome="${GNUPGHOME:-$HOME/.gnupg}"
   mkdir -p "$_gnupghome"
   chmod 700 "$_gnupghome"
@@ -108,7 +109,8 @@ if [ -n "$CLAUDE_SANDBOX_GPG_PUBKEYS" ]; then
   # It also stops dirmngr autostarting (keyserver lookups need an explicit
   # `gpgconf --launch dirmngr`), which the forwarded-agent setup does not rely on.
   printf 'no-autostart\n' >"$_gnupghome/gpg.conf"
-  printf '%s' "$CLAUDE_SANDBOX_GPG_PUBKEYS" | base64 -d | gpg --batch --import 2>/dev/null || true
+  gpg --batch --import "$CLAUDE_SANDBOX_GPG_PUBKEYS_FILE" 2>/dev/null ||
+    echo "warning: could not import the host's GPG public keys; signing may fail" >&2
 fi
 
 exec "$@"

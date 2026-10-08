@@ -174,7 +174,9 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
 - **GPG agent forwarding (`sandbox_gpg_agent`):** same bridge, forwarding the host
   gpg-agent restricted socket (`gpgconf --list-dirs agent-extra-socket`) to the in-VM
   `GNUPGHOME/S.gpg-agent` and seeding a fresh GNUPGHOME with the host's public keys
-  (`gpg --export`, base64 via env, imported by `entrypoint.sh`). Signing runs on the host,
+  (`gpg --export`, written to the data dir and mounted read-only at `SANDBOX_GPG_PUBKEYS` by
+  `_gpg_pubkeys_mounts`, imported by `entrypoint.sh`; a file because a keyring easily
+  outgrows the 128 KiB Linux allows one env string). Signing runs on the host,
   so secret keys/smartcard never enter the VM. `_sandbox_mounts` also bind-mounts
   `~/.gitconfig` read-only so signing config applies. Its `include`/`includeIf` files are not
   mounted, and a `gitdir:~/` condition could not match in the VM anyway (`~` is
@@ -183,7 +185,8 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   `(host_socket, guest_path, port)` tuples shared by both SSH and GPG plus a
   `clipboard_port` for the clipboard bridge; `active()` reports whether any host bridge is
   needed. The in-VM env (`CLAUDE_SANDBOX_FORWARDS`, `SSH_AUTH_SOCK`, `GNUPGHOME`,
-  `CLAUDE_SANDBOX_GPG_PUBKEYS`, `CLAUDE_SANDBOX_CLIPBOARD_PORT`) is built by `_forwarding_env`.
+  `CLAUDE_SANDBOX_GPG_PUBKEYS_FILE`, `CLAUDE_SANDBOX_CLIPBOARD_PORT`) is built by
+  `_forwarding_env`.
   The seeded GNUPGHOME also gets a `gpg.conf` carrying **`no-autostart`**, without which the
   forward dies partway through long sessions: `S.gpg-agent` in the VM is the bridge socket, not
   an agent, so any moment the host end is unreachable (the host gpg-agent restarting is enough)

@@ -1882,11 +1882,47 @@ def test_forwarding_env_ssh(tmp_path: Path) -> None:
 def test_forwarding_env_gpg(tmp_path: Path) -> None:
     host = tmp_path / "S.gpg-agent.extra"
     guest = Path("/home/appuser/.gnupg/S.gpg-agent")
-    fwd = claude_profile._Forwarding([(host, guest, 2222)], gpg_pubkeys_b64="QUJD")
+    fwd = claude_profile._Forwarding([(host, guest, 2222)], gpg_pubkeys=b"ABC")
     env = claude_profile._forwarding_env(fwd)
     assert f"CLAUDE_SANDBOX_FORWARDS={guest}=2222" in env
     assert "GNUPGHOME=/home/appuser/.gnupg" in env
-    assert "CLAUDE_SANDBOX_GPG_PUBKEYS=QUJD" in env
+    assert (
+        f"CLAUDE_SANDBOX_GPG_PUBKEYS_FILE={claude_profile.SANDBOX_GPG_PUBKEYS}" in env
+    )
+
+
+def test_argv_gpg_pubkeys_reach_the_vm_as_a_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Linux caps a single argv or env string at 128 KiB (MAX_ARG_STRLEN); a public
+    # keyring past that, base64'd into one variable, failed the launch with E2BIG.
+    keyring = os.urandom(200 * 1024)
+
+    def fake_export(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
+        assert cmd == ["gpg", "--export"]
+        return subprocess.CompletedProcess(cmd, 0, stdout=keyring)
+
+    extra = tmp_path / "S.gpg-agent.extra"
+    extra.touch()
+    monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", True)
+    monkeypatch.setattr(claude_profile, "_gpg_extra_socket", lambda: extra)
+    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 6000)
+    with patch("subprocess.run", fake_export):
+        fwd = claude_profile._build_forwarding()
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile, cwd = tmp_path / "prof", tmp_path / "work"
+    profile.mkdir()
+    cwd.mkdir()
+    argv = _build_sandbox_argv(profile, cwd, [], {}, fwd)
+    assert max(len(arg) for arg in argv) < 128 * 1024
+    prefix = "CLAUDE_SANDBOX_GPG_PUBKEYS_FILE="
+    guest_path = next(a for a in argv if a.startswith(prefix)).removeprefix(prefix)
+    source = next(
+        argv[i + 1].split(":")[0]
+        for i, arg in enumerate(argv)
+        if arg == "-v" and argv[i + 1].split(":")[1] == guest_path
+    )
+    assert Path(source).read_bytes() == keyring
 
 
 def test_gpg_extra_socket_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1919,14 +1955,12 @@ def test_gpg_extra_socket_no_gpgconf(monkeypatch: pytest.MonkeyPatch) -> None:
     assert claude_profile._gpg_extra_socket() is None
 
 
-def test_export_gpg_pubkeys_b64(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_export_gpg_pubkeys(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
         return subprocess.CompletedProcess(cmd, 0, stdout=b"PUBKEYBYTES")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    assert claude_profile._export_gpg_pubkeys() == base64.b64encode(
-        b"PUBKEYBYTES"
-    ).decode("ascii")
+    assert claude_profile._export_gpg_pubkeys() == b"PUBKEYBYTES"
 
 
 def test_export_gpg_pubkeys_none_when_empty(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1951,7 +1985,7 @@ def test_build_forwarding_ssh_only(
     fwd = claude_profile._build_forwarding()
     assert fwd.forwards == [(auth, auth, 5000)]
     assert fwd.ssh_auth_sock == auth
-    assert fwd.gpg_pubkeys_b64 is None
+    assert fwd.gpg_pubkeys is None
 
 
 def test_build_forwarding_gpg_only(
@@ -1961,13 +1995,13 @@ def test_build_forwarding_gpg_only(
     extra.touch()
     monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", True)
     monkeypatch.setattr(claude_profile, "_gpg_extra_socket", lambda: extra)
-    monkeypatch.setattr(claude_profile, "_export_gpg_pubkeys", lambda: "QUJD")
+    monkeypatch.setattr(claude_profile, "_export_gpg_pubkeys", lambda: b"ABC")
     monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 6000)
     fwd = claude_profile._build_forwarding()
     guest = Path(claude_profile.SANDBOX_GNUPGHOME) / "S.gpg-agent"
     assert fwd.forwards == [(extra, guest, 6000)]
     assert fwd.ssh_auth_sock is None
-    assert fwd.gpg_pubkeys_b64 == "QUJD"
+    assert fwd.gpg_pubkeys == b"ABC"
 
 
 def test_build_forwarding_gpg_warns_when_agent_unavailable(
@@ -1977,7 +2011,7 @@ def test_build_forwarding_gpg_warns_when_agent_unavailable(
     monkeypatch.setattr(claude_profile, "_gpg_extra_socket", lambda: None)
     fwd = claude_profile._build_forwarding()
     assert fwd.forwards == []
-    assert fwd.gpg_pubkeys_b64 is None
+    assert fwd.gpg_pubkeys is None
     assert "gpg-agent" in capsys.readouterr().err
 
 
@@ -1985,7 +2019,7 @@ def test_build_forwarding_none_when_disabled(monkeypatch: pytest.MonkeyPatch) ->
     fwd = claude_profile._build_forwarding()
     assert fwd.forwards == []
     assert fwd.ssh_auth_sock is None
-    assert fwd.gpg_pubkeys_b64 is None
+    assert fwd.gpg_pubkeys is None
 
 
 def test_argv_forwarding_adds_pasta_and_env(

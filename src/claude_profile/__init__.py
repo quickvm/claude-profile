@@ -66,6 +66,8 @@ SANDBOX_MARKER = ".sandbox"
 SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 SANDBOX_CONFIG_DIR = "/home/appuser/.claude"
 SANDBOX_GNUPGHOME = "/home/appuser/.gnupg"
+# In-VM path of the host's public keyring, which the entrypoint imports into GNUPGHOME.
+SANDBOX_GPG_PUBKEYS = "/opt/claude-host/gpg-pubkeys"
 # In-VM path where the host's Claude Code binary is mounted read-only. The entrypoint
 # points the PATH entry at it, so the VM runs the host's version instead of the one
 # baked into the image (see _sandbox_claude_binary).
@@ -1223,7 +1225,7 @@ class _Forwarding:
 
     forwards: list[tuple[Path, Path, int]]  # (host_socket, guest_path, tcp_port)
     ssh_auth_sock: Optional[Path] = None
-    gpg_pubkeys_b64: Optional[str] = None
+    gpg_pubkeys: Optional[bytes] = None  # host public keyring (gpg --export)
     clipboard_port: Optional[int] = None  # host TCP port serving the clipboard bridge
     browser_port: Optional[int] = (
         None  # host TCP port serving the Claude in Chrome socket bridge
@@ -1303,6 +1305,7 @@ def _build_sandbox_argv(
     if extra_env:
         argv += ["--env-file", _secret_env_file(extra_env)]
     argv += _sandbox_mounts(profile_dir, cwd)
+    argv += _gpg_pubkeys_mounts(forwarding)
     argv += ["-w", str(cwd), settings.sandbox_image, "claude"]
     args = list(claude_args)
     if settings.sandbox_skip_permissions and SKIP_PERMISSIONS_FLAG not in args:
@@ -1388,12 +1391,12 @@ def _forwarding_env(forwarding: Optional[_Forwarding]) -> list[str]:
         env += ["-e", f"CLAUDE_SANDBOX_FORWARDS={spec}"]
     if forwarding.ssh_auth_sock is not None:
         env += ["-e", f"SSH_AUTH_SOCK={forwarding.ssh_auth_sock}"]
-    if forwarding.gpg_pubkeys_b64 is not None:
+    if forwarding.gpg_pubkeys is not None:
         env += [
             "-e",
             f"GNUPGHOME={SANDBOX_GNUPGHOME}",
             "-e",
-            f"CLAUDE_SANDBOX_GPG_PUBKEYS={forwarding.gpg_pubkeys_b64}",
+            f"CLAUDE_SANDBOX_GPG_PUBKEYS_FILE={SANDBOX_GPG_PUBKEYS}",
         ]
     if forwarding.clipboard_port is not None:
         env += ["-e", f"{SANDBOX_CLIPBOARD_PORT_ENV}={forwarding.clipboard_port}"]
@@ -1484,15 +1487,40 @@ def _gpg_extra_socket() -> Optional[Path]:
     return sock if sock.exists() else None
 
 
-def _export_gpg_pubkeys() -> Optional[str]:
-    """Base64-encoded export of the host public keyring (no secret material)."""
+def _export_gpg_pubkeys() -> Optional[bytes]:
+    """Export of the host public keyring (no secret material), or None."""
     try:
         result = subprocess.run(["gpg", "--export"], capture_output=True)
     except FileNotFoundError:
         return None
     if result.returncode != 0 or not result.stdout:
         return None
-    return base64.b64encode(result.stdout).decode("ascii")
+    return result.stdout
+
+
+def _gpg_pubkeys_mounts(forwarding: Optional[_Forwarding]) -> list[str]:
+    """Read-only mount of the host public keyring for the entrypoint to import.
+
+    A file rather than an env var: Linux caps a single argv or env string at 128 KiB,
+    and a keyring with a few dozen keys passes that, failing the launch with E2BIG.
+    Written to our data dir (not the VM-writable profile dir) under a temp name and
+    renamed, so parallel launches never mount a half-written file.
+    """
+    if forwarding is None or forwarding.gpg_pubkeys is None:
+        return []
+    keyring = _data_dir() / "gpg-pubkeys"
+    partial = keyring.with_name(f".gpg-pubkeys.{os.getpid()}.partial")
+    try:
+        keyring.parent.mkdir(parents=True, exist_ok=True)
+        partial.write_bytes(forwarding.gpg_pubkeys)
+        os.replace(partial, keyring)
+    except OSError as exc:
+        err_console.print(
+            f"[red]Can't write your GPG public keys for the sandbox to {keyring}: "
+            f"{exc}[/red]"
+        )
+        sys.exit(1)
+    return ["-v", f"{keyring}:{SANDBOX_GPG_PUBKEYS}:ro,z"]
 
 
 def _browser_bridge_dir() -> Path:
@@ -1535,7 +1563,7 @@ def _build_forwarding() -> _Forwarding:
         forwards += ssh
         if ssh:
             ssh_auth = ssh[0][1]
-    pubkeys: Optional[str] = None
+    pubkeys: Optional[bytes] = None
     if settings.sandbox_gpg_agent:
         extra = _gpg_extra_socket()
         if extra is not None:
