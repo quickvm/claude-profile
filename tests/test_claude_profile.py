@@ -2418,6 +2418,35 @@ def test_browser_bridge_write_all_delivers_every_byte(
     assert b"".join(written) == b"\x0a\x00\x00\x000123456789"
 
 
+@pytest.mark.parametrize(
+    ("mode", "found"), [(0o700, True), (0o750, False), (0o755, False)]
+)
+def test_browser_bridge_uses_only_a_private_socket_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: int, found: bool
+) -> None:
+    # claude's own client refuses a bridge dir others can write to; the host proxy
+    # must too, or another local user can plant a socket the VM's browser calls reach.
+    bridge_dir = tmp_path / "claude-mcp-browser-bridge-me"
+    bridge_dir.mkdir()
+    (bridge_dir / "123.sock").touch()
+    bridge_dir.chmod(mode)
+    monkeypatch.setattr(browser_bridge_host, "DIR", str(bridge_dir))
+    expected = str(bridge_dir / "123.sock") if found else None
+    assert browser_bridge_host.newest_sock() == expected
+
+
+def test_browser_bridge_ignores_a_symlinked_socket_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    private = tmp_path / "elsewhere"
+    private.mkdir(mode=0o700)
+    (private / "123.sock").touch()
+    link = tmp_path / "claude-mcp-browser-bridge-me"
+    link.symlink_to(private)
+    monkeypatch.setattr(browser_bridge_host, "DIR", str(link))
+    assert browser_bridge_host.newest_sock() is None
+
+
 def test_launch_supervised_chrome_only(
     profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

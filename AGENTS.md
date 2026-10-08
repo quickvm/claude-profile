@@ -216,7 +216,9 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   host, `_start_browser_host_bridge` runs `socat TCP-LISTEN:$port … EXEC:python3 browser_bridge_host.py`;
   the proxy picks the **newest** live native-host socket per connection and relays the framed messages,
   so the bridge follows Chrome across native-host restarts (its pid changes each spawn) and claude's
-  reconnect loop self-heals if Chrome starts after the VM. `_build_forwarding` allocates the port
+  reconnect loop self-heals if Chrome starts after the VM. Like claude's own client, the proxy
+  uses the bridge dir only when it is a real directory owned by the user with no group/other
+  permissions, so another local user can't plant a socket there. `_build_forwarding` allocates the port
   (warning if no native host is currently listening), `_forwarding_env` exports
   `CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT`, and `_run_sandbox_supervised` starts/tears down the host bridge.
   Nothing but the framed native-messaging relay crosses the boundary — the host filesystem and other

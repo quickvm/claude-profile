@@ -24,6 +24,7 @@ import glob
 import json
 import os
 import socket
+import stat
 import struct
 import threading
 import time
@@ -35,7 +36,22 @@ KA_INTERVAL = 20.0  # < Chrome's ~30s MV3 idle timeout, with margin
 
 
 def newest_sock() -> str | None:
-    """Newest native-host socket, matching the resolver the socat version used."""
+    """Newest native-host socket, or None unless DIR is a directory private to us.
+
+    claude's own client refuses a bridge dir that is not mode 0700 and owned by the
+    user. Without the same check, another local user who creates DIR first could plant
+    a socket here and receive the browser calls relayed from the sandbox.
+    """
+    try:
+        info = os.lstat(DIR)
+    except FileNotFoundError:
+        return None
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_mode & 0o077
+    ):
+        return None
     socks = glob.glob(f"{DIR}/*.sock")
     socks.sort(key=os.path.getmtime, reverse=True)
     return socks[0] if socks else None
