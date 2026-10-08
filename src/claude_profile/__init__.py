@@ -405,7 +405,9 @@ def build_sandbox() -> None:
 def _sandbox_installed_tools() -> list[str]:
     """Return which curated dev tools are present in the sandbox image."""
     names = " ".join(SANDBOX_SKILL_TOOLS)
-    script = f'for t in {names}; do command -v "$t" >/dev/null 2>&1 && echo "$t"; done'
+    # exit 0: the loop's status is its last `command -v`, so a missing last tool would
+    # otherwise look like a failed run.
+    script = f'for t in {names}; do command -v "$t" >/dev/null 2>&1 && echo "$t"; done; exit 0'
     result = subprocess.run(
         [
             settings.podman_bin,
@@ -419,6 +421,13 @@ def _sandbox_installed_tools() -> list[str]:
         capture_output=True,
         text=True,
     )
+    if result.returncode != 0:
+        # Otherwise the skill would be rewritten listing no tools at all.
+        err_console.print(
+            f"[red]Could not list the tools in {settings.sandbox_image} (podman exit "
+            f"{result.returncode}): {result.stderr.strip()}[/red]"
+        )
+        sys.exit(1)
     present = set(result.stdout.split())
     return [tool for tool in SANDBOX_SKILL_TOOLS if tool in present]
 

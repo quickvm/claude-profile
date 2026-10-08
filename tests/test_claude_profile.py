@@ -3707,6 +3707,22 @@ def test_sandbox_installed_tools_filters(monkeypatch: pytest.MonkeyPatch) -> Non
     assert claude_profile._sandbox_installed_tools() == ["uv", "jq"]
 
 
+def test_sandbox_skill_fails_when_the_image_cannot_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A failed podman run listed no tools, and the skill was rewritten without any.
+    def failing_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 125, stdout="", stderr="no such image")
+
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(subprocess, "run", failing_run)
+    dest = tmp_path / "SKILL.md"
+    dest.write_text("existing skill")
+    result = runner.invoke(app, ["sandbox-skill", "--path", str(dest)])
+    assert result.exit_code == 1
+    assert dest.read_text() == "existing skill"
+
+
 def test_sandbox_skill_writes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
     monkeypatch.setattr(
