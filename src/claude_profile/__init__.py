@@ -148,7 +148,9 @@ SANDBOX_BRIEFING = (
     "missing tool use `sudo dnf "
     "install <pkg>` or `uv tool install <tool>` (see the sandbox-tools skill). Nested "
     "containers run rootful automatically — just use `podman` (it is wrapped to sudo "
-    "because rootless can't unpack layers in the VM's user namespace). If you need a tool made "
+    "because rootless can't unpack layers in the VM's user namespace); give containers that "
+    'write into the mounted repo --user "$(id -u):$(id -g)", or the host user cannot delete '
+    "what they write. If you need a tool made "
     "permanent, access outside the mounted paths, or anything the sandbox blocks, ask "
     "the user instead of working around it."
 )

@@ -406,6 +406,11 @@ podman run --rm docker.io/library/alpine echo hi
 podman build -t myimage .
 ```
 
+Files a nested container writes into the mounted repo belong to root inside the VM, which is a
+subuid on the host, so you can't delete them there without `podman unshare rm -rf <path>`.
+Containers that write into the repo should run with `--user "$(id -u):$(id -g)"`; the agent
+is told to do this.
+
 Rootless podman doesn't work here (the nested user namespace can't be mapped), but the krun guest
 kernel treats uid 0 as real root, so podman behaves like rootful podman on a normal Fedora host,
 with fuse-overlayfs storage. Container networking works normally — external DNS and

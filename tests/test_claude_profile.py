@@ -3595,6 +3595,8 @@ def test_argv_includes_sandbox_briefing(
     # The mounts are read-write: the agent must know its changes outlive the VM.
     assert "persists on the host" in briefing
     assert "git hooks" in briefing
+    # Rootful nested containers leave subuid-owned files the host user can't delete.
+    assert '--user "$(id -u):$(id -g)"' in briefing
 
 
 @pytest.mark.parametrize("tty", [True, False])

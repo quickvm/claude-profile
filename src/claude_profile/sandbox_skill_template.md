@@ -27,6 +27,10 @@ the next launch**, and you have **passwordless `sudo` scoped to `dnf` and `podma
 `build`, and `pull` as usual (fuse-overlayfs storage); an explicit `sudo podman` also works. This is
 also why `podman run …` MCP servers work in the sandbox.
 
+Because containers run as root, anything one writes into the mounted repo is owned by a subuid on
+the host, and the user can't delete it there. When a container writes into the repo (`npm ci`,
+builds, codegen into a bind mount), run it as yourself: `podman run --user "$(id -u):$(id -g)" …`.
+
 Networking is normal: external DNS and container-to-container name resolution both work (the VM
 runs with a real guest netstack). So a multi-container app can use a user-defined network with
 service names as usual:
