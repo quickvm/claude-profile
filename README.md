@@ -44,9 +44,11 @@ claude-profile <name> [args...]      # launch claude with the given profile
 
 `add` copies `settings.json` and `CLAUDE.md` from `~/.claude` into the new profile directory
 and symlinks `statusline.sh` to `~/.claude/statusline.sh`, so every profile, sandboxed or
-not, runs the one status line script. It then prompts whether to symlink `commands/` and
-`skills/` to your global `~/.claude` directories (default: yes). Decline to keep those
-directories isolated per profile.
+not, runs the one status line script. It then prompts whether to symlink `commands/`,
+`skills/` and `hooks/` to your global `~/.claude` directories (default: yes). Decline to keep
+those directories isolated per profile. Link `hooks/` if your settings run hooks from
+`~/.claude/hooks/`: inside the sandbox `~/.claude` is the profile directory, so an unlinked
+guard hook is missing there and fails open.
 
 ```sh
 claude-profile add work
@@ -56,8 +58,8 @@ claude-profile add work
 
 ### Managing directory links
 
-Use `links` to inspect or change how `commands/` and `skills/` are connected after a profile
-is created:
+Use `links` to inspect or change how `commands/`, `skills/` and `hooks/` are connected after a
+profile is created:
 
 ```sh
 claude-profile links work                   # show link status for all dirs

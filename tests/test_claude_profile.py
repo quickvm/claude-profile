@@ -142,7 +142,7 @@ def test_list_multiple_profiles(profiles_base: Path) -> None:
 
 def test_add_creates_directory(profiles_base: Path, fake_home: Path) -> None:
     # Answer Y to both prompts
-    result = runner.invoke(app, ["add", "work"], input="y\ny\n")
+    result = runner.invoke(app, ["add", "work"], input="y\ny\nn\n")
     assert result.exit_code == 0
     assert (profiles_base / "work").is_dir()
 
@@ -154,7 +154,7 @@ def test_add_copies_files_from_claude_dir(profiles_base: Path, fake_home: Path) 
     (claude_dir / "CLAUDE.md").write_text("# instructions")
 
     # Answer n to both link prompts (no global dirs exist)
-    runner.invoke(app, ["add", "work"], input="n\nn\n")
+    runner.invoke(app, ["add", "work"], input="n\nn\nn\n")
 
     profile = profiles_base / "work"
     assert (profile / "settings.json").read_text() == '{"theme": "dark"}'
@@ -167,7 +167,7 @@ def test_add_links_statusline_to_global(profiles_base: Path, fake_home: Path) ->
     global_statusline = claude_dir / "statusline.sh"
     global_statusline.write_text("#!/bin/sh\necho ok")
 
-    runner.invoke(app, ["add", "work"], input="n\nn\n")
+    runner.invoke(app, ["add", "work"], input="n\nn\nn\n")
 
     profile_statusline = profiles_base / "work" / "statusline.sh"
     assert profile_statusline.is_symlink()
@@ -179,7 +179,7 @@ def test_add_links_statusline_to_global(profiles_base: Path, fake_home: Path) ->
 
 def test_add_skips_missing_source_files(profiles_base: Path, fake_home: Path) -> None:
     (fake_home / ".claude").mkdir()
-    result = runner.invoke(app, ["add", "work"], input="n\nn\n")
+    result = runner.invoke(app, ["add", "work"], input="n\nn\nn\n")
     assert result.exit_code == 0
     profile = profiles_base / "work"
     assert not (profile / "settings.json").exists()
@@ -201,7 +201,7 @@ def test_add_default_yes_creates_symlinks(profiles_base: Path, fake_home: Path) 
     (claude_dir / "commands").mkdir()
     (claude_dir / "skills").mkdir()
 
-    result = runner.invoke(app, ["add", "work"], input="\n\n")
+    result = runner.invoke(app, ["add", "work"], input="\n\n\n")
     assert result.exit_code == 0
     profile = profiles_base / "work"
     assert (profile / "commands").is_symlink()
@@ -212,7 +212,7 @@ def test_add_decline_both_creates_isolated_dirs(
     profiles_base: Path, fake_home: Path
 ) -> None:
     (fake_home / ".claude").mkdir()
-    result = runner.invoke(app, ["add", "work"], input="n\nn\n")
+    result = runner.invoke(app, ["add", "work"], input="n\nn\nn\n")
     assert result.exit_code == 0
     profile = profiles_base / "work"
     assert (profile / "commands").is_dir()
@@ -227,7 +227,7 @@ def test_add_mixed_link_and_isolate(profiles_base: Path, fake_home: Path) -> Non
     (claude_dir / "commands").mkdir()
 
     # Link commands (Y), isolate skills (n)
-    result = runner.invoke(app, ["add", "work"], input="y\nn\n")
+    result = runner.invoke(app, ["add", "work"], input="y\nn\nn\n")
     assert result.exit_code == 0
     profile = profiles_base / "work"
     assert (profile / "commands").is_symlink()
@@ -240,7 +240,7 @@ def test_add_global_dir_absent_skips_symlink(
 ) -> None:
     (fake_home / ".claude").mkdir()
     # Request link but global dir doesn't exist — should warn and not crash
-    result = runner.invoke(app, ["add", "work"], input="y\ny\n")
+    result = runner.invoke(app, ["add", "work"], input="y\ny\nn\n")
     assert result.exit_code == 0
     profile = profiles_base / "work"
     # Symlinks not created (global dirs absent)
@@ -321,6 +321,16 @@ def test_links_nonexistent_profile(profiles_base: Path) -> None:
 # ---------------------------------------------------------------------------
 # links --link
 # ---------------------------------------------------------------------------
+
+
+def test_links_link_named_dir_without_global_fails(
+    profiles_base: Path, fake_home: Path
+) -> None:
+    (fake_home / ".claude").mkdir()
+    (profiles_base / "work").mkdir(parents=True)
+    result = runner.invoke(app, ["links", "work", "hooks", "--link"])
+    assert result.exit_code == 1
+    assert not (profiles_base / "work" / "hooks").exists()
 
 
 def test_links_link_all(profiles_base: Path, fake_home: Path) -> None:
@@ -1481,14 +1491,14 @@ def test_add_sandbox_creates_marker(
 ) -> None:
     (fake_home / ".claude").mkdir()
     monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
-    result = runner.invoke(app, ["add", "work", "--sandbox"], input="n\nn\n")
+    result = runner.invoke(app, ["add", "work", "--sandbox"], input="n\nn\nn\n")
     assert result.exit_code == 0
     assert (profiles_base / "work" / SANDBOX_MARKER).exists()
 
 
 def test_add_without_sandbox_no_marker(profiles_base: Path, fake_home: Path) -> None:
     (fake_home / ".claude").mkdir()
-    result = runner.invoke(app, ["add", "work"], input="n\nn\n")
+    result = runner.invoke(app, ["add", "work"], input="n\nn\nn\n")
     assert result.exit_code == 0
     assert not (profiles_base / "work" / SANDBOX_MARKER).exists()
 
@@ -1498,7 +1508,7 @@ def test_add_sandbox_hints_build_when_image_absent(
 ) -> None:
     (fake_home / ".claude").mkdir()
     monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: False)
-    result = runner.invoke(app, ["add", "work", "--sandbox"], input="n\nn\n")
+    result = runner.invoke(app, ["add", "work", "--sandbox"], input="n\nn\nn\n")
     assert result.exit_code == 0
     assert "claude-profile build" in result.output
 
@@ -1927,6 +1937,22 @@ def test_linked_mounts_skip_link_retargeted_off_global(
     cwd.mkdir()
     mounts = _sandbox_mounts(profile, cwd)
     assert not any(str(secret) in m for m in mounts)
+
+
+def test_linked_hooks_dir_mounted_at_link_target(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A guard hook written as ~/.claude/hooks/guard.sh resolves to the profile in the
+    # VM; unless the link resolves there it exits 127 and the guard fails open.
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    global_hooks = fake_home / ".claude" / "hooks"
+    global_hooks.mkdir(parents=True)
+    (profile / "hooks").symlink_to(global_hooks)
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    assert f"{global_hooks}:{global_hooks}:ro,z" in _sandbox_mounts(profile, cwd)
 
 
 def test_copied_statusline_not_mounted(

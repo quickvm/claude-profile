@@ -60,7 +60,9 @@ settings = Settings()
 console = Console()
 err_console = Console(stderr=True)
 
-LINKABLE_DIRS: tuple[str, ...] = ("commands", "skills")
+# hooks: a hook or statusLine command written as ~/.claude/hooks/... resolves to the
+# profile dir inside the sandbox, so a guard hook there only runs if the link does.
+LINKABLE_DIRS: tuple[str, ...] = ("commands", "skills", "hooks")
 # Symlinked into each profile rather than copied: the sandbox reaches it through the
 # profile dir, and a copy goes stale the moment the global script changes.
 STATUSLINE_FILE = "statusline.sh"
@@ -679,11 +681,23 @@ def manage_links(
         return
 
     if link:
-        for dn in dirs:
-            _do_link(d, dn)
+        _link_dirs(d, dirs, named=dir_name is not None)
     else:
         for dn in dirs:
             _do_unlink(d, dn)
+
+
+def _link_dirs(profile_dir: Path, dirs: tuple[str, ...], *, named: bool) -> None:
+    """Link each dir to its ~/.claude counterpart.
+
+    Linking every dir skips the ones with no global counterpart (most people have no
+    ~/.claude/hooks); a dir named on the command line must exist.
+    """
+    for dn in dirs:
+        if not named and not (Path.home() / ".claude" / dn).exists():
+            console.print(f"Skipping '{dn}': ~/.claude/{dn} does not exist.")
+            continue
+        _do_link(profile_dir, dn)
 
 
 def _show_links_table(name: str, profile_dir: Path, dirs: tuple[str, ...]) -> None:
