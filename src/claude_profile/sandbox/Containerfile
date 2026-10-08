@@ -27,9 +27,10 @@ RUN curl -fsSL -o /tmp/bk.rpm \
     && rm -f /tmp/bk.rpm \
     && dnf clean all
 
-# Passwordless sudo scoped to the package manager plus podman: the agent can install
-# missing system packages and run nested containers, but cannot sudo-write into the
-# bind mounts. Podman runs rootful because the guest kernel sees uid 0 as real root —
+# Passwordless sudo for the package manager and podman, so the agent can install
+# missing system packages and run nested containers. Either one amounts to root inside
+# the VM: the VM is the isolation boundary, not these rules. Podman runs rootful
+# because the guest kernel sees uid 0 as real root —
 # rootless podman can't unpack layers in the nested user namespace. The podman rule
 # carries SETENV so the `podman` wrapper's `sudo -E` can preserve pass-through env
 # (MCP servers pass tokens as `-e VAR` with the value taken from the environment).

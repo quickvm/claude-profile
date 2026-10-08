@@ -152,8 +152,9 @@ version baked into the image and `claude-profile build` is how you update it.
 On launch the agent is told (via the system prompt) that it's in the sandbox, and the
 bundled `sandbox-tools` skill explains how to self-provision. Inside the VM it can:
 
-- `sudo dnf install -y <pkg>` — passwordless sudo is scoped to `dnf`, so it can't `sudo` a
-  write into your mounted repo
+- `sudo dnf install -y <pkg>` — passwordless sudo covers `dnf` and `podman`. Either one
+  amounts to root inside the VM, so the sudo rules are a convenience, not a boundary; the VM
+  is the boundary
 - `uv tool install <tool>` / `uv run --with <lib> …` — no root needed
 
 Installs are per-session (the VM is ephemeral). For a tool you need every time, add it to
@@ -262,9 +263,11 @@ the agent over pasta networking, with the host end bound to `127.0.0.1`. Managin
 bridge means an SSH-agent launch runs the VM as a child process instead of exec'ing it (the
 TUI is unchanged). Requires `socat` on the host (`dnf install socat`).
 
-**Security:** while the VM runs, the agent is reachable on a host-local port — from your
-host and this VM only, not the network. Code in the sandbox can *use* your keys to
-authenticate (it cannot read them). Leave this off for untrusted work.
+**Security:** while the VM runs, the agent is reachable on a TCP port on the host's
+`127.0.0.1`. The network can't reach it, but any local process can, whatever user it runs
+as, including containers on the host network and other sandbox VMs (they reach the host's
+loopback the same way). Code in the sandbox, or in any of those, can *use* your keys to
+authenticate (it cannot read them). Leave this off for untrusted work and on shared hosts.
 
 ### GPG (signed commits)
 
@@ -277,10 +280,15 @@ claude-profile personal
 
 The sandbox gets a fresh GNUPGHOME seeded with your **public keys** (`gpg --export`) plus a
 bridge to your gpg-agent's restricted `S.gpg-agent.extra` socket. Signing happens on the
-host, so your secret keys (or smartcard) never enter the VM and you get the usual PIN/touch
-prompt. Your `~/.gitconfig` is mounted read-only too, so `commit.gpgsign` and
-`user.signingkey` apply. Note: `gpg --list-secret-keys` looks empty inside the VM (the
-restricted socket hides key listing) — that's expected; signing still works.
+host, so your secret keys (or smartcard) never enter the VM. gpg-agent applies your usual
+PIN and touch policy: with the PIN cached and no touch requirement, the sandbox can sign
+without any prompt. The restricted socket also allows decryption, so the sandbox can
+decrypt data encrypted to your keys, and like the SSH bridge its port is reachable by any
+local process while the VM runs. Your `~/.gitconfig` is mounted read-only too, so
+`commit.gpgsign` and `user.signingkey` apply when they are set in that file; files it pulls
+in with `include` or `includeIf` are not mounted. Note: `gpg --list-secret-keys` looks empty
+inside the VM (the restricted socket hides key listing) — that's expected; signing still
+works.
 
 ### Clipboard (image paste)
 
@@ -433,6 +441,22 @@ A microVM raises the bar considerably but is not a perfect boundary. Networking 
 network egress — and the agent can read the profile credentials mounted into the VM. For
 genuinely untrusted code, prefer a full or cloud VM. This is based on the Fedora Magazine
 article [Sandbox AI coding agents with microVMs on Fedora Linux](https://fedoramagazine.org/sandbox-ai-coding-agents-with-microvms-on-fedora-linux/).
+
+What else the VM can reach:
+
+- **Writable state the host trusts later.** The profile directory and the working tree are
+  mounted read-write, so the agent can change files that run on the host afterwards. In the
+  profile: `.claude.json` (MCP server commands), `.env`, `statusline.sh` and, unless the
+  sandbox overlays it, `settings.json` (hooks), all of which apply to a host launch of the
+  same profile (`CLAUDE_PROFILE_SANDBOX=0`). In the repo: git hooks, `.git/config` and
+  `.claude/` settings, which apply the next time you run git or claude there on the host.
+  Check changes to these before using them on the host, or keep a sandboxed profile
+  sandbox-only.
+- **MCP config above the working directory.** Ancestor `.mcp.json` files (often
+  `~/.mcp.json`) are mounted read-only, so any API keys in them are readable in the VM.
+- **The host's loopback.** When a bridge or a loopback hook is active, the VM runs with
+  `--map-host-loopback`, which reaches every service listening on the host's `127.0.0.1`,
+  not only the bridges.
 
 ## Configuration
 

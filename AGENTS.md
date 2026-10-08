@@ -131,7 +131,8 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   host-oriented deny rules; `deny` wins even under `--dangerously-skip-permissions`, so a blanket
   `Bash(sudo *)` deny blocks the sandbox's own scoped `sudo dnf`/`sudo podman`.
   `_sandbox_settings_overlay` writes `settings.sandbox.json` (the profile settings with any deny
-  matching `SANDBOX_STRIP_DENY_PREFIXES` — currently `Bash(sudo` — removed) and `_sandbox_mounts`
+  matching `SANDBOX_STRIP_DENY_PREFIXES` — `Bash(sudo`, `Read(~/.ssh`, `Edit(~/.ssh` and
+  `Read(~/.aws` — removed) and `_sandbox_mounts`
   bind-mounts it over `settings.json` **inside the VM only**, read-write so in-VM setting writes
   hit the throwaway overlay (regenerated each launch), not the real profile settings. Host launches
   are untouched and keep the sudo deny.
