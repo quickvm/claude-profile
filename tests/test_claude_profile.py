@@ -71,6 +71,9 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     # Default the host-claude probe to "not a native install" so tests never read (or
     # copy) the developer's real claude binary. Tests for that path set it themselves.
     monkeypatch.setattr(claude_profile, "_host_claude_binary", lambda: None)
+    # A podman nobody can find, so a launch that a test forgot to stub fails fast
+    # instead of booting a real microVM on the developer's machine.
+    monkeypatch.setattr(claude_profile.settings, "podman_bin", "podman-stub-me")
 
 
 # ---------------------------------------------------------------------------
