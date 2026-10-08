@@ -3451,6 +3451,17 @@ def test_with_forwarded_env_skips_missing(monkeypatch: pytest.MonkeyPatch) -> No
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "value_args",
+    [["-e", "API_URL=https://api.example.com/v1"], ["-v", "cache:/data"]],
+)
+def test_image_ref_from_args_skips_option_values(value_args: list[str]) -> None:
+    # These values have a "/" and a ":" before it, so they were taken for the image and
+    # sandbox-cache tried to pull them.
+    args = ["run", "-i", "--rm", *value_args, "ghcr.io/org/img:1", "stdio"]
+    assert claude_profile._image_ref_from_args(args) == "ghcr.io/org/img:1"
+
+
 def test_image_ref_from_args_picks_registry_ref() -> None:
     f = claude_profile._image_ref_from_args
     assert (

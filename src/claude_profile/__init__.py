@@ -481,15 +481,48 @@ def _image_cache_dir() -> Path:
     return _data_dir() / "image-store"
 
 
+# podman/docker run options that take the next arg as their value (see
+# _image_ref_from_args).
+RUN_VALUE_FLAGS: frozenset[str] = frozenset(
+    {
+        "-e",
+        "--env",
+        "--env-file",
+        "-v",
+        "--volume",
+        "--mount",
+        "-w",
+        "--workdir",
+        "--name",
+        "--network",
+        "--entrypoint",
+        "-p",
+        "--publish",
+        "-l",
+        "--label",
+        "-u",
+        "--user",
+    }
+)
+
+
 def _image_ref_from_args(args: list) -> Optional[str]:
     """Pick the container image ref out of a podman/docker ``run`` arg list.
 
-    The image is the first arg that is not a flag or path and whose first path segment
-    looks like a registry host (has a ``.`` or ``:``), which distinguishes a
-    fully-qualified ref like ``ghcr.io/o/i:tag`` from ``-v``/``-e`` flag values.
+    The image is the first arg that is not a flag, a flag's value or a path, and whose
+    first path segment looks like a registry host (has a ``.`` or ``:``), as in a
+    fully-qualified ref like ``ghcr.io/o/i:tag``. Values of RUN_VALUE_FLAGS are skipped
+    because they can look the same (``-e URL=https://h/x``, ``-v cache:/data``).
     """
+    skip_value = False
     for arg in args:
-        if not isinstance(arg, str) or arg.startswith(("-", "/")) or "/" not in arg:
+        if skip_value or not isinstance(arg, str):
+            skip_value = False
+            continue
+        if arg in RUN_VALUE_FLAGS:
+            skip_value = True
+            continue
+        if arg.startswith(("-", "/")) or "/" not in arg:
             continue
         host = arg.split("/", 1)[0]
         if "." in host or ":" in host:
