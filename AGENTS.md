@@ -317,7 +317,8 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   missing/failed token warns and continues (gh stays unauthenticated). The token grants the
   sandbox whatever the login's scopes allow, so it is opt-in.
 - **Infisical (`sandbox_infisical`):** the image bakes the `infisical` CLI; `sandbox_infisical` is
-  an allowlist (comma-separated emails or domain substrings) of infisical logins to forward. The
+  an allowlist (comma-separated exact emails, or domains matching the email's domain or the
+  login's host and their subdomains) of infisical logins to forward. The
   CLI stores each login as a JSON `UserCredentials` blob in the OS keyring (service `infisical-cli`,
   keyed by email), which a microVM can't reach. `_infisical_logins()` matches the allowlist against
   the host's `~/.infisical/infisical-config.json` `loggedInUsers`, reads each match's token from the

@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     sandbox_chrome: bool = Field(default=False)
     sandbox_gh: bool = Field(default=False)
     # Allowlist of infisical logins to forward into the sandbox: comma-separated
-    # emails or domain substrings (e.g. "corp.example,quickvm.com"). Empty = disabled.
+    # emails or domains (e.g. "corp.example,quickvm.com"). Empty = disabled.
     sandbox_infisical: str = Field(default="")
     sandbox_pulumi: bool = Field(default=False)
     # Comma-separated names of host env vars to copy into the sandbox (e.g. tokens that
@@ -1982,17 +1982,26 @@ def _infisical_config() -> dict:
 
 
 def _infisical_login_matches(entry: str, user: dict) -> bool:
-    """True if an allowlist entry matches a login by email or domain substring."""
+    """True if an allowlist entry names this login.
+
+    An entry with an @ must equal the login's email. Any other entry is a domain that
+    must equal, or be a parent of, the email's domain or the login's Infisical host.
+    Matching substrings forwarded tokens for logins the user never named (bob@ also
+    picked up jimbob@).
+    """
     email = (user.get("email") or "").lower()
-    domain = (user.get("domain") or "").lower()
-    return entry == email or entry in email or entry in domain
+    if "@" in entry:
+        return entry == email
+    host = (urlsplit(user.get("domain") or "").hostname or "").lower()
+    names = [name for name in (email.rpartition("@")[2], host) if name]
+    return any(name == entry or name.endswith(f".{entry}") for name in names)
 
 
 def _infisical_logins() -> list[_InfisicalLogin]:
     """Resolve the allowlisted, still-valid infisical logins to forward.
 
-    ``sandbox_infisical`` is a comma-separated allowlist of emails or domain
-    substrings. Each entry is matched against the host's logged-in infisical users;
+    ``sandbox_infisical`` is a comma-separated allowlist of emails or domains (see
+    _infisical_login_matches). Each entry is matched against the host's logged-in users;
     matches whose keyring token is live are returned. Entries matching nothing, and
     matched logins whose token has expired, are warned about and skipped.
     """

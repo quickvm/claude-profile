@@ -3015,6 +3015,16 @@ def test_infisical_login_matches() -> None:
     assert claude_profile._infisical_login_matches("corp.example", user) is False
 
 
+@pytest.mark.parametrize("entry", ["bob@corp.example", "bob", "orp.example"])
+def test_infisical_login_matches_no_partial_names(entry: str) -> None:
+    # Substring matching forwarded tokens for logins the user never named.
+    jimbob = {
+        "email": "jimbob@corp.example",
+        "domain": "https://secrets.corp.example/api",
+    }
+    assert claude_profile._infisical_login_matches(entry, jimbob) is False
+
+
 def test_infisical_logins_allowlist_and_active(monkeypatch: pytest.MonkeyPatch) -> None:
     _setup_infisical(
         monkeypatch,

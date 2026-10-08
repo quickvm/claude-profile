@@ -341,7 +341,8 @@ your real GitHub account.
 ### Infisical
 
 The image ships the `infisical` CLI. To let the agent read your secrets, allowlist which of your
-infisical logins to forward — by email or a domain substring, comma-separated:
+infisical logins to forward — by exact email, or by domain (which also covers its
+subdomains), comma-separated:
 
 ```sh
 export CLAUDE_PROFILE_SANDBOX_INFISICAL="corp.example,quickvm.com"
