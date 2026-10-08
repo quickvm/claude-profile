@@ -176,7 +176,10 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   `GNUPGHOME/S.gpg-agent` and seeding a fresh GNUPGHOME with the host's public keys
   (`gpg --export`, base64 via env, imported by `entrypoint.sh`). Signing runs on the host,
   so secret keys/smartcard never enter the VM. `_sandbox_mounts` also bind-mounts
-  `~/.gitconfig` read-only so signing config applies. `_Forwarding` carries
+  `~/.gitconfig` read-only so signing config applies. Its `include`/`includeIf` files are not
+  mounted, and a `gitdir:~/` condition could not match in the VM anyway (`~` is
+  /home/appuser there), so `_git_identity_env` resolves `GIT_IDENTITY_KEYS` for the CWD on
+  the host and passes them through `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n`. `_Forwarding` carries
   `(host_socket, guest_path, port)` tuples shared by both SSH and GPG plus a
   `clipboard_port` for the clipboard bridge; `active()` reports whether any host bridge is
   needed. The in-VM env (`CLAUDE_SANDBOX_FORWARDS`, `SSH_AUTH_SOCK`, `GNUPGHOME`,

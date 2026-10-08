@@ -114,6 +114,13 @@ SANDBOX_STRIP_DENY_PREFIXES: tuple[str, ...] = (
 # podman's default host.containers.internal address under pasta; mapping it to the
 # host loopback lets the agent bridge bind to 127.0.0.1 instead of all interfaces.
 SANDBOX_HOST_LOOPBACK = "169.254.1.2"
+# Git settings resolved on the host and passed into the VM (see _git_identity_env).
+GIT_IDENTITY_KEYS: tuple[str, ...] = (
+    "user.name",
+    "user.email",
+    "user.signingkey",
+    "commit.gpgsign",
+)
 # Settings every profile gets (e.g. hooks), in the profiles base and passed to each launch
 # with --settings; "{profile}" in any string becomes the profile name.
 SHARED_SETTINGS = "shared-settings.json"
@@ -1286,6 +1293,7 @@ def _build_sandbox_argv(
         "-e",
         "COLORTERM",
     ]
+    argv += _git_identity_env(cwd)
     if _host_claude_binary() is not None:
         # The VM runs the host's binary from a read-only mount and is thrown away at
         # exit, so an in-VM self-update would download a release only to discard it —
@@ -1311,6 +1319,36 @@ def _build_sandbox_argv(
             SANDBOX_BRIEFING + _infisical_briefing(extra_env),
         ]
     return argv + args
+
+
+def _git_identity_env(cwd: Path) -> list[str]:
+    """``-e`` args carrying the git identity and signing settings in effect for cwd.
+
+    Only ~/.gitconfig is mounted into the VM. The files it pulls in with include or
+    includeIf are not, and an ``includeIf "gitdir:~/..."`` would not match there anyway
+    (``~`` is /home/appuser in the VM), so sandbox commits fell back to the default
+    identity. Resolve GIT_IDENTITY_KEYS on the host as git would for cwd, and pass them
+    in through git's GIT_CONFIG_COUNT/KEY/VALUE environment.
+    """
+    values: dict[str, str] = {}
+    for key in GIT_IDENTITY_KEYS:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(cwd), "config", "--get", key],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            return []
+        if result.returncode == 0:
+            values[key] = result.stdout.rstrip("\n")
+    if not values:
+        return []
+    env = ["-e", f"GIT_CONFIG_COUNT={len(values)}"]
+    for index, (key, value) in enumerate(values.items()):
+        env += ["-e", f"GIT_CONFIG_KEY_{index}={key}"]
+        env += ["-e", f"GIT_CONFIG_VALUE_{index}={value}"]
+    return env
 
 
 def _secret_env_file(env: dict[str, str]) -> str:

@@ -78,6 +78,9 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     # A podman nobody can find, so a launch that a test forgot to stub fails fast
     # instead of booting a real microVM on the developer's machine.
     monkeypatch.setattr(claude_profile.settings, "podman_bin", "podman-stub-me")
+    # Default the git identity probe to none, so launch tests never read the
+    # developer's git config. The identity tests use the git_identity fixture.
+    monkeypatch.setattr(claude_profile, "_git_identity_env", lambda cwd: [])
 
 
 # ---------------------------------------------------------------------------
@@ -1273,6 +1276,59 @@ def test_argv_env_value_with_newline_fails_without_echoing_it(
     err = capsys.readouterr().err
     assert "TOKEN" in err
     assert "secret-tail" not in err
+
+
+_REAL_GIT_IDENTITY_ENV = claude_profile._git_identity_env
+
+
+@pytest.fixture()
+def git_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Run the real git identity probe against an isolated global git config."""
+    monkeypatch.setattr(claude_profile, "_git_identity_env", _REAL_GIT_IDENTITY_ENV)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    global_config = tmp_path / "gitconfig"
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    return global_config
+
+
+def _git_config_env(argv: list[str]) -> dict[str, str]:
+    """The git config entries passed into the VM through GIT_CONFIG_COUNT/KEY/VALUE."""
+    pairs = [argv[i + 1] for i, arg in enumerate(argv) if arg == "-e"]
+    env = dict(pair.split("=", 1) for pair in pairs if "=" in pair)
+    count = int(env.get("GIT_CONFIG_COUNT", "0"))
+    return {
+        env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(count)
+    }
+
+
+def test_argv_carries_the_git_identity_resolved_for_the_cwd(
+    git_identity: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Only ~/.gitconfig is mounted, so identity it pulls in through includeIf must be
+    # resolved on the host or sandbox commits get the default identity.
+    repo = tmp_path / "work"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    work_config = tmp_path / "gitconfig-work"
+    work_config.write_text(
+        "[user]\n\temail = alice@corp.example\n\tsigningkey = 0xC0FFEE\n"
+    )
+    git_identity.write_text(
+        "[user]\n\tname = Alice Example\n\temail = alice@home.example\n"
+        f'[includeIf "gitdir:{repo}/"]\n\tpath = {work_config}\n'
+        "[commit]\n\tgpgsign = true\n"
+    )
+    assert _git_config_env(_make_argv(monkeypatch, tmp_path, [])) == {
+        "user.name": "Alice Example",
+        "user.email": "alice@corp.example",
+        "user.signingkey": "0xC0FFEE",
+        "commit.gpgsign": "true",
+    }
+
+
+def test_argv_without_git_identity_sets_no_git_config(
+    git_identity: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    assert _git_config_env(_make_argv(monkeypatch, tmp_path, [])) == {}
 
 
 def test_argv_without_env_vars_has_no_env_file(
