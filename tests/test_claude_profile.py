@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import textwrap
 import time
 from pathlib import Path
 from typing import Any, Generator
@@ -1893,16 +1896,95 @@ def test_launch_supervised_when_forwarding(
     monkeypatch.setattr(claude_profile, "_start_host_bridge", fake_bridge)
     monkeypatch.chdir(tmp_path)
     with (
-        patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run,
+        patch("subprocess.Popen") as popen,
         patch("os.execvpe") as mock_exec,
         pytest.raises(SystemExit) as exc_info,
     ):
+        popen.return_value.wait.return_value = 0
         _launch_profile("work", [])
     assert exc_info.value.code == 0
     mock_exec.assert_not_called()
-    run.assert_called_once()
-    assert any(arg.startswith("--network=pasta") for arg in run.call_args[0][0])
+    popen.assert_called_once()
+    assert any(arg.startswith("--network=pasta") for arg in popen.call_args[0][0])
     assert started == [(sock, 1234)]
+
+
+SUPERVISOR_HARNESS = textwrap.dedent(
+    """
+    import pathlib, shutil, subprocess, sys
+    import claude_profile
+
+    bridge_pid, vm_pid = sys.argv[1], sys.argv[2]
+
+    def fake_bridge(host, port):
+        proc = subprocess.Popen(["sleep", "300"])
+        pathlib.Path(bridge_pid).write_text(str(proc.pid))
+        return proc
+
+    claude_profile._start_host_bridge = fake_bridge
+    claude_profile._build_sandbox_argv = lambda *args, **kwargs: [
+        "sh", "-c", f"echo $$ > {vm_pid}; exec sleep 300"
+    ]
+    shutil.which = lambda name: "/usr/bin/" + name
+    sock = pathlib.Path("/run/agent.sock")
+    claude_profile._run_sandbox_supervised(
+        pathlib.Path("/profile"),
+        pathlib.Path("/cwd"),
+        [],
+        {},
+        claude_profile._Forwarding([(sock, sock, 1)]),
+    )
+    """
+)
+
+
+def _proc_state(pid: int) -> str:
+    """The /proc state letter of pid, or "" once it is gone."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (FileNotFoundError, ProcessLookupError):
+        return ""
+
+
+def _catches(pid: int, signum: int) -> bool:
+    """True once pid has installed a handler for signum (its SigCgt mask)."""
+    for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+        if line.startswith("SigCgt:"):
+            return bool(int(line.split()[1], 16) & (1 << (signum - 1)))
+    return False
+
+
+def _poll(condition: Any, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+def test_supervised_launch_stops_bridges_on_signal(tmp_path: Path, signum: int) -> None:
+    # Closing the terminal sends SIGHUP; `kill` and systemd send SIGTERM. Either must
+    # still tear the host bridges down, or they leave the forwarded agents reachable on
+    # host ports after the session is gone.
+    bridge_pid, vm_pid = tmp_path / "bridge.pid", tmp_path / "vm.pid"
+    launcher = subprocess.Popen(
+        [sys.executable, "-c", SUPERVISOR_HARNESS, str(bridge_pid), str(vm_pid)]
+    )
+    try:
+        assert _poll(lambda: vm_pid.exists() and vm_pid.read_text().strip(), 10)
+        _poll(lambda: _catches(launcher.pid, signum), 3)
+        launcher.send_signal(signum)
+        # The VM stand-in dies from the forwarded signal: exit 128+N, as a shell would.
+        assert launcher.wait(timeout=10) == 128 + signum
+        bridge = int(bridge_pid.read_text())
+        assert _poll(lambda: _proc_state(bridge) in ("", "Z"), 5)
+    finally:
+        launcher.kill()
+        for pidfile in (bridge_pid, vm_pid):
+            with contextlib.suppress(ValueError, OSError):
+                os.kill(int(pidfile.read_text()), signal.SIGKILL)
 
 
 def test_launch_agent_no_socat_exits(
@@ -2018,15 +2100,16 @@ def test_launch_supervised_clipboard_only(
     )
     monkeypatch.chdir(tmp_path)
     with (
-        patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run,
+        patch("subprocess.Popen") as popen,
         patch("os.execvpe") as mock_exec,
         pytest.raises(SystemExit) as exc_info,
     ):
+        popen.return_value.wait.return_value = 0
         _launch_profile("work", [])
     assert exc_info.value.code == 0
     mock_exec.assert_not_called()
-    run.assert_called_once()
-    assert any(arg.startswith("--network=pasta") for arg in run.call_args[0][0])
+    popen.assert_called_once()
+    assert any(arg.startswith("--network=pasta") for arg in popen.call_args[0][0])
     assert clip_ports == [7777]
     assert host_bridges == []
 
@@ -2348,15 +2431,16 @@ def test_launch_supervised_chrome_only(
     )
     monkeypatch.chdir(tmp_path)
     with (
-        patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run,
+        patch("subprocess.Popen") as popen,
         patch("os.execvpe") as mock_exec,
         pytest.raises(SystemExit) as exc_info,
     ):
+        popen.return_value.wait.return_value = 0
         _launch_profile("work", [])
     assert exc_info.value.code == 0
     mock_exec.assert_not_called()
-    run.assert_called_once()
-    argv = run.call_args[0][0]
+    popen.assert_called_once()
+    argv = popen.call_args[0][0]
     assert any(arg.startswith("--network=pasta") for arg in argv)
     assert f"{claude_profile.SANDBOX_BROWSER_OPEN_PORT_ENV}=9999" in argv
     assert browser_ports == [8888]

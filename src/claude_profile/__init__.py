@@ -7,6 +7,7 @@ import json
 import os
 import pwd
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -2006,11 +2007,35 @@ def _run_sandbox_supervised(
         bridges.append(_start_browser_open_host_bridge(forwarding.browser_open_port))
     argv = _build_sandbox_argv(profile_dir, cwd, claude_args, extra_env, forwarding)
     try:
-        result = subprocess.run(argv, env=os.environ.copy())
+        returncode = _wait_forwarding_signals(
+            subprocess.Popen(argv, env=os.environ.copy())
+        )
     finally:
         for bridge in bridges:
             bridge.terminate()
-    sys.exit(result.returncode)
+    sys.exit(128 - returncode if returncode < 0 else returncode)
+
+
+def _wait_forwarding_signals(proc: subprocess.Popen[bytes]) -> int:
+    """Wait for proc, passing SIGTERM and SIGHUP on to it rather than dying from them.
+
+    Both signals kill this process outright by default, which skips the caller's
+    cleanup and leaves the host bridges listening after the session has ended; closing
+    the terminal window is enough to send SIGHUP. Forwarding them lets podman stop the
+    VM and exit normally, so the caller's ``finally`` still runs.
+    """
+
+    def forward(signum: int, _frame: object) -> None:
+        proc.send_signal(signum)
+
+    previous = {
+        sig: signal.signal(sig, forward) for sig in (signal.SIGTERM, signal.SIGHUP)
+    }
+    try:
+        return proc.wait()
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def _sandbox_enabled(profile_dir: Path) -> bool:

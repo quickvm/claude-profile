@@ -155,7 +155,9 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   runs a host `socat` (TCP on 127.0.0.1 → the agent socket), and
   `--network=pasta:--map-host-loopback,…` lets the guest reach it; `entrypoint.sh` starts a
   guest `socat` per forward and sets `SSH_AUTH_SOCK`. Because the bridges need teardown,
-  this path supervises podman (`_run_sandbox_supervised`) instead of `execvpe`.
+  this path supervises podman (`_run_sandbox_supervised`) instead of `execvpe`. While it
+  waits, SIGTERM and SIGHUP are passed on to podman (`_wait_forwarding_signals`) rather than
+  killing the launcher, so the teardown still runs when the terminal window is closed.
 - **known_hosts persistence:** `_sandbox_mounts` mounts the host's `~/.ssh/known_hosts`
   read-only as the VM's *global* known_hosts (`/etc/ssh/ssh_known_hosts`, for verification)
   and a per-profile writable `known_hosts` (`_sandbox_known_hosts`) as the *user* file, so
