@@ -42,9 +42,11 @@ claude-profile <name> [args...]      # launch claude with the given profile
 
 ### Creating a profile
 
-`add` copies `settings.json`, `statusline.sh`, and `CLAUDE.md` from `~/.claude` into the new
-profile directory, then prompts whether to symlink `commands/` and `skills/` to your global
-`~/.claude` directories (default: yes). Decline to keep those directories isolated per profile.
+`add` copies `settings.json` and `CLAUDE.md` from `~/.claude` into the new profile directory
+and symlinks `statusline.sh` to `~/.claude/statusline.sh`, so every profile, sandboxed or
+not, runs the one status line script. It then prompts whether to symlink `commands/` and
+`skills/` to your global `~/.claude` directories (default: yes). Decline to keep those
+directories isolated per profile.
 
 ```sh
 claude-profile add work
@@ -196,9 +198,9 @@ The launcher mounts the current directory at its real path, plus the repo's git 
 dir when it lives outside the worktree, so `git` and `wt` work inside the VM and each
 worktree keeps its own session history. A profile's credentials and config are shared
 across its VMs, just as they already are across host terminals. If the profile links
-`commands`/`skills` to your global `~/.claude`, those targets are mounted **read-only**
-into the VM so the links resolve there too, as is your `~/.gitconfig` (so git identity and
-signing config apply).
+`commands`, `skills` or `statusline.sh` to your global `~/.claude`, those targets are
+mounted **read-only** into the VM so the links resolve there too, as is your `~/.gitconfig`
+(so git identity and signing config apply).
 
 ### Turning sandbox mode on or off
 

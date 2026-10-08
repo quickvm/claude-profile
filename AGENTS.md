@@ -84,9 +84,15 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   immutable). `_build_sandbox_argv` also sets `DISABLE_AUTOUPDATER=1` when the mount is
   present: the VM is ephemeral, so an in-VM update would download a release only to
   discard it, and would move the session off the host's version mid-run.
-- **Linked commands/skills:** `_linked_dir_mounts()` bind-mounts the real target of any
-  symlinked `LINKABLE_DIRS` (e.g. `skills` → `~/.claude/skills`) read-only at the link's
-  path, so the symlink resolves inside the VM without exposing the global dir writable.
+- **Linked commands/skills/statusline:** `_linked_mounts()` bind-mounts the real target of
+  any symlinked `LINKABLE_DIRS` entry or `STATUSLINE_FILE` (e.g. `skills` →
+  `~/.claude/skills`) read-only at the link's path, so the symlink resolves inside the VM
+  without exposing the global target writable. `add` symlinks `statusline.sh` rather than
+  copying it: settings run `~/.claude/statusline.sh`, which inside the VM is the *profile's*
+  file (there `~/.claude` is the profile dir), so a copy silently drifted from the host's
+  global script. Mounting the global script straight over that path instead would leave an
+  empty `statusline.sh` in the host profile dir whenever none exists there, because podman
+  creates a missing bind-mount target.
 - **Non-root entrypoint is mandatory:** krun boots the VM as root and ignores the
   image `USER`; claude refuses `--dangerously-skip-permissions` as root, so
   `entrypoint.sh` drops to a host-UID user (`runuser`) before exec'ing claude. Sandbox

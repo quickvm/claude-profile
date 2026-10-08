@@ -57,6 +57,9 @@ console = Console()
 err_console = Console(stderr=True)
 
 LINKABLE_DIRS: tuple[str, ...] = ("commands", "skills")
+# Symlinked into each profile rather than copied: the sandbox reaches it through the
+# profile dir, and a copy goes stale the moment the global script changes.
+STATUSLINE_FILE = "statusline.sh"
 SANDBOX_MARKER = ".sandbox"
 SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 SANDBOX_CONFIG_DIR = "/home/appuser/.claude"
@@ -248,15 +251,13 @@ def add_profile(
         raise typer.Exit(code=1)
     d.mkdir(parents=True)
     claude_dir = Path.home() / ".claude"
-    for fname in ("statusline.sh", "settings.json"):
+    for fname in ("settings.json", "CLAUDE.md"):
         src = claude_dir / fname
-        dst = d / fname
-        if src.exists() and not dst.exists():
-            shutil.copy2(src, dst)
-    claude_md = claude_dir / "CLAUDE.md"
-    dst_md = d / "CLAUDE.md"
-    if claude_md.exists() and not dst_md.exists():
-        shutil.copy2(claude_md, dst_md)
+        if src.exists():
+            shutil.copy2(src, d / fname)
+    statusline = claude_dir / STATUSLINE_FILE
+    if statusline.exists():
+        (d / STATUSLINE_FILE).symlink_to(statusline)
 
     for dir_name in LINKABLE_DIRS:
         link = typer.confirm(
@@ -1169,23 +1170,23 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
         mounts += ["-v", f"{host_claude}:{SANDBOX_HOST_CLAUDE}:ro,z"]
     mounts += _mcp_json_mounts(cwd)
     mounts += _ca_trust_mounts()
-    mounts += _linked_dir_mounts(profile_dir)
+    mounts += _linked_mounts(profile_dir)
     mounts += _image_cache_mounts(profile_dir)
     return mounts
 
 
-def _linked_dir_mounts(profile_dir: Path) -> list[str]:
-    """Read-only mounts for any LINKABLE_DIRS the profile symlinks to global dirs.
+def _linked_mounts(profile_dir: Path) -> list[str]:
+    """Read-only mounts for the profile entries symlinked into the global ~/.claude.
 
-    The profile dir is mounted as the in-VM config dir, but a symlinked
-    commands/skills points at an absolute host path (e.g. ~/.claude/skills) that is
-    not otherwise mounted, so the link dangles inside the VM. Mount the real target
-    at the link's path, read-only so a sandboxed agent cannot modify dirs shared
-    across every profile.
+    The profile dir is mounted as the in-VM config dir, but a symlinked commands/,
+    skills/ or statusline.sh points at an absolute host path (e.g. ~/.claude/skills)
+    that is not otherwise mounted, so the link dangles inside the VM. Mount the real
+    target at the link's path, read-only so a sandboxed agent cannot modify what every
+    profile shares.
     """
     mounts: list[str] = []
-    for dir_name in LINKABLE_DIRS:
-        link = profile_dir / dir_name
+    for name in (*LINKABLE_DIRS, STATUSLINE_FILE):
+        link = profile_dir / name
         if not link.is_symlink():
             continue
         target = Path(os.readlink(link))

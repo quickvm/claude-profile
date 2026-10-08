@@ -136,7 +136,6 @@ def test_add_copies_files_from_claude_dir(profiles_base: Path, fake_home: Path) 
     claude_dir = fake_home / ".claude"
     claude_dir.mkdir()
     (claude_dir / "settings.json").write_text('{"theme": "dark"}')
-    (claude_dir / "statusline.sh").write_text("#!/bin/sh\necho ok")
     (claude_dir / "CLAUDE.md").write_text("# instructions")
 
     # Answer n to both link prompts (no global dirs exist)
@@ -144,8 +143,23 @@ def test_add_copies_files_from_claude_dir(profiles_base: Path, fake_home: Path) 
 
     profile = profiles_base / "work"
     assert (profile / "settings.json").read_text() == '{"theme": "dark"}'
-    assert (profile / "statusline.sh").read_text() == "#!/bin/sh\necho ok"
     assert (profile / "CLAUDE.md").read_text() == "# instructions"
+
+
+def test_add_links_statusline_to_global(profiles_base: Path, fake_home: Path) -> None:
+    claude_dir = fake_home / ".claude"
+    claude_dir.mkdir()
+    global_statusline = claude_dir / "statusline.sh"
+    global_statusline.write_text("#!/bin/sh\necho ok")
+
+    runner.invoke(app, ["add", "work"], input="n\nn\n")
+
+    profile_statusline = profiles_base / "work" / "statusline.sh"
+    assert profile_statusline.is_symlink()
+    assert profile_statusline.readlink() == global_statusline
+    # An edit to the global script is what the profile runs.
+    global_statusline.write_text("#!/bin/sh\necho edited")
+    assert profile_statusline.read_text() == "#!/bin/sh\necho edited"
 
 
 def test_add_skips_missing_source_files(profiles_base: Path, fake_home: Path) -> None:
@@ -154,6 +168,8 @@ def test_add_skips_missing_source_files(profiles_base: Path, fake_home: Path) ->
     assert result.exit_code == 0
     profile = profiles_base / "work"
     assert not (profile / "settings.json").exists()
+    # is_symlink too: exists() is False for a dangling link.
+    assert not (profile / "statusline.sh").is_symlink()
     assert not (profile / "statusline.sh").exists()
     assert not (profile / "CLAUDE.md").exists()
 
@@ -1464,7 +1480,7 @@ def test_override_forces_sandbox_without_marker(
 
 
 # ---------------------------------------------------------------------------
-# linked commands/skills read-only mounts
+# linked commands/skills/statusline read-only mounts
 # ---------------------------------------------------------------------------
 
 
@@ -1525,6 +1541,35 @@ def test_linked_dir_symlink_chain_mounts_real_at_target(
     mounts = _sandbox_mounts(profile, cwd)
     # real content mounted at the link's immediate (absolute) target
     assert f"{canonical}:{intermediate}:ro,z" in mounts
+
+
+def test_linked_statusline_mounted_at_link_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    global_statusline = tmp_path / "global" / "statusline.sh"
+    global_statusline.parent.mkdir()
+    global_statusline.write_text("#!/bin/sh\necho ok")
+    (profile / "statusline.sh").symlink_to(global_statusline)
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    assert f"{global_statusline}:{global_statusline}:ro,z" in mounts
+
+
+def test_copied_statusline_not_mounted(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    (profile / "statusline.sh").write_text("#!/bin/sh\necho own copy")
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    assert all("ro,z" not in m for m in mounts)
 
 
 def test_sandbox_mounts_includes_gitconfig(
