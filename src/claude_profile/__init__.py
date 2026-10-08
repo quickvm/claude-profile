@@ -748,25 +748,28 @@ def manage_env(
         _show_env_table(name, existing)
         return
 
-    if set_var:
-        for entry in set_var:
-            if "=" not in entry:
-                err_console.print(
-                    f"[red]Error: '{entry}' is not valid. Use KEY=VALUE.[/red]"
-                )
-                raise typer.Exit(code=1)
-            key, _, value = entry.partition("=")
-            existing[key.strip()] = value.strip()
-
-    if unset_var:
-        for key in unset_var:
-            if key not in existing:
-                err_console.print(f"[yellow]Warning: '{key}' is not set.[/yellow]")
-                continue
-            del existing[key]
-
+    _apply_env_changes(existing, set_var or [], unset_var or [])
     _write_env_file(env_file, existing)
     console.print(f"[green]Updated .env for profile '{name}'.[/green]")
+
+
+def _apply_env_changes(
+    env_vars: dict[str, str], set_var: list[str], unset_var: list[str]
+) -> None:
+    """Apply ``--set KEY=VALUE`` and ``--unset KEY`` entries to env_vars in place."""
+    for entry in set_var:
+        if "=" not in entry:
+            err_console.print(
+                f"[red]Error: '{entry}' is not valid. Use KEY=VALUE.[/red]"
+            )
+            raise typer.Exit(code=1)
+        key, _, value = entry.partition("=")
+        env_vars[key.strip()] = value.strip()
+    for key in unset_var:
+        if key not in env_vars:
+            err_console.print(f"[yellow]Warning: '{key}' is not set.[/yellow]")
+            continue
+        del env_vars[key]
 
 
 def _show_env_table(name: str, env_vars: dict[str, str]) -> None:
