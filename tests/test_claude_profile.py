@@ -1808,6 +1808,13 @@ def test_override_forces_host_despite_marker(
     assert env["CLAUDE_CONFIG_DIR"] == str(p)
 
 
+def test_empty_setting_means_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `CLAUDE_PROFILE_SANDBOX=` (to clear an exported override) failed every command
+    # with a pydantic error at import.
+    monkeypatch.setenv("CLAUDE_PROFILE_SANDBOX", "")
+    assert claude_profile.Settings().sandbox is None
+
+
 def test_override_forces_sandbox_without_marker(
     profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

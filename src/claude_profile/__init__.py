@@ -29,7 +29,11 @@ from rich.table import Table
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="CLAUDE_PROFILE_")
+    # An empty value means unset: `CLAUDE_PROFILE_SANDBOX=` clears an exported override
+    # instead of failing every command on a bool that cannot be parsed.
+    model_config = SettingsConfigDict(
+        env_prefix="CLAUDE_PROFILE_", env_ignore_empty=True
+    )
 
     profiles_base: Path = Field(
         default_factory=lambda: Path.home() / ".claude-profiles"
