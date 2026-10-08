@@ -115,8 +115,10 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
 - **Non-root entrypoint is mandatory:** krun boots the VM as root and ignores the
   image `USER`; claude refuses `--dangerously-skip-permissions` as root, so
   `entrypoint.sh` drops to a host-UID user (`runuser`) before exec'ing claude. Sandbox
-  mode auto-appends that flag unless `sandbox_skip_permissions` is false or the user
-  already passed it.
+  mode adds that flag unless `sandbox_skip_permissions` is false, the user already passed
+  it, or the user passed `--permission-mode` (claude ranks the skip flag above it). The
+  sandbox's own flags (this one, `--chrome`, the briefing) go *before* the user's args, so
+  a subcommand's `--` arguments (`mcp add NAME -- CMD`) never pick them up.
 - **Sandbox settings:** `podman_bin`, `sandbox_image`, `sandbox_ram_mib`, `sandbox_cpus`,
   `sandbox_skip_permissions`, `sandbox_ssh_agent`, `sandbox_gpg_agent`, `sandbox_clipboard`,
   `sandbox_chrome`, `sandbox_gh`, `sandbox_infisical`, `sandbox_pulumi`, `sandbox_forward_env`
@@ -146,10 +148,9 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
 - **Sandbox settings overlay:** the profile's `settings.json` is copied from the host and carries
   host-oriented deny rules; `deny` wins even under `--dangerously-skip-permissions`, so a blanket
   `Bash(sudo *)` deny blocks the sandbox's own scoped `sudo dnf`/`sudo podman`.
-  `_sandbox_settings_overlay` writes `settings.json` in the profile's state dir (the profile
-  settings with any deny
-  matching `SANDBOX_STRIP_DENY_PREFIXES` — `Bash(sudo`, `Read(~/.ssh`, `Edit(~/.ssh` and
-  `Read(~/.aws` — removed) and `_sandbox_mounts`
+  `_sandbox_settings_overlay` writes `settings.json` in the profile's state dir (the
+  profile settings with any deny matching `SANDBOX_STRIP_DENY_PREFIXES` — `Bash(sudo`,
+  `Read(~/.ssh`, `Edit(~/.ssh` and `Read(~/.aws` — removed) and `_sandbox_mounts`
   bind-mounts it over `settings.json` **inside the VM only**, read-write so in-VM setting writes
   hit the throwaway overlay (regenerated each launch), not the real profile settings. Host launches
   are untouched and keep the sudo deny.
@@ -294,7 +295,7 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   bridge does (fix: `CLAUDE_PROFILE_SANDBOX=0 claude-profile <name> /login` for a full OAuth
   login — `_warn_missing_chrome_scope` checks this at launch and points at the fix); and the
   sandbox launch trips `dn()`, which sits ahead of the config default, so `_build_sandbox_argv`
-  auto-appends `--chrome` (checked before `dn()`) whenever `sandbox_chrome` is set. claude separately reports
+  adds `--chrome` (checked before `dn()`) whenever `sandbox_chrome` is set. claude separately reports
   **Extension: Installed** by `readdir`-ing `<chrome-user-data>/<profile>/Extensions/<ext-id>`
   (*not* the native-messaging manifest), which a VM with no Chrome install always fails — so
   `/chrome` showed "Not detected" even with the bridge working. `_chrome_extension_guest_path`

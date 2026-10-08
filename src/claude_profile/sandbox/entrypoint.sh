@@ -12,11 +12,13 @@ if [ "$(id -u)" = "0" ]; then
   # about "no changes" otherwise).
   if [ "$(id -g appuser)" != "$HOST_GID" ]; then
     groupmod -o -g "$HOST_GID" appuser ||
-      echo "warning: could not give appuser GID $HOST_GID; files written to the mounts get the wrong group" >&2
+      echo "warning: could not give appuser GID $HOST_GID;" \
+        "files written to the mounts get the wrong group" >&2
   fi
   if [ "$(id -u appuser)" != "$HOST_UID" ]; then
     usermod -o -u "$HOST_UID" appuser ||
-      echo "warning: could not give appuser UID $HOST_UID; files written to the mounts get the wrong owner" >&2
+      echo "warning: could not give appuser UID $HOST_UID;" \
+        "files written to the mounts get the wrong owner" >&2
   fi
   export HOME=/home/appuser
   # claude-profile mounts the host's own claude binary at /opt/claude-host/claude, so the
