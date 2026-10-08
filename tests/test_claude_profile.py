@@ -1158,6 +1158,19 @@ def test_sandbox_settings_overlay_none_when_no_sudo_deny(tmp_path: Path) -> None
     assert claude_profile._sandbox_settings_overlay(prof) is None
 
 
+def test_sandbox_settings_overlay_warns_when_it_cannot_be_written(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prof = tmp_path / "prof"
+    prof.mkdir()
+    (prof / "settings.json").write_text(
+        json.dumps({"permissions": {"deny": ["Bash(sudo *)"]}})
+    )
+    (prof / "settings.sandbox.json").mkdir()  # writing over a directory fails
+    assert claude_profile._sandbox_settings_overlay(prof) is None
+    assert "deny rules" in " ".join(capsys.readouterr().err.split())
+
+
 def test_sandbox_settings_overlay_none_when_no_settings(tmp_path: Path) -> None:
     prof = tmp_path / "prof"
     prof.mkdir()

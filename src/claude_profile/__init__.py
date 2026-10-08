@@ -895,7 +895,11 @@ def _sandbox_settings_overlay(profile_dir: Path) -> Optional[Path]:
     overlay = profile_dir / "settings.sandbox.json"
     try:
         overlay.write_text(json.dumps(data, indent=2))
-    except OSError:
+    except OSError as exc:
+        err_console.print(
+            f"[yellow]Warning: could not write {overlay} ({exc}), so the profile's "
+            f"deny rules, including Bash(sudo …), stay in force in the sandbox.[/yellow]"
+        )
         return None
     return overlay
 
