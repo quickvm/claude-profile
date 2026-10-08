@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -1104,6 +1105,27 @@ def _host_claude_binary() -> Optional[Path]:
     return binary if os.access(binary, os.X_OK) else None
 
 
+def _stale_claude_copy(entry: Path) -> bool:
+    """Whether a file in the host-claude cache can be deleted.
+
+    Older versions can. A ``.<version>.<pid>.partial`` copy can only once the launch
+    writing it is gone: sandboxes in parallel worktrees start together, and deleting a
+    copy mid-write sent that launch back to the image's own claude.
+    """
+    if not entry.name.endswith(".partial"):
+        return True
+    pid = entry.name.rsplit(".", 2)[-2]
+    if not pid.isdigit():
+        return True
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False  # alive, owned by someone else
+    return False
+
+
 def _sandbox_claude_binary() -> Optional[Path]:
     """Cache the host's Claude Code binary for the VM and return the cached copy.
 
@@ -1130,9 +1152,11 @@ def _sandbox_claude_binary() -> Optional[Path]:
             # truncated binary that later launches would mistake for a complete one.
             shutil.copy(source, partial)
             os.replace(partial, dest)
-        for stale in cache.iterdir():
-            if stale not in (dest, partial):
-                stale.unlink()
+        for entry in cache.iterdir():
+            if entry != dest and _stale_claude_copy(entry):
+                # Another launch may be pruning the same file.
+                with contextlib.suppress(FileNotFoundError):
+                    entry.unlink()
     except OSError as exc:
         err_console.print(
             f"[yellow]Warning: could not cache {source} for the sandbox ({exc}); "
@@ -1387,15 +1411,17 @@ def _build_sandbox_argv(
     argv += _git_identity_mounts(
         cwd, signing=forwarding is not None and forwarding.gpg()
     )
-    if _host_claude_binary() is not None:
-        # The VM runs the host's binary from a read-only mount and is thrown away at
-        # exit, so an in-VM self-update would download a release only to discard it —
-        # and would move the session off the host's version mid-run.
-        argv += ["-e", "DISABLE_AUTOUPDATER=1"]
     argv += _forwarding_env(forwarding)
     if extra_env:
         argv += ["--env-file", _secret_env_file(extra_env)]
-    argv += _sandbox_mounts(profile_dir, cwd)
+    mounts = _sandbox_mounts(profile_dir, cwd)
+    if any(spec.split(":")[1:2] == [SANDBOX_HOST_CLAUDE] for spec in mounts):
+        # The VM runs the host's binary from a read-only mount and is thrown away at
+        # exit, so an in-VM self-update would download a release only to discard it —
+        # and would move the session off the host's version mid-run. Without the mount
+        # (no native install, or the copy failed) the image's claude may update itself.
+        argv += ["-e", "DISABLE_AUTOUPDATER=1"]
+    argv += mounts
     argv += _gpg_pubkeys_mounts(forwarding)
     argv += ["-w", str(cwd), settings.sandbox_image, "claude"]
     args = list(claude_args)

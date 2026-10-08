@@ -1074,11 +1074,40 @@ def test_sandbox_claude_binary_prunes_old_versions(
     cache = tmp_path / "data" / "claude-profile" / "claude"
     cache.mkdir(parents=True)
     (cache / "2.1.100").write_text("old")
-    (cache / ".2.1.100.999.partial").write_text("leftover from a killed launch")
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    (cache / f".2.1.100.{gone.pid}.partial").write_text("leftover from a killed launch")
     binary = _native_install(tmp_path)
     monkeypatch.setattr(claude_profile, "_host_claude_binary", lambda: binary)
     claude_profile._sandbox_claude_binary()
     assert sorted(p.name for p in cache.iterdir()) == ["2.1.220"]
+
+
+def test_sandbox_claude_binary_keeps_a_parallel_launchs_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Worktree sandboxes start together; deleting another launch's half-written copy
+    # made it fall back to the image's claude.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    cache = tmp_path / "data" / "claude-profile" / "claude"
+    cache.mkdir(parents=True)
+    in_progress = cache / f".2.1.220.{os.getppid()}.partial"
+    in_progress.write_text("still being copied")
+    binary = _native_install(tmp_path)
+    monkeypatch.setattr(claude_profile, "_host_claude_binary", lambda: binary)
+    claude_profile._sandbox_claude_binary()
+    assert in_progress.exists()
+
+
+def test_argv_keeps_autoupdater_when_the_host_claude_is_not_mounted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The copy failed, so the VM runs the image's claude: let it update itself.
+    binary = _native_install(tmp_path)
+    monkeypatch.setattr(claude_profile, "_host_claude_binary", lambda: binary)
+    monkeypatch.setattr(claude_profile, "_sandbox_claude_binary", lambda: None)
+    argv = _make_argv(monkeypatch, tmp_path, [])
+    assert "DISABLE_AUTOUPDATER=1" not in argv
 
 
 def test_sandbox_claude_binary_none_without_native_install(

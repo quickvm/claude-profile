@@ -87,7 +87,7 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   image's claude stays in play). `_sandbox_claude_binary` copies it to
   `~/.local/share/claude-profile/claude/<version>` — the mount needs an SELinux `:z`
   relabel and relabelling the user's real install is not ours to do — pruning older
-  versions, and `_sandbox_mounts` mounts that copy read-only at `SANDBOX_HOST_CLAUDE`
+  versions (a `.partial` copy only once the launch writing it has exited), and `_sandbox_mounts` mounts that copy read-only at `SANDBOX_HOST_CLAUDE`
   (`/opt/claude-host/claude`). The entrypoint points `~/.local/bin/claude` at it before
   dropping privileges. The copy happens only when the host updates (version dirs are
   immutable). `_build_sandbox_argv` also sets `DISABLE_AUTOUPDATER=1` when the mount is
