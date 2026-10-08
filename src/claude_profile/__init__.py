@@ -1966,6 +1966,7 @@ def _launch_sandbox(
     profile_dir: Path, claude_args: list[str], extra_env: dict[str, str]
 ) -> None:
     """Launch a podman krun microVM running claude (optionally bridging agents)."""
+    _refuse_home_cwd(Path.cwd())
     _ensure_sandbox_image()
     image_user = _sandbox_image_user()
     if image_user and image_user not in ("root", "0"):
@@ -1997,6 +1998,23 @@ def _launch_sandbox(
         profile_dir, cwd, claude_args, extra_env, host_loopback=host_loopback
     )
     os.execvpe(settings.podman_bin, argv, os.environ.copy())
+
+
+def _refuse_home_cwd(cwd: Path) -> None:
+    """Exit when cwd is the home directory or above it, such as ``/``.
+
+    The sandbox mounts the working directory read-write, so either one would hand the
+    VM the whole home directory: ~/.ssh private keys, keyrings and every profile's
+    credentials.
+    """
+    home = Path.home().resolve()
+    if cwd.resolve() == home or cwd.resolve() in home.parents:
+        err_console.print(
+            f"[red]Refusing to start the sandbox in {cwd}: it mounts the working "
+            f"directory read-write, which here includes your whole home directory. "
+            f"cd into a project directory first.[/red]"
+        )
+        sys.exit(1)
 
 
 def _run_sandbox_supervised(

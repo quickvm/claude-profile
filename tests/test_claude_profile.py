@@ -1389,6 +1389,47 @@ def test_launch_sandbox_passes_profile_env_to_podman(
     assert "sk-xyz" not in env.values()
 
 
+def _sandbox_profile_in(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, cwd: Path
+) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / SANDBOX_MARKER).touch()
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.chdir(cwd)
+
+
+@pytest.mark.parametrize("where", ["home", "root", "above-home"])
+def test_launch_sandbox_refuses_to_mount_the_home_dir(
+    profiles_base: Path,
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    where: str,
+) -> None:
+    # The working directory is mounted read-write, so launching from ~ (or anything
+    # above it) would hand the VM ~/.ssh keys and every profile's credentials.
+    cwd = {"home": fake_home, "root": Path("/"), "above-home": fake_home.parent}[where]
+    _sandbox_profile_in(profiles_base, monkeypatch, cwd)
+    with patch("os.execvpe") as mock_exec, pytest.raises(SystemExit) as exc_info:
+        _launch_profile("work", [])
+    assert exc_info.value.code == 1
+    mock_exec.assert_not_called()
+    assert "whole home directory" in " ".join(capsys.readouterr().err.split())
+
+
+def test_launch_sandbox_allows_a_project_dir_under_home(
+    profiles_base: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = fake_home / "src" / "project"
+    project.mkdir(parents=True)
+    _sandbox_profile_in(profiles_base, monkeypatch, project)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    mock_exec.assert_called_once()
+
+
 def test_launch_sandbox_missing_image_exits(
     profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
