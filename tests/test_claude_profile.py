@@ -1485,13 +1485,13 @@ def test_override_forces_sandbox_without_marker(
 
 
 def test_linked_dir_mount_for_symlink(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
     profile = tmp_path / "prof"
     profile.mkdir()
-    global_skills = tmp_path / "global_skills"
-    global_skills.mkdir()
+    global_skills = fake_home / ".claude" / "skills"
+    global_skills.mkdir(parents=True)
     (profile / "skills").symlink_to(global_skills)
     cwd = tmp_path / "work"
     cwd.mkdir()
@@ -1518,7 +1518,7 @@ def test_linked_dir_broken_symlink_skipped(
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
     profile = tmp_path / "prof"
     profile.mkdir()
-    (profile / "commands").symlink_to(tmp_path / "missing")
+    (profile / "commands").symlink_to(fake_home / ".claude" / "commands")
     cwd = tmp_path / "work"
     cwd.mkdir()
     mounts = _sandbox_mounts(profile, cwd)
@@ -1526,14 +1526,15 @@ def test_linked_dir_broken_symlink_skipped(
 
 
 def test_linked_dir_symlink_chain_mounts_real_at_target(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
     profile = tmp_path / "prof"
     profile.mkdir()
     canonical = tmp_path / "canonical"
     canonical.mkdir()
-    intermediate = tmp_path / "intermediate"
+    intermediate = fake_home / ".claude" / "skills"
+    intermediate.parent.mkdir()
     intermediate.symlink_to(canonical)
     (profile / "skills").symlink_to(intermediate)
     cwd = tmp_path / "work"
@@ -1544,12 +1545,12 @@ def test_linked_dir_symlink_chain_mounts_real_at_target(
 
 
 def test_linked_statusline_mounted_at_link_target(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
     profile = tmp_path / "prof"
     profile.mkdir()
-    global_statusline = tmp_path / "global" / "statusline.sh"
+    global_statusline = fake_home / ".claude" / "statusline.sh"
     global_statusline.parent.mkdir()
     global_statusline.write_text("#!/bin/sh\necho ok")
     (profile / "statusline.sh").symlink_to(global_statusline)
@@ -1557,6 +1558,35 @@ def test_linked_statusline_mounted_at_link_target(
     cwd.mkdir()
     mounts = _sandbox_mounts(profile, cwd)
     assert f"{global_statusline}:{global_statusline}:ro,z" in mounts
+
+
+@pytest.mark.parametrize(
+    ("name", "planted"),
+    [("skills", ".ssh"), ("statusline.sh", ".config/gh/hosts.yml")],
+)
+def test_linked_mounts_skip_link_retargeted_off_global(
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    name: str,
+    planted: str,
+) -> None:
+    # The profile dir is writable from inside the VM, so an agent can repoint a link at
+    # any host path. The next launch must not mount that path into the VM.
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    secret = fake_home / planted
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    if name == "skills":
+        secret.mkdir()
+    else:
+        secret.write_text("oauth_token: x")
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    (profile / name).symlink_to(secret)
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    assert not any(str(secret) in m for m in mounts)
 
 
 def test_copied_statusline_not_mounted(

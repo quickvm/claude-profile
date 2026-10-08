@@ -1183,6 +1183,10 @@ def _linked_mounts(profile_dir: Path) -> list[str]:
     that is not otherwise mounted, so the link dangles inside the VM. Mount the real
     target at the link's path, read-only so a sandboxed agent cannot modify what every
     profile shares.
+
+    Only links pointing at the global ``~/.claude/<name>`` that ``add`` and ``links``
+    create are mounted. The profile dir is writable from inside the VM, so a link aimed
+    anywhere else may have been planted there to get that host path mounted next launch.
     """
     mounts: list[str] = []
     for name in (*LINKABLE_DIRS, STATUSLINE_FILE):
@@ -1190,7 +1194,13 @@ def _linked_mounts(profile_dir: Path) -> list[str]:
         if not link.is_symlink():
             continue
         target = Path(os.readlink(link))
-        if not target.is_absolute():
+        expected = Path.home() / ".claude" / name
+        if target != expected:
+            err_console.print(
+                f"[yellow]Warning: not mounting {link} into the sandbox: it points at "
+                f"{target}, not {expected}. Re-point it with: "
+                f"ln -sfn {expected} {link}[/yellow]"
+            )
             continue
         real = link.resolve()
         if real.exists():

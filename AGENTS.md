@@ -87,7 +87,10 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
 - **Linked commands/skills/statusline:** `_linked_mounts()` bind-mounts the real target of
   any symlinked `LINKABLE_DIRS` entry or `STATUSLINE_FILE` (e.g. `skills` →
   `~/.claude/skills`) read-only at the link's path, so the symlink resolves inside the VM
-  without exposing the global target writable. `add` symlinks `statusline.sh` rather than
+  without exposing the global target writable. Only a link whose target is exactly
+  `~/.claude/<name>` is mounted: the profile dir is writable from inside the VM, so a link
+  aimed anywhere else may have been planted there to get that host path mounted on the next
+  launch (it is skipped with a warning). `add` symlinks `statusline.sh` rather than
   copying it: settings run `~/.claude/statusline.sh`, which inside the VM is the *profile's*
   file (there `~/.claude` is the profile dir), so a copy silently drifted from the host's
   global script. Mounting the global script straight over that path instead would leave an
