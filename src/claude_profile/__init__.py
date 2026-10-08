@@ -742,7 +742,7 @@ def manage_env(
         raise typer.Exit(code=1)
 
     env_file = d / ".env"
-    existing = _parse_env_file(env_file) if env_file.exists() else {}
+    existing = _load_profile_env(d)
 
     if not set_var and not unset_var:
         _show_env_table(name, existing)
@@ -789,7 +789,7 @@ def _write_env_file(env_file: Path, env_vars: dict[str, str]) -> None:
     private (it is world-readable by default, like ~/.claude). An existing file is
     tightened to 0600 before the new contents go in."""
     lines = [f"{key}={value}" for key, value in sorted(env_vars.items())]
-    fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     os.fchmod(fd, 0o600)
     with open(fd, "w") as handle:
         handle.write("\n".join(lines) + "\n" if lines else "")
@@ -809,6 +809,25 @@ def _do_unlink(profile_dir: Path, dir_name: str) -> None:
     else:
         path.mkdir()
         console.print(f"[green]Created isolated '{dir_name}' directory.[/green]")
+
+
+def _load_profile_env(profile_dir: Path) -> dict[str, str]:
+    """Parse the profile's .env, refusing one that is a symlink.
+
+    The profile dir is writable from inside the sandbox. A .env planted there as a link
+    (to ~/.aws/credentials, say) would feed that file's KEY=VALUE lines into the next VM,
+    and `env --set` would overwrite the link's target. claude-profile only ever writes a
+    regular file.
+    """
+    env_file = profile_dir / ".env"
+    if env_file.is_symlink():
+        err_console.print(
+            f"[red]Refusing to use {env_file}: it is a symlink (to "
+            f"{os.readlink(env_file)}), not a file claude-profile wrote. Check it and "
+            f"remove it before launching this profile.[/red]"
+        )
+        sys.exit(1)
+    return _parse_env_file(env_file) if env_file.exists() else {}
 
 
 def _parse_env_file(env_path: Path) -> dict[str, str]:
@@ -1215,7 +1234,28 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
     mounts += _mcp_json_mounts(cwd)
     mounts += _ca_trust_mounts()
     mounts += _linked_mounts(profile_dir)
+    mounts += _launch_state_mounts(profile_dir)
     mounts += _image_cache_mounts(profile_dir)
+    return mounts
+
+
+def _launch_state_mounts(profile_dir: Path) -> list[str]:
+    """Read-only mounts pinning the profile files that decide how it launches.
+
+    The VM sees the profile dir read-write. Deleting .sandbox would turn the next plain
+    launch into a host launch, and .env is loaded into that launch's environment
+    (LD_PRELOAD, say). Mounted read-only over themselves, neither can be changed or
+    removed from inside. A missing .env is created empty so there is a file to pin; the
+    VM gets the values through the env file (see _secret_env_file).
+    """
+    env_file = profile_dir / ".env"
+    if not os.path.lexists(env_file):
+        os.close(os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    mounts: list[str] = []
+    for name in (SANDBOX_MARKER, ".env"):
+        path = profile_dir / name
+        if path.is_file() and not path.is_symlink():
+            mounts += ["-v", f"{path}:{SANDBOX_CONFIG_DIR}/{name}:ro,z"]
     return mounts
 
 
@@ -2206,7 +2246,8 @@ def _sandbox_enabled(profile_dir: Path) -> bool:
     """
     if settings.sandbox is not None:
         return settings.sandbox
-    return (profile_dir / SANDBOX_MARKER).exists()
+    # lexists: a marker planted as a dangling link still counts, failing safe.
+    return os.path.lexists(profile_dir / SANDBOX_MARKER)
 
 
 def _launch_profile(name: str, claude_args: list[str]) -> None:
@@ -2217,8 +2258,7 @@ def _launch_profile(name: str, claude_args: list[str]) -> None:
             f"Create it with: claude-profile add {name}"
         )
         sys.exit(1)
-    env_file = d / ".env"
-    extra_env = _parse_env_file(env_file) if env_file.exists() else {}
+    extra_env = _load_profile_env(d)
     if _sandbox_enabled(d):
         _launch_sandbox(d, claude_args, extra_env)
         return

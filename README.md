@@ -451,12 +451,13 @@ What else the VM can reach:
 
 - **Writable state the host trusts later.** The profile directory and the working tree are
   mounted read-write, so the agent can change files that run on the host afterwards. In the
-  profile: `.claude.json` (MCP server commands), `.env`, `statusline.sh` and, unless the
-  sandbox overlays it, `settings.json` (hooks), all of which apply to a host launch of the
-  same profile (`CLAUDE_PROFILE_SANDBOX=0`). In the repo: git hooks, `.git/config` and
-  `.claude/` settings, which apply the next time you run git or claude there on the host.
-  Check changes to these before using them on the host, or keep a sandboxed profile
-  sandbox-only.
+  profile: `.claude.json` (MCP server commands), `statusline.sh` and, unless the sandbox
+  overlays it, `settings.json` (hooks), all of which apply to a host launch of the same
+  profile (`CLAUDE_PROFILE_SANDBOX=0`). The `.sandbox` marker and `.env` are mounted
+  read-only, so the agent cannot switch the next launch to the host or plant variables in
+  it. In the repo: git hooks, `.git/config` and `.claude/` settings, which apply the next
+  time you run git or claude there on the host. Check changes to these before using them
+  on the host, or keep a sandboxed profile sandbox-only.
 - **MCP config above the working directory.** Ancestor `.mcp.json` files (often
   `~/.mcp.json`) are mounted read-only, so any API keys in them are readable in the VM.
 - **The host's loopback.** When a bridge or a loopback hook is active, the VM runs with

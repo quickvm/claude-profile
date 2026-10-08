@@ -378,6 +378,12 @@ uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && 
   generated storage.conf overlay with `additionalimagestores`, so in-VM podman finds images locally
   (no pull); an empty/absent store leaves the pull-on-demand default. Read-only and shared, so
   parallel worktree sandboxes can't corrupt it.
+- **Pinned launch files:** `_launch_state_mounts` mounts the profile's `.sandbox` marker and
+  `.env` read-only over themselves (creating an empty 0600 `.env` if missing). Otherwise an
+  agent could delete the marker, so the next plain launch silently ran on the host, or
+  plant `LD_PRELOAD` and the like in `.env` for that launch. `_load_profile_env` refuses a
+  `.env` that is a symlink (its target's KEY=VALUE lines would reach the VM, and `env --set`
+  would overwrite the target), and `_sandbox_enabled` counts even a dangling marker link.
 - **`sandbox` subcommand & override:** `sandbox <name> --on/--off` toggles the `.sandbox`
   marker on an existing profile (shows status when no flag). `_sandbox_enabled()` decides
   per launch: the `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state

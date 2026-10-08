@@ -869,9 +869,8 @@ def test_sandbox_mounts_no_git(
     profile.mkdir()
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
     mounts = _sandbox_mounts(profile, cwd)
-    # profile config + cwd + per-profile user known_hosts
-    assert mounts.count("-v") == 4  # +1 for the chrome-dir mask
     assert f"{cwd}:{cwd}:z" in mounts
+    assert not any(".git" in spec for spec in mounts)
 
 
 def test_sandbox_mounts_includes_external_git_dir(
@@ -885,8 +884,6 @@ def test_sandbox_mounts_includes_external_git_dir(
     profile.mkdir()
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: git_dir)
     mounts = _sandbox_mounts(profile, cwd)
-    # profile config + cwd + git dir + per-profile user known_hosts
-    assert mounts.count("-v") == 5  # +1 for the chrome-dir mask
     assert f"{git_dir}:{git_dir}:z" in mounts
 
 
@@ -899,8 +896,8 @@ def test_sandbox_mounts_skips_git_dir_inside_cwd(
     profile.mkdir()
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: cwd / ".git")
     mounts = _sandbox_mounts(profile, cwd)
-    # profile config + cwd + per-profile user known_hosts (git dir skipped, inside cwd)
-    assert mounts.count("-v") == 4  # +1 for the chrome-dir mask
+    # the git dir rides along on the cwd mount
+    assert not any(spec.startswith(f"{cwd / '.git'}:") for spec in mounts)
 
 
 # ---------------------------------------------------------------------------
@@ -1663,6 +1660,12 @@ def test_override_forces_sandbox_without_marker(
 # ---------------------------------------------------------------------------
 
 
+def _linked_specs(mounts: list[str]) -> list[str]:
+    """Read-only mount specs other than the pinned .sandbox marker and .env."""
+    pinned = (f"/{SANDBOX_MARKER}:ro,z", "/.env:ro,z")
+    return [m for m in mounts if m.endswith("ro,z") and not m.endswith(pinned)]
+
+
 def test_linked_dir_mount_for_symlink(
     fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1688,7 +1691,7 @@ def test_linked_dir_isolated_dir_not_mounted(
     cwd = tmp_path / "work"
     cwd.mkdir()
     mounts = _sandbox_mounts(profile, cwd)
-    assert all("ro,z" not in m for m in mounts)
+    assert _linked_specs(mounts) == []
 
 
 def test_linked_dir_broken_symlink_skipped(
@@ -1701,7 +1704,7 @@ def test_linked_dir_broken_symlink_skipped(
     cwd = tmp_path / "work"
     cwd.mkdir()
     mounts = _sandbox_mounts(profile, cwd)
-    assert all("ro,z" not in m for m in mounts)
+    assert _linked_specs(mounts) == []
 
 
 def test_linked_dir_symlink_chain_mounts_real_at_target(
@@ -1778,7 +1781,7 @@ def test_copied_statusline_not_mounted(
     cwd = tmp_path / "work"
     cwd.mkdir()
     mounts = _sandbox_mounts(profile, cwd)
-    assert all("ro,z" not in m for m in mounts)
+    assert _linked_specs(mounts) == []
 
 
 def test_sandbox_mounts_includes_gitconfig(
@@ -3520,6 +3523,50 @@ def test_sandbox_mounts_ignore_links_planted_in_the_profile_dir(
     assert not sources & {str(profile / name) for name in planted}
     assert all(victim.read_text() == "untouched" for victim in victims)
     assert bashrc.read_text() == "# untouched\n"
+
+
+def test_sandbox_mounts_pin_marker_and_env_read_only(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Deleting .sandbox from inside the VM would make the next plain launch a host
+    # launch, which loads whatever the agent planted in .env.
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    (profile / SANDBOX_MARKER).touch()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    config = claude_profile.SANDBOX_CONFIG_DIR
+    assert f"{profile / SANDBOX_MARKER}:{config}/{SANDBOX_MARKER}:ro,z" in mounts
+    assert f"{profile / '.env'}:{config}/.env:ro,z" in mounts
+    # Created so there is something to pin, private like any .env.
+    assert (profile / ".env").stat().st_mode & 0o777 == 0o600
+
+
+def test_launch_refuses_a_symlinked_env_file(
+    profiles_base: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A .env planted as a link to e.g. ~/.aws/credentials would have its KEY=VALUE
+    # lines passed into the VM.
+    secrets = fake_home / "credentials"
+    secrets.write_text("aws_secret_access_key=s3cr3t\n")
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / ".env").symlink_to(secrets)
+    with patch("os.execvpe") as mock_exec, pytest.raises(SystemExit) as exc_info:
+        _launch_profile("work", [])
+    assert exc_info.value.code == 1
+    mock_exec.assert_not_called()
+
+
+def test_sandbox_marker_planted_as_dangling_link_still_sandboxes(
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    (profile / SANDBOX_MARKER).symlink_to(tmp_path / "gone")
+    assert claude_profile._sandbox_enabled(profile) is True
 
 
 def test_sandbox_mounts_known_hosts_global_ro_and_user_rw(
