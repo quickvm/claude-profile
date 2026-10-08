@@ -3336,6 +3336,9 @@ def test_argv_includes_sandbox_briefing(
     assert "--append-system-prompt" in argv
     briefing = argv[argv.index("--append-system-prompt") + 1]
     assert "sandbox" in briefing.lower()
+    # The mounts are read-write: the agent must know its changes outlive the VM.
+    assert "persists on the host" in briefing
+    assert "git hooks" in briefing
 
 
 def test_argv_respects_user_system_prompt(
