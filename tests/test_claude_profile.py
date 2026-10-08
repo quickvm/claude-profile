@@ -2506,7 +2506,10 @@ def test_infisical_token_none_when_secret_tool_missing(
 
 
 def test_infisical_login_matches() -> None:
-    user = {"email": "joe@quickvm.com", "domain": "https://infisical.quickvm.example/api"}
+    user = {
+        "email": "joe@quickvm.com",
+        "domain": "https://infisical.quickvm.example/api",
+    }
     assert claude_profile._infisical_login_matches("joe@quickvm.com", user) is True
     assert claude_profile._infisical_login_matches("quickvm.com", user) is True
     assert claude_profile._infisical_login_matches("quickvm.example", user) is True
