@@ -1382,20 +1382,24 @@ def _build_sandbox_argv(
     argv += _gpg_pubkeys_mounts(forwarding)
     argv += ["-w", str(cwd), settings.sandbox_image, "claude"]
     args = list(claude_args)
+    # The sandbox's own flags go before the user's args: after a subcommand's `--` they
+    # would become that command's arguments (`claude mcp add NAME -- CMD ...` saved them
+    # into the server definition).
+    session: list[str] = []
     if settings.sandbox_skip_permissions and SKIP_PERMISSIONS_FLAG not in args:
-        args.append(SKIP_PERMISSIONS_FLAG)
+        session.append(SKIP_PERMISSIONS_FLAG)
     # claude force-disables Chrome in a non-interactive session (dn()=!isInteractive),
     # which the sandbox launch trips, so claudeInChromeDefaultEnabled never applies. The
-    # explicit --chrome flag is checked first, so append it to actually enable the
+    # explicit --chrome flag is checked first, so add it to actually enable the
     # integration when the user opted into sandbox_chrome.
     if settings.sandbox_chrome and "--chrome" not in args and "--no-chrome" not in args:
-        args.append("--chrome")
+        session.append("--chrome")
     if "--append-system-prompt" not in args:
-        args += [
+        session += [
             "--append-system-prompt",
             SANDBOX_BRIEFING + _infisical_briefing(extra_env),
         ]
-    return argv + args
+    return argv + session + args
 
 
 def _git_identity_env(cwd: Path) -> list[str]:

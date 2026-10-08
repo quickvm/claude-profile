@@ -3378,6 +3378,20 @@ def test_argv_includes_sandbox_briefing(
     assert "git hooks" in briefing
 
 
+def test_argv_puts_sandbox_flags_before_the_users_args(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Appended after a subcommand's `--`, the sandbox's flags and briefing became the
+    # MCP server's own arguments and were saved into the profile's .claude.json.
+    monkeypatch.setattr(claude_profile.settings, "sandbox_chrome", True)
+    user_args = ["mcp", "add", "fetch", "--", "uvx", "mcp-server-fetch"]
+    argv = _make_argv(monkeypatch, tmp_path, user_args)
+    claude_args = argv[argv.index(claude_profile.settings.sandbox_image) + 2 :]
+    assert claude_args[-len(user_args) :] == user_args
+    assert SKIP_PERMISSIONS_FLAG in claude_args[: -len(user_args)]
+    assert "--chrome" in claude_args[: -len(user_args)]
+
+
 def test_argv_respects_user_system_prompt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
