@@ -463,14 +463,26 @@ article [Sandbox AI coding agents with microVMs on Fedora Linux](https://fedoram
 What else the VM can reach:
 
 - **Writable state the host trusts later.** The profile directory and the working tree are
-  mounted read-write, so the agent can change files that run on the host afterwards. In the
-  profile: `.claude.json` (MCP server commands), `statusline.sh` and, unless the sandbox
-  overlays it, `settings.json` (hooks), all of which apply to a host launch of the same
-  profile (`CLAUDE_PROFILE_SANDBOX=0`). The `.sandbox` marker and `.env` are mounted
-  read-only, so the agent cannot switch the next launch to the host or plant variables in
-  it. In the repo: git hooks, `.git/config` and `.claude/` settings, which apply the next
-  time you run git or claude there on the host. Check changes to these before using them
-  on the host, or keep a sandboxed profile sandbox-only.
+  mounted read-write, so the agent could change files that run on the host afterwards. The
+  ones the launcher knows about are protected:
+  - The repo's `.git/config` (and each submodule's) is read-only in the VM, so the agent can't
+    set something like `core.fsmonitor` that your next `git status` would run. Git commands
+    that save config there can't save it: `git push -u` pushes but doesn't record the
+    upstream, and `git remote add` fails.
+  - `.git/hooks/`, the profile's `settings.json` and the project's
+    `.claude/settings.local.json` are copies in the VM, thrown away when it exits. Hooks you
+    have on the host still run in the VM.
+  - The `.sandbox` marker and `.env` are read-only, so the agent can't switch the next launch
+    to the host or plant variables in it.
+  - On a host launch of a sandboxed profile you're warned if `statusline.sh` is no longer the
+    link to `~/.claude/statusline.sh`.
+  - When a session that forwards anything (SSH, GPG, clipboard, Chrome) ends, you're told
+    which MCP servers or `.mcp.json` approvals it added to the profile's `.claude.json`, and
+    whether it created a `.claude/settings.local.json`. Other launches can't report this, so
+    check `.claude.json` yourself after them.
+
+  Everything else in the working tree, `.claude/settings.json` and `.mcp.json` included,
+  is yours to review as you would any change the agent makes.
 - **MCP config above the working directory.** Ancestor `.mcp.json` files (often
   `~/.mcp.json`) are mounted read-only, so any API keys in them are readable in the VM.
 - **The host's loopback.** When a bridge or a loopback hook is active, the VM runs with
