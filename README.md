@@ -474,6 +474,9 @@ Credentials the agent in the VM can read or use:
   (`CLAUDE_PROFILE_SANDBOX_PULUMI`), the variables named in
   `CLAUDE_PROFILE_SANDBOX_FORWARD_ENV`, your clipboard (`CLAUDE_PROFILE_SANDBOX_CLIPBOARD`,
   read-only), and your logged-in browser through the Claude extension (see below).
+- **When the profile uses [Agent Vault](#agent-vault-infisical):** a session token, in
+  `HTTPS_PROXY` and `HTTP_PROXY`, instead of the credentials themselves. It works only through
+  the proxy, only for the bundle's services, and only until the launch ends or 24 hours pass.
 
 Not mounted: `~/.ssh` (only a copy of `known_hosts`), your keyring, and other profiles'
 directories.
@@ -516,6 +519,62 @@ What else the VM can reach:
   `--map-host-loopback`, which reaches every service listening on the host's `127.0.0.1`,
   not only the bridges.
 
+## Agent Vault (Infisical)
+
+A profile can send claude's HTTPS through an
+[Infisical Agent Vault](https://infisical.com/docs/documentation/platform/agent-vault/overview)
+proxy, which attaches the real credential to each request for a service in an access bundle.
+claude and everything it runs (`gh`, `curl`, git, SDKs, MCP servers) then work with placeholder
+tokens, and the credentials stay in Infisical and on the proxy. It is off unless a profile opts
+in, and it needs the `infisical` CLI on the host, logged in to the instance that holds the bundle.
+
+Opt a profile in through its environment:
+
+```sh
+claude-profile env work \
+  --set CLAUDE_PROFILE_AGENT_VAULT_BUNDLE=coding \
+  --set CLAUDE_PROFILE_AGENT_VAULT_PROXY=10.0.1.5:17323 \
+  --set CLAUDE_PROFILE_AGENT_VAULT_CA_FINGERPRINT=SHA256:9F:2C:... \
+  --set GH_TOKEN=agent-vault
+```
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `CLAUDE_PROFILE_AGENT_VAULT_BUNDLE` | yes | The access bundle the session covers. Setting it turns Agent Vault on for the profile; unsetting it turns it off and keeps the other keys |
+| `CLAUDE_PROFILE_AGENT_VAULT_PROXY` | with `BUNDLE` | The proxy's `host:port` |
+| `CLAUDE_PROFILE_AGENT_VAULT_CA_FINGERPRINT` | with `BUNDLE` | The proxy CA's fingerprint, as the Proxies page shows it (`SHA256:...`) |
+| `CLAUDE_PROFILE_AGENT_VAULT_INFISICAL_PROFILE` | no | The `infisical` login profile to mint sessions with (see `infisical profile list`), when the CLI would otherwise pick another |
+| `CLAUDE_PROFILE_AGENT_VAULT_NO_PROXY` | no | Comma-separated hosts that skip the proxy, in addition to the ones listed below |
+
+claude-profile reads these keys and claude never sees them. Every other variable in the profile's
+environment reaches claude as usual, which is where placeholders go: a Bearer service replaces the
+header whatever its value, so a placeholder only needs to satisfy tools that won't run without a
+token, such as `gh`. These keys are per profile, not `CLAUDE_PROFILE_*` variables in your shell,
+and the sandbox can't change them: the profile's `.env` is read-only in the VM.
+
+What a launch does:
+
+1. **Pre-flight.** It asks the proxy for its CA and compares it with the pinned fingerprint. If the
+   proxy doesn't answer, serves another CA, or the `infisical` CLI is missing, the launch goes
+   ahead without Agent Vault and says so in red. In the sandbox the agent is told as well, and
+   `CLAUDE_SANDBOX_AGENT_VAULT` is `unavailable` (`active` otherwise).
+2. **Session.** It starts itself again under `infisical agent-vault run`, which mints a 24-hour
+   session over the bundle with your Infisical login and revokes it when the launch exits,
+   including on SIGHUP and SIGTERM. If minting fails, the launch stops with the CLI's error; unset
+   `CLAUDE_PROFILE_AGENT_VAULT_BUNDLE` to launch without it.
+3. **Environment.** claude gets `HTTPS_PROXY` and `HTTP_PROXY`, which carry the session token, and
+   a CA bundle with your system's roots plus the proxy's CA, so proxied and direct HTTPS both
+   verify. The Claude API (`.anthropic.com`), the login and token hosts (`claude.ai`,
+   `claude.com` and their subdomains) and the Claude in Chrome bridge (`.claudeusercontent.com`)
+   skip the proxy, so your prompts and the profile's login never pass through it.
+
+In the sandbox, the session token reaches the VM in the same unlinked env file as the rest of the
+profile's environment, never in podman's argv or environment. The combined CA bundle is mounted
+over the VM's system bundle, and the VM's `NO_PROXY` adds the host loopback, where the bridges
+listen. On a host launch, `infisical agent-vault run` stays as claude's parent for the whole
+session, since it revokes the session when claude exits; other launches replace claude-profile
+with claude.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -523,6 +582,7 @@ What else the VM can reach:
 | `CLAUDE_PROFILE_PROFILES_BASE` | `~/.claude-profiles` | Directory where profiles are stored |
 | `CLAUDE_PROFILE_CLAUDE_BIN` | `claude` | Path to the claude binary |
 | `CLAUDE_PROFILE_PODMAN_BIN` | `podman` | Path to the podman binary (sandbox mode) |
+| `CLAUDE_PROFILE_INFISICAL_BIN` | `infisical` | Path to the infisical CLI ([Agent Vault](#agent-vault-infisical) profiles) |
 | `CLAUDE_PROFILE_SANDBOX_IMAGE` | `claude-profile-sandbox:latest` | Image used for sandbox launches |
 | `CLAUDE_PROFILE_SANDBOX_RAM_MIB` | `4096` | microVM memory in MiB |
 | `CLAUDE_PROFILE_SANDBOX_CPUS` | `4` | microVM vCPU count |

@@ -5,10 +5,13 @@ from __future__ import annotations
 import ast
 import base64
 import contextlib
+import hashlib
+import http.server
 import json
 import os
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import textwrap
@@ -83,6 +86,9 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     # A podman nobody can find, so a launch that a test forgot to stub fails fast
     # instead of booting a real microVM on the developer's machine.
     monkeypatch.setattr(claude_profile.settings, "podman_bin", "podman-stub-me")
+    # Likewise an infisical CLI that is never installed, so no test mints a real Agent
+    # Vault session; the tests that need one installed use the infisical_cli fixture.
+    monkeypatch.setattr(claude_profile.settings, "infisical_bin", "infisical-stub-me")
     # git exports GIT_INDEX_FILE and friends to hooks, and prek runs these tests from
     # one; inherited, they would point the tests' own git calls at this repo.
     for name in [name for name in os.environ if name.startswith("GIT_")]:
@@ -4603,3 +4609,420 @@ def test_supervised_session_reports_new_local_project_settings(
 
     _supervised_session(monkeypatch, profile, cwd, vm)
     assert str(local) in _unwrapped(capsys.readouterr().err)
+
+
+# ---------------------------------------------------------------------------
+# Agent Vault
+# ---------------------------------------------------------------------------
+
+# ssl.PEM_cert_to_DER_cert only base64-decodes, so any bytes stand in for the proxy's CA.
+AV_CA_DER = b"agent-vault test CA"
+AV_PIN = "SHA256:" + ":".join(
+    f"{byte:02X}" for byte in hashlib.sha256(AV_CA_DER).digest()
+)
+AV_TOKEN = "agv_test-session-token"
+AV_PROXY_URL = f"http://x-agent-vault:{AV_TOKEN}@10.0.1.5:17323"
+
+
+@contextlib.contextmanager
+def _ca_server(der: bytes = AV_CA_DER) -> Generator[str]:
+    """A local stand-in for a proxy's /_agent-vault/ca endpoint; yields its host:port."""
+    body = json.dumps({"certificate": ssl.DER_cert_to_PEM_cert(der)}).encode()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200 if self.path == "/_agent-vault/ca" else 404)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.fixture()
+def infisical_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """An installed (never run) infisical CLI."""
+    cli = tmp_path / "bin" / "infisical"
+    cli.parent.mkdir()
+    cli.write_text("#!/bin/sh\nexit 1\n")
+    cli.chmod(0o755)
+    monkeypatch.setattr(claude_profile.settings, "infisical_bin", str(cli))
+    return cli
+
+
+def _vault_profile(
+    profiles_base: Path, proxy: str, *, sandbox: bool = False, extra: str = ""
+) -> Path:
+    """A profile opted into Agent Vault, with a placeholder token in its .env."""
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    if sandbox:
+        (profile / SANDBOX_MARKER).touch()
+    (profile / ".env").write_text(
+        "CLAUDE_PROFILE_AGENT_VAULT_BUNDLE=personal\n"
+        f"CLAUDE_PROFILE_AGENT_VAULT_PROXY={proxy}\n"
+        f"CLAUDE_PROFILE_AGENT_VAULT_CA_FINGERPRINT={AV_PIN}\n"
+        f"GH_TOKEN=agent-vault\n{extra}"
+    )
+    return profile
+
+
+def _inner_run_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Set the environment `infisical agent-vault run` gives its child; return its CA file."""
+    ca = tmp_path / "proxy-ca.pem"
+    ca.write_text(ssl.DER_cert_to_PEM_cert(AV_CA_DER))
+    system = tmp_path / "system-ca.pem"
+    system.write_text(
+        "-----BEGIN CERTIFICATE-----\nc3lzdGVt\n-----END CERTIFICATE-----\n"
+    )
+    monkeypatch.setattr(claude_profile, "_system_ca_bundle", lambda: system)
+    monkeypatch.setenv(claude_profile.AGENT_VAULT_RUN_ENV, "work")
+    for name in claude_profile.AGENT_VAULT_SESSION_VARS:
+        monkeypatch.setenv(name, AV_PROXY_URL)
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.setenv(name, "localhost,127.0.0.1,.anthropic.com")
+    monkeypatch.setenv("NODE_USE_ENV_PROXY", "1")
+    for name in claude_profile.AGENT_VAULT_CA_VARS:
+        monkeypatch.setenv(name, str(ca))
+    return ca
+
+
+def _vault_mounts(argv: list[str]) -> list[str]:
+    return [
+        arg
+        for arg in argv
+        if arg.endswith(f":{claude_profile.SANDBOX_VM_CA_BUNDLE}:ro,z")
+    ]
+
+
+def test_launch_without_agent_vault_keys_runs_claude_directly(
+    profiles_base: Path, infisical_cli: Path
+) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    assert mock_exec.call_args[0][0] == claude_profile.settings.claude_bin
+
+
+def test_agent_vault_launch_reruns_itself_under_the_cli(
+    profiles_base: Path, infisical_cli: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["/usr/bin/claude-profile", "work", "-p", "hi"])
+    with _ca_server() as proxy:
+        _vault_profile(
+            profiles_base,
+            proxy,
+            extra="CLAUDE_PROFILE_AGENT_VAULT_INFISICAL_PROFILE=ops\n"
+            "CLAUDE_PROFILE_AGENT_VAULT_NO_PROXY=10.0.1.5, logs.example\n",
+        )
+        with patch("os.execvpe") as mock_exec:
+            _launch_profile("work", ["-p", "hi"])
+    mock_exec.assert_called_once()
+    binary, argv, env = mock_exec.call_args[0]
+    assert binary == str(infisical_cli)
+    assert argv == [
+        str(infisical_cli),
+        "agent-vault",
+        "run",
+        "--silent",
+        "--profile",
+        "ops",
+        "--access-bundle",
+        "personal",
+        "--proxy",
+        proxy,
+        "--ca-fingerprint",
+        AV_PIN,
+        "--ttl",
+        "24h",
+        "--no-proxy",
+        (
+            ".anthropic.com,claude.ai,.claude.ai,claude.com,.claude.com,"
+            ".claudeusercontent.com,10.0.1.5,logs.example"
+        ),
+        "--",
+        "/usr/bin/claude-profile",
+        "work",
+        "-p",
+        "hi",
+    ]
+    assert env[claude_profile.AGENT_VAULT_RUN_ENV] == "work"
+
+
+def test_agent_vault_fingerprint_case_does_not_matter(
+    profiles_base: Path, infisical_cli: Path
+) -> None:
+    with _ca_server() as proxy:
+        profile = _vault_profile(profiles_base, proxy)
+        env_file = profile / ".env"
+        env_file.write_text(env_file.read_text().replace(AV_PIN, AV_PIN.lower()))
+        with patch("os.execvpe") as mock_exec:
+            _launch_profile("work", [])
+    argv = mock_exec.call_args[0][1]
+    assert argv[argv.index("--ca-fingerprint") + 1] == AV_PIN
+
+
+def test_agent_vault_preflight_never_goes_through_a_proxy(
+    profiles_base: Path, infisical_cli: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The launcher's own environment can name a proxy; the CA must come from the vault's.
+    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:9")
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    with _ca_server() as proxy:
+        _vault_profile(profiles_base, proxy)
+        with patch("os.execvpe") as mock_exec:
+            _launch_profile("work", [])
+    assert mock_exec.call_args[0][0] == str(infisical_cli)
+
+
+def test_agent_vault_pin_mismatch_launches_without_the_vault(
+    profiles_base: Path, infisical_cli: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with _ca_server(b"another CA") as proxy:
+        _vault_profile(profiles_base, proxy)
+        with patch("os.execvpe") as mock_exec:
+            _launch_profile("work", [])
+    binary, _argv, env = mock_exec.call_args[0]
+    assert binary == claude_profile.settings.claude_bin
+    err = _unwrapped(capsys.readouterr().err)
+    assert "AgentVaultisunavailable" in err
+    assert f"notthepinned{AV_PIN}" in err
+    # The profile's vault keys are claude-profile's; its placeholders are claude's.
+    assert not [
+        name for name in env if name.startswith(claude_profile.AGENT_VAULT_PREFIX)
+    ]
+    assert env["GH_TOKEN"] == "agent-vault"
+
+
+def test_agent_vault_unreachable_proxy_launches_without_the_vault(
+    profiles_base: Path, infisical_cli: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with socket.socket() as closed:
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+    _vault_profile(profiles_base, f"127.0.0.1:{port}")
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    assert mock_exec.call_args[0][0] == claude_profile.settings.claude_bin
+    assert "didnotserveitsCA" in _unwrapped(capsys.readouterr().err)
+
+
+def test_agent_vault_missing_cli_launches_without_the_vault(
+    profiles_base: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with _ca_server() as proxy:
+        _vault_profile(profiles_base, proxy)
+        with patch("os.execvpe") as mock_exec:
+            _launch_profile("work", [])
+    assert mock_exec.call_args[0][0] == claude_profile.settings.claude_bin
+    assert "isnotinstalled" in _unwrapped(capsys.readouterr().err)
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        (
+            "CLAUDE_PROFILE_AGENT_VAULT_BUNDLE=personal\n",
+            "CLAUDE_PROFILE_AGENT_VAULT_PROXYisnotset",
+        ),
+        (
+            # A typo is caught even with BUNDLE unset, so it can't switch the vault off.
+            "CLAUDE_PROFILE_AGENT_VAULT_BUNDEL=personal\n",
+            "CLAUDE_PROFILE_AGENT_VAULT_BUNDELisnotasetting",
+        ),
+        (
+            (
+                "CLAUDE_PROFILE_AGENT_VAULT_BUNDLE=personal\n"
+                "CLAUDE_PROFILE_AGENT_VAULT_PROXY=proxy:17323\n"
+                f"CLAUDE_PROFILE_AGENT_VAULT_CA_FINGERPRINT={AV_PIN}\n"
+                "CLAUDE_PROFILE_AGENT_VAULT_BUNDEL=personal\n"
+            ),
+            "CLAUDE_PROFILE_AGENT_VAULT_BUNDELisnotasetting",
+        ),
+        (
+            (
+                "CLAUDE_PROFILE_AGENT_VAULT_BUNDLE=personal\n"
+                "CLAUDE_PROFILE_AGENT_VAULT_PROXY=proxy:17323\n"
+                "CLAUDE_PROFILE_AGENT_VAULT_CA_FINGERPRINT=SHA256:9F:2C\n"
+            ),
+            "CLAUDE_PROFILE_AGENT_VAULT_CA_FINGERPRINTisnotafingerprint",
+        ),
+    ],
+)
+def test_agent_vault_bad_settings_fail_the_launch(
+    profiles_base: Path, capsys: pytest.CaptureFixture[str], env: str, message: str
+) -> None:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text(env)
+    with patch("os.execvpe") as mock_exec, pytest.raises(SystemExit) as exc_info:
+        _launch_profile("work", [])
+    assert exc_info.value.code == 1
+    mock_exec.assert_not_called()
+    assert message in _unwrapped(capsys.readouterr().err)
+
+
+def test_unsetting_the_agent_vault_bundle_launches_without_the_vault(
+    profiles_base: Path, infisical_cli: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The way out when Infisical is down: the other keys stay for next time.
+    profile = _vault_profile(profiles_base, "10.0.1.5:17323")
+    env_file = profile / ".env"
+    lines = env_file.read_text().splitlines(keepends=True)
+    env_file.write_text("".join(line for line in lines if "_BUNDLE=" not in line))
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    binary, _argv, env = mock_exec.call_args[0]
+    assert binary == claude_profile.settings.claude_bin
+    assert not [
+        name for name in env if name.startswith(claude_profile.AGENT_VAULT_PREFIX)
+    ]
+    assert "Agent Vault" not in capsys.readouterr().err
+
+
+def test_agent_vault_host_launch_trusts_the_proxy_and_system_cas(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ca = _inner_run_env(monkeypatch, tmp_path)
+    _vault_profile(profiles_base, "10.0.1.5:17323")
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    binary, _argv, env = mock_exec.call_args[0]
+    assert binary == claude_profile.settings.claude_bin
+    assert env["HTTPS_PROXY"] == AV_PROXY_URL
+    assert env["NO_PROXY"] == "localhost,127.0.0.1,.anthropic.com"
+    bundle = Path(env["SSL_CERT_FILE"])
+    assert {env[name] for name in claude_profile.AGENT_VAULT_CA_VARS} == {str(bundle)}
+    assert "c3lzdGVt" in bundle.read_text()
+    assert bundle.read_text().endswith(ca.read_text())
+    # A launch started from this claude has to get a session of its own.
+    assert claude_profile.AGENT_VAULT_RUN_ENV not in env
+
+
+def test_agent_vault_sandbox_launch_keeps_the_session_out_of_podman(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ca = _inner_run_env(monkeypatch, tmp_path)
+    _vault_profile(profiles_base, "10.0.1.5:17323", sandbox=True)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.chdir(_project(tmp_path))
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    binary, argv, env = mock_exec.call_args[0]
+    assert binary == claude_profile.settings.podman_bin
+    assert not [arg for arg in argv if AV_TOKEN in arg]
+    # podman itself runs with the host's own environment: no proxy, no proxy-only CA.
+    assert not [value for value in env.values() if AV_TOKEN in value]
+    for name in (
+        *claude_profile.AGENT_VAULT_CA_VARS,
+        claude_profile.AGENT_VAULT_RUN_ENV,
+    ):
+        assert name not in env
+    text = _env_file_text(argv)
+    assert f"HTTPS_PROXY={AV_PROXY_URL}\n" in text
+    assert "OPENCLAW_PROXY_URL" not in text
+    no_proxy = "localhost,127.0.0.1,.anthropic.com,169.254.1.2,host.containers.internal"
+    assert f"NO_PROXY={no_proxy}\n" in text
+    assert "NODE_USE_ENV_PROXY=1\n" in text
+    assert f"SSL_CERT_FILE={claude_profile.SANDBOX_VM_CA_BUNDLE}\n" in text
+    assert "CLAUDE_SANDBOX_AGENT_VAULT=active\n" in text
+    assert "GH_TOKEN=agent-vault\n" in text
+    [mount] = _vault_mounts(argv)
+    assert Path(mount.split(":")[0]).read_text().endswith(ca.read_text())
+    assert [arg for arg in argv if "Credentials are brokered" in arg]
+
+
+def test_agent_vault_supervised_sandbox_launch_mounts_the_bundle(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _inner_run_env(monkeypatch, tmp_path)
+    _vault_profile(profiles_base, "10.0.1.5:17323", sandbox=True)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    sock = Path("/run/x.sock")
+    fwd = claude_profile._Forwarding([(sock, sock, "ssh-0")], ssh_auth_sock=sock)
+    monkeypatch.setattr(claude_profile, "_build_forwarding", lambda: fwd)
+    monkeypatch.chdir(_project(tmp_path))
+    with patch("subprocess.Popen") as popen, pytest.raises(SystemExit):
+        popen.return_value.wait.return_value = 0
+        _launch_profile("work", [])
+    argv = popen.call_args[0][0]
+    assert len(_vault_mounts(argv)) == 1
+    assert f"HTTPS_PROXY={AV_PROXY_URL}\n" in _env_file_text(argv)
+    assert AV_TOKEN not in str(popen.call_args.kwargs["env"])
+
+
+def test_agent_vault_unavailable_sandbox_launch_tells_the_agent(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _vault_profile(profiles_base, "10.0.1.5:17323", sandbox=True)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.chdir(_project(tmp_path))
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    argv = mock_exec.call_args[0][1]
+    text = _env_file_text(argv)
+    assert "CLAUDE_SANDBOX_AGENT_VAULT=unavailable\n" in text
+    assert "HTTPS_PROXY" not in text
+    assert not _vault_mounts(argv)
+    assert [arg for arg in argv if "Agent Vault was unavailable" in arg]
+
+
+def test_vault_bundle_mounts_after_the_host_trust_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    anchors = tmp_path / "anchors"
+    anchors.mkdir()
+    (anchors / "corp.pem").write_text("anchor")
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(anchors))
+    monkeypatch.setattr(claude_profile, "SANDBOX_CA_EXTRACTED", str(extracted))
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    bundle = tmp_path / "bundle.pem"
+    bundle.write_text("bundle")
+    argv = _build_sandbox_argv(profile, _project(tmp_path), [], {}, vault_ca=bundle)
+    [mount] = _vault_mounts(argv)
+    assert argv.index(f"{extracted}:{extracted}:ro") < argv.index(mount)
+
+
+def test_agent_vault_run_marker_without_the_cli_variables_fails(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _vault_profile(profiles_base, "10.0.1.5:17323")
+    monkeypatch.setenv(claude_profile.AGENT_VAULT_RUN_ENV, "work")
+    for name in ("HTTPS_PROXY", "SSL_CERT_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    with patch("os.execvpe") as mock_exec, pytest.raises(SystemExit) as exc_info:
+        _launch_profile("work", [])
+    assert exc_info.value.code == 1
+    mock_exec.assert_not_called()
+
+
+def test_agent_vault_run_marker_for_another_profile_is_not_reused(
+    profiles_base: Path, infisical_cli: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A launch from inside another profile's session gets a session of its own.
+    monkeypatch.setenv(claude_profile.AGENT_VAULT_RUN_ENV, "personal")
+    with _ca_server() as proxy:
+        _vault_profile(profiles_base, proxy)
+        with patch("os.execvpe") as mock_exec:
+            _launch_profile("work", [])
+    binary, _argv, env = mock_exec.call_args[0]
+    assert binary == str(infisical_cli)
+    assert env[claude_profile.AGENT_VAULT_RUN_ENV] == "work"
