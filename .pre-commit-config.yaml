@@ -36,7 +36,7 @@ repos:
           (?x)^(
             src/claude_profile/(
               .*\.sh|
-              sandbox/(wl-paste|google-chrome|podman-wrapper|bridge-connect)
+              sandbox/(wl-paste|podman-wrapper|bridge-connect)
             )|
             \.buildkite/run
           )$

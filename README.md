@@ -473,8 +473,7 @@ Credentials the agent in the VM can read or use:
   (`CLAUDE_PROFILE_SANDBOX_INFISICAL`), your Pulumi Cloud token
   (`CLAUDE_PROFILE_SANDBOX_PULUMI`), the variables named in
   `CLAUDE_PROFILE_SANDBOX_FORWARD_ENV`, your clipboard (`CLAUDE_PROFILE_SANDBOX_CLIPBOARD`,
-  read-only), and your logged-in browser through the Claude extension
-  (`CLAUDE_PROFILE_SANDBOX_CHROME`).
+  read-only), and your logged-in browser through the Claude extension (see below).
 
 Not mounted: `~/.ssh` (only a copy of `known_hosts`), your keyring, and other profiles'
 directories.
@@ -495,7 +494,7 @@ What else the VM can reach:
     to the host or plant variables in it.
   - On a host launch of a sandboxed profile you're warned if `statusline.sh` is no longer the
     link to `~/.claude/statusline.sh`.
-  - When a session that forwards anything (SSH, GPG, clipboard, Chrome) ends, you're told
+  - When a session that forwards anything (SSH, GPG, clipboard) ends, you're told
     which MCP servers or `.mcp.json` approvals it added to the profile's `.claude.json`, and
     whether it created a `.claude/settings.local.json`. Other launches can't report this, so
     check `.claude.json` yourself after them.
@@ -504,6 +503,11 @@ What else the VM can reach:
   is yours to review as you would any change the agent makes.
 - **MCP config above the working directory.** Ancestor `.mcp.json` files (often
   `~/.mcp.json`) are mounted read-only, so any API keys in them are readable in the VM.
+- **Your browser.** claude reaches the Claude Chrome extension through Anthropic's bridge,
+  signed in with the profile's claude.ai login, which the VM holds. So while the extension is
+  signed in to that account, anything in the VM can drive your logged-in Chrome with
+  `claude --chrome`, whether or not `CLAUDE_PROFILE_SANDBOX_CHROME` is set (that setting only
+  adds the flag). The extension's site permissions are the limit.
 - **The host's loopback.** When a bridge or a loopback hook is active, the VM runs with
   `--map-host-loopback`, which reaches every service listening on the host's `127.0.0.1`,
   not only the bridges.
@@ -522,6 +526,7 @@ What else the VM can reach:
 | `CLAUDE_PROFILE_SANDBOX_SSH_AGENT` | `false` | Forward your SSH agent(s) into the VM through a token-checked bridge |
 | `CLAUDE_PROFILE_SANDBOX_GPG_AGENT` | `false` | Forward your gpg-agent (signing) into the VM; seeds public keys, mounts `~/.gitconfig` |
 | `CLAUDE_PROFILE_SANDBOX_CLIPBOARD` | `false` | Bridge your clipboard into the VM (read-only) so image paste works; needs `wl-paste` on the host |
+| `CLAUDE_PROFILE_SANDBOX_CHROME` | `false` | Start the VM's claude with `--chrome`, so Claude in Chrome drives your browser through Anthropic's bridge; needs a full OAuth login, not a setup-token |
 | `CLAUDE_PROFILE_SANDBOX_GH` | `false` | Forward your GitHub login into the VM as `GH_TOKEN` (read via `gh auth token`) so `gh` acts as you |
 | `CLAUDE_PROFILE_SANDBOX_INFISICAL` | _(empty)_ | Allowlist (comma-separated emails/domains) of infisical logins to forward into the VM as `INFISICAL_TOKEN`/`--token` |
 | `CLAUDE_PROFILE_SANDBOX_PULUMI` | `false` | Forward your Pulumi Cloud token into the VM as `PULUMI_ACCESS_TOKEN` so `pulumi` acts as you |

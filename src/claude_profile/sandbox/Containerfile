@@ -94,15 +94,6 @@ RUN chmod +x /usr/local/libexec/claude-sandbox/bridge-connect
 COPY wl-paste /usr/local/bin/wl-paste
 RUN chmod +x /usr/local/bin/wl-paste
 
-# Browser-open shim: Claude Code's Chrome integration detects a browser via
-# `which google-chrome` and opens its extension connect/reconnect page by running
-# `google-chrome <url>`. The VM has no browser, so this shim relays the URL to the
-# bridge server's open service (see claude_profile.bridges), which opens it in the
-# real Chrome to wake the extension. Inert unless the launch enabled Chrome forwarding.
-COPY google-chrome /usr/local/bin/google-chrome
-RUN chmod +x /usr/local/bin/google-chrome \
-    && ln -sf google-chrome /usr/local/bin/google-chrome-stable
-
 ENV PATH="/home/appuser/.local/bin:/home/appuser/.pulumi/bin:$PATH"
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["claude"]

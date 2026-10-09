@@ -29,8 +29,7 @@ if [ "$(id -u)" = "0" ]; then
     ln -sf /opt/claude-host/claude /home/appuser/.local/bin/claude
   fi
   # Forwarded sockets live under root-owned trees (/run/claude-sandbox, the in-VM
-  # GNUPGHOME, claude's /tmp scan dir); create their parents, private to the host user,
-  # before dropping. claude refuses its Chrome socket's dir unless it is mode 0700.
+  # GNUPGHOME); create their parents, private to the host user, before dropping.
   if [ -n "$CLAUDE_SANDBOX_FORWARDS" ]; then
     IFS=',' read -ra _forwards <<<"$CLAUDE_SANDBOX_FORWARDS"
     for _fwd in "${_forwards[@]}"; do
@@ -43,10 +42,10 @@ if [ "$(id -u)" = "0" ]; then
   exec runuser -u appuser -- "$0" "$@"
 fi
 
-# Present each forwarded socket (CLAUDE_SANDBOX_FORWARDS = "guest_path=service,...":
-# an SSH or GPG agent, or claude's Chrome native host). Every client connection runs
-# bridge-connect, which reaches the host's bridge server over pasta with this launch's
-# token. Sockets are mode 0600, as claude requires of the Chrome one.
+# Present each forwarded socket (CLAUDE_SANDBOX_FORWARDS = "guest_path=service,...": an
+# SSH or GPG agent). Every client connection runs bridge-connect, which reaches the host's
+# bridge server over pasta with this launch's token. Sockets are mode 0600, private to the
+# host user.
 if [ -n "$CLAUDE_SANDBOX_FORWARDS" ]; then
   IFS=',' read -ra _forwards <<<"$CLAUDE_SANDBOX_FORWARDS"
   for _fwd in "${_forwards[@]}"; do
@@ -56,8 +55,7 @@ if [ -n "$CLAUDE_SANDBOX_FORWARDS" ]; then
     socat "UNIX-LISTEN:${_path},fork,unlink-early,perm=0600" \
       "EXEC:/usr/local/libexec/claude-sandbox/bridge-connect ${_service}" &
   done
-  # claude scans for the Chrome socket at startup, and git may sign straight away, so
-  # wait for every socket to be bound before exec'ing.
+  # git may sign straight away, so wait for every socket to be bound before exec'ing.
   for _fwd in "${_forwards[@]}"; do
     _tries=0
     while [ ! -S "${_fwd%=*}" ] && [ "$_tries" -lt 50 ]; do
@@ -65,17 +63,6 @@ if [ -n "$CLAUDE_SANDBOX_FORWARDS" ]; then
       _tries=$((_tries + 1))
     done
   done
-fi
-
-# claude reports "Extension: Installed" by readdir'ing
-# <chrome-user-data>/<profile>/Extensions/<extension-id>. A VM with no Chrome install always
-# fails that, so /chrome shows "Extension: Not detected" even though the bridge works and the
-# extension really is installed — on the host, where Chrome runs. claude-profile passes the
-# path to create only when it verified the extension on the host, so the status stays honest.
-# Only the directory's existence is checked, so an empty dir suffices; the host's Chrome
-# profile (cookies, history, passwords) is deliberately never exposed to the VM.
-if [ -n "$CLAUDE_SANDBOX_CHROME_EXT_PATH" ]; then
-  mkdir -p "$CLAUDE_SANDBOX_CHROME_EXT_PATH"
 fi
 
 # When the host has custom CA anchors, claude-profile mounts them and the host's

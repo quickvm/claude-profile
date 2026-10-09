@@ -221,27 +221,26 @@ hand.
   adds `--map-host-loopback` even when no agent bridge is active — inside the VM, 127.0.0.1 is
   the VM itself, so without both a local hook receiver would silently never
   hear from sandboxed sessions.
-- **Bridge server (`bridges.py`):** everything the VM reaches on the host — agent sockets, the
-  clipboard, the browser-open shim, the Chrome native host — goes through one
-  `bridges.BridgeServer` that `_run_sandbox_supervised` runs inside the launcher: a TCP listener
-  on `127.0.0.1` (ephemeral port), a daemon thread per connection, closed in `finally`. The VM
-  reaches it through `--network=pasta:--map-host-loopback,…`. Loopback is open to every local
-  user, every container on the host network and every other sandbox VM, so each connection must
-  open with `<token> <service>\n`: the token is 32 random bytes per launch, compared with
-  `hmac.compare_digest`, and a wrong token, an unknown service or a client silent for
-  `HANDSHAKE_TIMEOUT` is dropped without a reply. `_bridge_services` maps the launch's
-  `_Forwarding` to services (`ssh-N`/`gpg` → `unix_relay(host_socket)`, plus `clipboard`,
-  `chrome` and `open`), so a service the launch didn't enable doesn't exist. The VM gets the
-  port as `-e CLAUDE_SANDBOX_BRIDGE_PORT` and the token through the secret env file
-  (`_secret_env_file`), never on podman's argv, which every local user can read in `ps`. In the
-  VM, `entrypoint.sh` presents each `CLAUDE_SANDBOX_FORWARDS` socket (`guest_path=service`) with
+- **Bridge server (`bridges.py`):** everything the VM reaches on the host — agent sockets and the
+  clipboard — goes through one `bridges.BridgeServer` that `_run_sandbox_supervised` runs inside
+  the launcher: a TCP listener on `127.0.0.1` (ephemeral port), a daemon thread per connection,
+  closed in `finally`. The VM reaches it through `--network=pasta:--map-host-loopback,…`. Loopback
+  is open to every local user, every container on the host network and every other sandbox VM, so
+  each connection must open with `<token> <service>\n`: the token is 32 random bytes per launch,
+  compared with `hmac.compare_digest`, and a wrong token, an unknown service or a client silent
+  for `HANDSHAKE_TIMEOUT` is dropped without a reply. `_bridge_services` maps the launch's
+  `_Forwarding` to services (`ssh-N`/`gpg` → `unix_relay(host_socket)`, plus `clipboard`), so a
+  service the launch didn't enable doesn't exist. The VM gets the port as
+  `-e CLAUDE_SANDBOX_BRIDGE_PORT` and the token through the secret env file (`_secret_env_file`),
+  never on podman's argv, which every local user can read in `ps`. In the VM, `entrypoint.sh`
+  presents each `CLAUDE_SANDBOX_FORWARDS` socket (`guest_path=service`) with
   `socat UNIX-LISTEN:…,perm=0600` → `EXEC:bridge-connect <service>`; `bridge-connect`
   (`/usr/local/libexec/claude-sandbox/`) opens the connection with bash `/dev/tcp`, sends the
-  handshake and relays with `socat - FD:3`. The `wl-paste` and `google-chrome` shims send the
-  handshake themselves. The host needs no socat. Because the server lives in the launcher,
-  bridged launches supervise podman (`_run_sandbox_supervised`) instead of `execvpe`. While it
-  waits, SIGTERM and SIGHUP are passed on to podman (`_wait_forwarding_signals`) rather than
-  killing the launcher, which would leave the VM running without its bridges.
+  handshake and relays with `socat - FD:3`. The `wl-paste` shim sends the handshake itself. The
+  host needs no socat. Because the server lives in the launcher, bridged launches supervise podman
+  (`_run_sandbox_supervised`) instead of `execvpe`. While it waits, SIGTERM and SIGHUP are passed
+  on to podman (`_wait_forwarding_signals`) rather than killing the launcher, which would leave
+  the VM running without its bridges.
 - **SSH agent forwarding (`sandbox_ssh_agent`):** a microVM can't bind-mount the agent
   socket (separate kernel), so `_ssh_agent_sockets()` probes the candidates (the active
   `SSH_AUTH_SOCK` agent + 1Password) with `ssh-add -l`, drops dead ones (a stale socket
@@ -307,75 +306,28 @@ hand.
   checks the host has `wl-paste` first. Read-only: the sandbox reads the clipboard but cannot
   write it or reach any other Wayland protocol. The shim is inert unless the launch enabled the
   service.
-- **Claude in Chrome bridge (`sandbox_chrome`):** the `mcp__claude-in-chrome__*` tools drive a
-  browser through a native host Chrome spawns on the host (`claude --chrome-native-host`, wired via
-  the `com.anthropic.claude_code_browser_extension` native-messaging manifest). That native host
-  **binds** a Unix socket at `/tmp/claude-mcp-browser-bridge-<user>/<pid>.sock`; the interactive
-  claude session is the client — it scans that dir, connects out, and (per its `validateSocketSecurity`)
-  requires the dir be mode `0700` owned by the current uid AND the socket itself be mode `0600` (it
-  throws "Insecure socket permissions (expected 0600)" and reports the extension as "Not detected"
-  otherwise — which is why the real native host binds its socket `srw-------`). The microVM has its own
-  kernel, so it can't reach the host socket directly. Discovery is inverted vs. the ssh/gpg bridges
-  (guest connects, not the host), so the guest presents the socket: `_forwarding_env` adds
-  `SANDBOX_CHROME_SOCKET` (`/tmp/claude-mcp-browser-bridge-appuser/host.sock`, the VM user being
-  `appuser`) to `CLAUDE_SANDBOX_FORWARDS` as the `chrome` service, and the entrypoint binds it at
-  mode `0600` in a `0700` dir before exec'ing claude (claude scans at startup). On the host, the
-  bridge's `chrome` service (`bridges.chrome_relay`) picks the **newest** live native-host socket
-  per connection and relays the framed messages, so the bridge follows Chrome across native-host
-  restarts (its pid changes each spawn) and claude's reconnect loop self-heals if Chrome starts
-  after the VM. Like claude's own client, it uses the socket dir only when it is a real directory
-  owned by the user with no group/other permissions, so another local user can't plant a socket
-  there. `_build_forwarding` warns if no native host is listening yet. Nothing but the framed
-  native-messaging relay crosses the boundary — the host filesystem and other browser state stay
-  out of the VM.
-- **Service-worker keepalive (`bridges._ChromeRelay`):** Chrome's MV3 service worker goes idle after
-  ~30s, which closes the native-messaging port and kills the native host, so browser tools break after
-  any idle gap (upstream anthropics/claude-code #16350, #61347 — the keepalive fix requests were
-  stale-closed unfixed). The `chrome` service parses frames rather than copying bytes so it can
-  work around this: the native host is a transparent bridge to the extension service worker
-  (reading the extension's `service-worker.ts` shows every native message hits its `onMessage`
-  handler — an `execute_tool` runs a real browser tool, any other method round-trips as
-  `{"result":{"content":"Unknown method: X"}}` **from the service worker**), and processing an event
-  resets the MV3 idle timer. So during idle gaps (>20s of no traffic) the relay injects a keepalive
-  whose method name is distinctive; the service worker echoes that name back in its "Unknown method"
-  reply, which lets the relay swallow its own keepalive responses so the in-VM claude never sees them.
-  Verified end-to-end: the native host survives 100s+ of idle through the relay (vs ~30s bare). This
-  makes the sandbox's browser connection *more* reliable than a plain host session, which has no
-  keepalive.
-  The native host only exists while Chrome's extension holds its native-messaging port; that spawn is
-  triggered CLI-side by Claude Code opening a connect page (`clau.de/chrome/reconnect`) in a browser,
-  and the extension's service worker idles (dropping the link) — both upstream behaviors the socket
-  bridge can't fix on its own, which is what the browser-open shim below addresses.
-- **Browser-open shim (part of `sandbox_chrome`):** the socket bridge is useless if nothing spawns the
-  host native host, and the VM has no browser to open the connect/reconnect page that wakes the
-  extension. Claude Code detects a browser with `which google-chrome` and opens URLs by running
-  `google-chrome <url>`, so the image ships a `google-chrome` shim (+ `google-chrome-stable` symlink)
-  at `/usr/local/bin` (`src/claude_profile/sandbox/google-chrome`) that sends the URL (bash
-  `/dev/tcp`) to the bridge's `open` service (`bridges.browser_open`). It opens the URL in the
-  host's real Chrome **only** when `chrome_page_allowed` passes it — https, host `clau.de` or
-  `claude.ai`, path `/chrome` or below, no credentials or port — so a misbehaving sandbox can't
-  open arbitrary pages in the host's logged-in browser, and acks `OK`/`NO`. The server offers
-  `open` only with `sandbox_chrome`, so browser detection stays harmless when it is disabled. Net
-  effect: `/chrome` → "Reconnect extension" inside the sandbox opens the page in host Chrome,
-  waking the extension so it spawns the native host the `chrome` service then relays to.
+- **Claude in Chrome (`sandbox_chrome`):** claude reaches the Chrome extension through
+  Anthropic's account-level cloud bridge (`wss://bridge.claudeusercontent.com`): claude and the
+  extension each connect to it with the same claude.ai login, and claude lists the browsers
+  connected for the account (`/chrome` shows "Browser: Browser 1" and "Select browser…", which
+  exist only for bridge connections). A sandboxed session therefore drives the host's Chrome with
+  no local plumbing; verified with claude 2.1.295, where `--chrome` alone opened a page in host
+  Chrome from a VM. `sandbox_chrome` adds `--chrome` (see the gates below) and checks the OAuth
+  scope. `/chrome` in the VM says "Extension: Not detected" because that check looks for the
+  extension in a local browser profile; the tools work regardless. The bridge authenticates with
+  the profile's login, which the VM holds, so anything in the VM can use the browser through it
+  with `claude --chrome`, whether or not `sandbox_chrome` is set; the extension's site permissions
+  are the limit.
 - **Chrome enablement gates (why it says "Disabled"):** claude gates Claude in Chrome behind
   several checks, in this order: an **OAuth scope** check (`KYn()` — the token must carry one of
   `user:profile`/`user:office`/`user:ccr_inference`), then the `--chrome` flag, then
   `CLAUDE_CODE_ENABLE_CFC`, then `dn()` (`!isInteractive`), and only then the profile's
   `claudeInChromeDefaultEnabled`. Two of those bite the sandbox: a profile authenticated with a
-  **setup-token gets `user:inference` only**, so Chrome reports "Disabled" no matter what the
-  bridge does (fix: `CLAUDE_PROFILE_SANDBOX=0 claude-profile <name> /login` for a full OAuth
-  login — `_warn_missing_chrome_scope` checks this at launch and points at the fix); and the
-  sandbox launch trips `dn()`, which sits ahead of the config default, so `_build_sandbox_argv`
-  adds `--chrome` (checked before `dn()`) whenever `sandbox_chrome` is set. claude separately reports
-  **Extension: Installed** by `readdir`-ing `<chrome-user-data>/<profile>/Extensions/<ext-id>`
-  (*not* the native-messaging manifest), which a VM with no Chrome install always fails — so
-  `/chrome` showed "Not detected" even with the bridge working. `_chrome_extension_guest_path`
-  locates the extension in a host browser profile and passes the equivalent in-VM path as
-  `CLAUDE_SANDBOX_CHROME_EXT_PATH`; the entrypoint creates just that directory (only its
-  existence is checked). It returns None when the extension really is absent, so the status stays
-  honest, and the host's Chrome profile — cookies, history, passwords — is never mounted into the
-  VM. Browser tools work through the bridge either way; this only fixes the reported status.
+  **setup-token gets `user:inference` only**, so Chrome reports "Disabled" whatever else is set
+  (fix: `CLAUDE_PROFILE_SANDBOX=0 claude-profile <name> /login` for a full OAuth login —
+  `_warn_missing_chrome_scope` checks this at launch and points at the fix); and the sandbox
+  launch trips `dn()`, which sits ahead of the config default, so `_sandbox_claude_args` adds
+  `--chrome` (checked before `dn()`) whenever `sandbox_chrome` is set.
 - **Protecting the host's native-host wrapper:** the profile is mounted as the in-VM config dir,
   so an in-VM "Install Chrome extension" rewrites `<profile>/chrome/chrome-native-host` to an
   in-VM path (`/home/appuser/…`). Chrome's manifest on the **host** points at that same wrapper,
