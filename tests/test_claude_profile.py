@@ -65,6 +65,7 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     # Point the trust anchors at an absent dir so the developer's real host CAs (this
     # runs on machines that have them) never add a mount. Tests for that path set it.
     monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(tmp_path / "no-ca"))
+    monkeypatch.setattr(claude_profile, "SANDBOX_CA_EXTRACTED", str(tmp_path / "no-ca"))
     monkeypatch.setattr(claude_profile.settings, "sandbox", None)
     monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", False)
@@ -997,23 +998,38 @@ def test_sandbox_mounts_includes_ancestor_mcp_json(
 # ---------------------------------------------------------------------------
 
 
-def test_ca_trust_mounts_when_anchors_present(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def _host_trust(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
+    """A host trust store with one custom anchor and its extracted bundles."""
     anchors = tmp_path / "anchors"
     anchors.mkdir()
     (anchors / "internal-root.pem").write_text("-----BEGIN CERTIFICATE-----")
+    extracted = tmp_path / "extracted"
+    (extracted / "pem").mkdir(parents=True)
     monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(anchors))
+    monkeypatch.setattr(claude_profile, "SANDBOX_CA_EXTRACTED", str(extracted))
+    return anchors, extracted
+
+
+def test_ca_trust_mounts_the_hosts_extracted_bundles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The host has already merged its anchors into the bundles curl, git and openssl
+    # read; running update-ca-trust in the VM instead took about 7 s of every launch.
     # Read-only and deliberately unrelabelled: see _ca_trust_mounts.
-    assert claude_profile._ca_trust_mounts() == ["-v", f"{anchors}:{anchors}:ro"]
+    anchors, extracted = _host_trust(monkeypatch, tmp_path)
+    assert claude_profile._ca_trust_mounts() == [
+        "-v",
+        f"{anchors}:{anchors}:ro",
+        "-v",
+        f"{extracted}:{extracted}:ro",
+    ]
 
 
 def test_ca_trust_mounts_empty_when_no_anchors(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    anchors = tmp_path / "anchors"
-    anchors.mkdir()
-    monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(anchors))
+    anchors, _extracted = _host_trust(monkeypatch, tmp_path)
+    (anchors / "internal-root.pem").unlink()
     assert claude_profile._ca_trust_mounts() == []
 
 
@@ -1024,19 +1040,29 @@ def test_ca_trust_mounts_empty_when_dir_missing(
     assert claude_profile._ca_trust_mounts() == []
 
 
-def test_sandbox_mounts_includes_ca_anchors(
+def test_ca_trust_mounts_empty_without_extracted_bundles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Anchors nothing has extracted would trust nothing in the VM either; say so.
+    _anchors, extracted = _host_trust(monkeypatch, tmp_path)
+    (extracted / "pem").rmdir()
+    extracted.rmdir()
+    assert claude_profile._ca_trust_mounts() == []
+    assert "update-ca-trust" in capsys.readouterr().err
+
+
+def test_sandbox_mounts_includes_host_trust(
     fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    anchors = tmp_path / "anchors"
-    anchors.mkdir()
-    (anchors / "internal-root.pem").write_text("-----BEGIN CERTIFICATE-----")
-    monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(anchors))
+    anchors, extracted = _host_trust(monkeypatch, tmp_path)
     cwd = tmp_path / "repo"
     cwd.mkdir()
     profile = tmp_path / "prof"
     profile.mkdir()
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
-    assert f"{anchors}:{anchors}:ro" in _sandbox_mounts(profile, cwd)
+    mounts = _sandbox_mounts(profile, cwd)
+    assert f"{anchors}:{anchors}:ro" in mounts
+    assert f"{extracted}:{extracted}:ro" in mounts
 
 
 # ---------------------------------------------------------------------------

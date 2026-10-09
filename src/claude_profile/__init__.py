@@ -89,9 +89,11 @@ SANDBOX_GPG_PUBKEYS = "/opt/claude-host/gpg-pubkeys"
 SANDBOX_HOST_CLAUDE = "/opt/claude-host/claude"
 # In-VM path where the shared, read-only MCP image store is mounted (additionalimagestore).
 SANDBOX_IMAGE_STORE = "/var/lib/shared-mcp-store"
-# Trust anchors sourced by update-ca-trust. Same path on host and in the VM: the host's
-# copy is mounted straight over the image's (see _ca_trust_mounts).
+# Trust anchors, and the bundles update-ca-trust extracts from them and the system roots.
+# Same paths on host and in the VM: the host's are mounted over the image's (see
+# _ca_trust_mounts).
 SANDBOX_CA_ANCHORS = "/etc/pki/ca-trust/source/anchors"
+SANDBOX_CA_EXTRACTED = "/etc/pki/ca-trust/extracted"
 # The bridge server's port and this launch's token, as the in-VM side sees them. The
 # token travels in the secret env file (see _secret_env_file), never on podman's argv.
 SANDBOX_BRIDGE_PORT_ENV = "CLAUDE_SANDBOX_BRIDGE_PORT"
@@ -1396,26 +1398,36 @@ def _mcp_json_mounts(cwd: Path) -> list[str]:
 
 
 def _ca_trust_mounts() -> list[str]:
-    """Read-only mount of the host's custom CA anchors, when it has any.
+    """Read-only mounts of the host's trust store, when it has custom CA anchors.
 
     Internal services signed by a private CA fail TLS in the VM otherwise: the image
-    ships only public roots. Mounted at the same path because ``update-ca-trust`` (run
-    by the entrypoint) reads that location and nowhere else, and the image's own anchor
-    dir is empty, so the mount masks nothing.
+    ships only public roots. The host's own update-ca-trust has already merged its
+    anchors with the system roots into the extracted bundles that curl, git and openssl
+    read, so the VM gets those as they are; running update-ca-trust in the VM took about
+    7 s of every launch. The anchors come too, at the path the entrypoint checks before
+    pointing node and python at the bundle. Same paths as on the host, so the bundles'
+    links still resolve.
 
     No ``:z`` here, unlike every other mount: relabelling is for paths the container
-    must *write*, and this one is read-only system state. SELinux already lets
-    containers read ``cert_t``, while ``:z`` would relabel a root-owned system
-    directory out from under the host's own TLS clients (and fail for a rootless
-    podman that cannot chcon it in the first place).
+    must *write*, and these are read-only system state. SELinux already lets containers
+    read ``cert_t``, while ``:z`` would relabel root-owned system directories out from
+    under the host's own TLS clients (and fail for a rootless podman that cannot chcon
+    them in the first place).
     """
     anchors = Path(SANDBOX_CA_ANCHORS)
+    extracted = Path(SANDBOX_CA_EXTRACTED)
     try:
         if not any(anchors.iterdir()):
             return []
     except OSError:
         return []
-    return ["-v", f"{anchors}:{anchors}:ro"]
+    if not extracted.is_dir():
+        err_console.print(
+            f"[yellow]Warning: {anchors} has CA anchors but there is no {extracted}, "
+            f"so the sandbox does not trust them. Run update-ca-trust on the host.[/yellow]"
+        )
+        return []
+    return ["-v", f"{anchors}:{anchors}:ro", "-v", f"{extracted}:{extracted}:ro"]
 
 
 def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
