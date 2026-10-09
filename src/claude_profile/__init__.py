@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -25,6 +26,7 @@ import typer
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from claude_profile import bridges
@@ -88,9 +90,13 @@ SANDBOX_GPG_PUBKEYS = "/opt/claude-host/gpg-pubkeys"
 SANDBOX_HOST_CLAUDE = "/opt/claude-host/claude"
 # In-VM path where the shared, read-only MCP image store is mounted (additionalimagestore).
 SANDBOX_IMAGE_STORE = "/var/lib/shared-mcp-store"
-# Trust anchors sourced by update-ca-trust. Same path on host and in the VM: the host's
-# copy is mounted straight over the image's (see _ca_trust_mounts).
+# ioctl that makes a file share another's blocks (a reflink), from linux/fs.h.
+FICLONE = 0x40049409
+# Trust anchors, and the bundles update-ca-trust extracts from them and the system roots.
+# Same paths on host and in the VM: the host's are mounted over the image's (see
+# _ca_trust_mounts).
 SANDBOX_CA_ANCHORS = "/etc/pki/ca-trust/source/anchors"
+SANDBOX_CA_EXTRACTED = "/etc/pki/ca-trust/extracted"
 # The bridge server's port and this launch's token, as the in-VM side sees them. The
 # token travels in the secret env file (see _secret_env_file), never on podman's argv.
 SANDBOX_BRIDGE_PORT_ENV = "CLAUDE_SANDBOX_BRIDGE_PORT"
@@ -151,10 +157,13 @@ SANDBOX_BRIEFING = (
     "podman/krun VM (confirm with /run/.containerenv). The host filesystem is visible "
     "only where it is mounted: the working directory and its git dir, this profile's "
     "Claude config, and a few read-only files. Whatever you change under those mounts "
-    "persists on the host, where the user later runs it outside the sandbox — git hooks "
-    "and git config, .claude/ settings, and this profile's config included — so treat "
-    "those changes as you would on the host. Anything you install is discarded when "
-    "the session ends, and you have passwordless sudo for dnf and podman. To add a "
+    "persists on the host, so treat those changes as you would on the host. The files "
+    "the host runs commands from are protected instead: this repo's .git/config is "
+    "read-only, so git commands that save settings to it (push -u, branch -u, remote "
+    "add, git config) cannot save them, though the push itself still works (prefer "
+    "`git push origin HEAD`); .git/hooks, this profile's settings.json and "
+    ".claude/settings.local.json are copies, discarded when the session ends along with "
+    "anything you install. You have passwordless sudo for dnf and podman. To add a "
     "missing tool use `sudo dnf "
     "install <pkg>` or `uv tool install <tool>` (see the sandbox-tools skill). Nested "
     "containers run rootful automatically — just use `podman` (it is wrapped to sudo "
@@ -242,10 +251,13 @@ def list_profiles() -> None:
             status = (
                 f"[red]✗ not authenticated[/red] (run: claude-profile {p.name} /login)"
             )
-        sandbox = "✓ microVM" if (p / SANDBOX_MARKER).exists() else "—"
+        sandbox = "✓ microVM" if _sandbox_marked(p) else "—"
         table.add_row(p.name, status, sandbox)
 
     console.print(table)
+    note = _sandbox_override_note()
+    if note is not None:
+        console.print(note)
 
 
 def _setup_dir_link(profile_dir: Path, dir_name: str, link: bool) -> None:
@@ -684,13 +696,15 @@ def manage_sandbox(
         err_console.print(f"[red]Profile '{name}' does not exist.[/red]")
         raise typer.Exit(code=1)
 
-    marker = d / SANDBOX_MARKER
     if not on and not off:
-        state = "microVM" if marker.exists() else "host"
-        console.print(f"Profile '{name}' launches on: {state}")
+        _print_sandbox_status(name, d)
         return
 
+    marker = d / SANDBOX_MARKER
     if on:
+        # touch() would follow a linked marker and create its target instead.
+        if marker.is_symlink():
+            marker.unlink()
         marker.touch()
         console.print(f"[green]Sandbox enabled for '{name}'.[/green]")
         if not _sandbox_image_exists():
@@ -698,6 +712,19 @@ def manage_sandbox(
     else:
         marker.unlink(missing_ok=True)
         console.print(f"[green]Sandbox disabled for '{name}' (runs on host).[/green]")
+    note = _sandbox_override_note()
+    if note is not None and settings.sandbox != on:
+        console.print(f"[yellow]{note}[/yellow]")
+
+
+def _print_sandbox_status(name: str, profile_dir: Path) -> None:
+    """Say where the profile launches, and why when CLAUDE_PROFILE_SANDBOX decides it."""
+    state = "microVM" if _sandbox_enabled(profile_dir) else "host"
+    console.print(f"Profile '{name}' launches on: {state}")
+    note = _sandbox_override_note()
+    if note is not None:
+        own = "microVM" if _sandbox_marked(profile_dir) else "host"
+        console.print(f"{note} Its own setting is {own}.")
 
 
 @app.command("remove")
@@ -1017,52 +1044,87 @@ def _sandbox_state_dir(profile_dir: Path) -> Path:
     in this dir are bind-mounted individually: the VM can change their contents but
     cannot replace them.
     """
-    state = _data_dir() / "profiles" / profile_dir.name
+    state = _sandbox_state_path(profile_dir)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     return state
 
 
-def _sandbox_settings_overlay(profile_dir: Path) -> Path | None:
-    """Write a sandbox-tuned settings.json (host sudo deny stripped) to mount in the VM.
+def _sandbox_state_path(profile_dir: Path) -> Path:
+    """Where _sandbox_state_dir keeps a profile's files; it exists once a launch has."""
+    return _data_dir() / "profiles" / profile_dir.name
 
-    The profile's settings.json is copied from the host and carries host-oriented deny
-    rules (e.g. ``Bash(sudo *)``) that still apply inside the VM — deny wins even under
-    --dangerously-skip-permissions. The microVM is the isolation boundary and grants
-    scoped sudo, so we strip those denies into an overlay mounted only in the VM; the
-    profile's real settings.json (used by host launches) is untouched. Returns the
-    overlay path, or None when there is no settings.json or nothing to strip.
+
+def _sandbox_settings_overlay(profile_dir: Path) -> Path:
+    """Write the VM's per-launch copy of the profile's settings.json; return its path.
+
+    claude on the host runs the hooks and statusline command in settings.json, and the
+    VM sees the profile dir read-write, so the VM gets this copy mounted over the file
+    instead: settings it changes last the session and never reach the host. The copy
+    drops the host-oriented deny rules matching SANDBOX_STRIP_DENY_PREFIXES (e.g.
+    ``Bash(sudo *)``): deny wins even under --dangerously-skip-permissions, and the VM
+    grants scoped sudo. A missing settings.json is created as ``{}`` so there is a file
+    to mount over, which podman would otherwise create empty on the host. A linked one is
+    never read through: the VM could have aimed the link at another profile's
+    credentials to get them copied into the next sandbox.
     """
     src = profile_dir / "settings.json"
-    if not src.exists():
-        return None
-    try:
-        data = json.loads(src.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    perms = data.get("permissions")
-    if not isinstance(perms, dict) or not isinstance(perms.get("deny"), list):
-        return None
-    deny = perms["deny"]
-    kept = [
-        rule
-        for rule in deny
-        if not (isinstance(rule, str) and rule.startswith(SANDBOX_STRIP_DENY_PREFIXES))
-    ]
-    if len(kept) == len(deny):
-        return None
-    perms["deny"] = kept
+    if src.is_symlink():
+        err_console.print(
+            f"[yellow]Warning: {src} is a symlink, so the sandbox gets empty settings "
+            f"instead of reading through it. Replace it with a regular file to use "
+            f"these settings in the sandbox.[/yellow]"
+        )
+        content = b"{}\n"
+    else:
+        if not src.exists():
+            src.write_text("{}\n")
+        content = _sandbox_settings_content(src)
     overlay = _sandbox_state_dir(profile_dir) / "settings.json"
     try:
-        overlay.write_text(json.dumps(data, indent=2))
+        overlay.write_bytes(content)
     except OSError as exc:
         err_console.print(
-            f"[yellow]Warning: could not write {overlay} ({exc}), so the profile's "
-            f"deny rules, including Bash(sudo …), stay in force in the sandbox.[/yellow]"
+            f"[red]Could not write the sandbox's copy of settings.json to {overlay} "
+            f"({exc}).[/red] Without it the VM would change the profile's real settings."
         )
-        return None
+        sys.exit(1)
     return overlay
+
+
+def _sandbox_settings_content(src: Path) -> bytes:
+    """The profile's settings.json as the VM gets it, the host's sudo denies dropped."""
+    try:
+        raw = src.read_bytes()
+    except OSError as exc:
+        err_console.print(f"[red]Could not read {src} ({exc}).[/red]")
+        sys.exit(1)
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    if not _strip_sandbox_denies(data):
+        return raw
+    return json.dumps(data, indent=2).encode()
+
+
+def _strip_sandbox_denies(data: object) -> bool:
+    """Drop the host-oriented denies in SANDBOX_STRIP_DENY_PREFIXES from a settings object.
+
+    deny wins even under --dangerously-skip-permissions, so a host's ``Bash(sudo *)``
+    would block the VM's own scoped sudo. Returns whether any rule was dropped.
+    """
+    perms = data.get("permissions") if isinstance(data, dict) else None
+    if not isinstance(perms, dict) or not isinstance(perms.get("deny"), list):
+        return False
+    kept = [
+        rule
+        for rule in perms["deny"]
+        if not (isinstance(rule, str) and rule.startswith(SANDBOX_STRIP_DENY_PREFIXES))
+    ]
+    if len(kept) == len(perms["deny"]):
+        return False
+    perms["deny"] = kept
+    return True
 
 
 def _has_option(args: list[str], name: str) -> bool:
@@ -1077,8 +1139,9 @@ def _shared_settings_args(
 
     ``shared-settings.json`` in the profiles base holds settings every profile gets, such
     as hooks. claude merges ``--settings`` over the profile's own settings.json, and hook
-    entries from both run. ``{profile}`` in any string becomes the profile name; in the
-    sandbox, HTTP hooks aimed at the host's loopback are re-pointed so they still reach it.
+    entries from both run. ``{profile}`` in any string becomes the profile name. In the
+    sandbox, HTTP hooks aimed at the host's loopback are re-pointed so they still reach it,
+    and host-oriented denies are dropped as from the profile's settings.json.
     """
     path = settings.profiles_base / SHARED_SETTINGS
     if not path.exists():
@@ -1097,6 +1160,8 @@ def _shared_settings_args(
         err_console.print(f"[red]{path} must hold a JSON object.[/red]")
         sys.exit(1)
     host_loopback = sandbox and _rewrite_loopback_hooks(data)
+    if sandbox:
+        _strip_sandbox_denies(data)
     return ["--settings", json.dumps(data)], host_loopback
 
 
@@ -1217,6 +1282,20 @@ def _sandbox_known_hosts(profile_dir: Path) -> Path:
     return dest
 
 
+def _host_file_copy(profile_dir: Path, source: Path, name: str) -> Path | None:
+    """Copy a host file into the profile's state dir to mount; None when it is absent.
+
+    Mounting the user's own file with :z would relabel it for containers, out from under
+    the host's tools and restorecon (known_hosts is ssh_home_t), so the VM gets a copy,
+    refreshed every launch, and :z relabels that instead.
+    """
+    if not source.is_file():
+        return None
+    copy = _sandbox_state_dir(profile_dir) / name
+    copy.write_bytes(source.read_bytes())
+    return copy
+
+
 def _host_claude_binary() -> Path | None:
     """The host's Claude Code binary, when it came from the native installer.
 
@@ -1280,7 +1359,7 @@ def _sandbox_claude_binary() -> Path | None:
         if not dest.exists():
             # Copy to a temp name and rename, so an interrupted launch can't leave a
             # truncated binary that later launches would mistake for a complete one.
-            shutil.copy(source, partial)
+            _clone_or_copy(source, partial)
             os.replace(partial, dest)
         for entry in cache.iterdir():
             if entry != dest and _stale_claude_copy(entry):
@@ -1294,6 +1373,22 @@ def _sandbox_claude_binary() -> Path | None:
         )
         return None
     return dest
+
+
+def _clone_or_copy(source: Path, dest: Path) -> None:
+    """Copy source to dest, sharing its blocks (a reflink) where the filesystem can.
+
+    On btrfs or XFS the clone is instant and takes no space, where a copy of the claude
+    binary writes 256 MB at every host update; elsewhere, or across filesystems, the
+    ioctl fails and a plain copy runs. The mode is copied either way, so the binary stays
+    executable.
+    """
+    try:
+        with source.open("rb") as src, dest.open("wb") as dst:
+            fcntl.ioctl(dst.fileno(), FICLONE, src.fileno())
+    except OSError:
+        shutil.copyfile(source, dest)
+    shutil.copymode(source, dest)
 
 
 def _ancestor_mcp_json(cwd: Path) -> list[Path]:
@@ -1322,26 +1417,36 @@ def _mcp_json_mounts(cwd: Path) -> list[str]:
 
 
 def _ca_trust_mounts() -> list[str]:
-    """Read-only mount of the host's custom CA anchors, when it has any.
+    """Read-only mounts of the host's trust store, when it has custom CA anchors.
 
     Internal services signed by a private CA fail TLS in the VM otherwise: the image
-    ships only public roots. Mounted at the same path because ``update-ca-trust`` (run
-    by the entrypoint) reads that location and nowhere else, and the image's own anchor
-    dir is empty, so the mount masks nothing.
+    ships only public roots. The host's own update-ca-trust has already merged its
+    anchors with the system roots into the extracted bundles that curl, git and openssl
+    read, so the VM gets those as they are; running update-ca-trust in the VM took about
+    7 s of every launch. The anchors come too, at the path the entrypoint checks before
+    pointing node and python at the bundle. Same paths as on the host, so the bundles'
+    links still resolve.
 
     No ``:z`` here, unlike every other mount: relabelling is for paths the container
-    must *write*, and this one is read-only system state. SELinux already lets
-    containers read ``cert_t``, while ``:z`` would relabel a root-owned system
-    directory out from under the host's own TLS clients (and fail for a rootless
-    podman that cannot chcon it in the first place).
+    must *write*, and these are read-only system state. SELinux already lets containers
+    read ``cert_t``, while ``:z`` would relabel root-owned system directories out from
+    under the host's own TLS clients (and fail for a rootless podman that cannot chcon
+    them in the first place).
     """
     anchors = Path(SANDBOX_CA_ANCHORS)
+    extracted = Path(SANDBOX_CA_EXTRACTED)
     try:
         if not any(anchors.iterdir()):
             return []
     except OSError:
         return []
-    return ["-v", f"{anchors}:{anchors}:ro"]
+    if not extracted.is_dir():
+        err_console.print(
+            f"[yellow]Warning: {anchors} has CA anchors but there is no {extracted}, "
+            f"so the sandbox does not trust them. Run update-ca-trust on the host.[/yellow]"
+        )
+        return []
+    return ["-v", f"{anchors}:{anchors}:ro", "-v", f"{extracted}:{extracted}:ro"]
 
 
 def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
@@ -1365,19 +1470,22 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
         "-v",
         f"{_sandbox_chrome_overlay(profile_dir)}:{SANDBOX_CONFIG_DIR}/chrome:z",
     ]
+    # Override just settings.json inside the VM; writes land in the throwaway overlay
+    # (regenerated each launch), not the profile's real settings.json.
     overlay = _sandbox_settings_overlay(profile_dir)
-    if overlay is not None:
-        # Override just settings.json inside the VM; writes land in the throwaway
-        # overlay (regenerated each launch), not the profile's real settings.json.
-        mounts += ["-v", f"{overlay}:{SANDBOX_CONFIG_DIR}/settings.json:z"]
+    mounts += ["-v", f"{overlay}:{SANDBOX_CONFIG_DIR}/settings.json:z"]
     git_dir = _git_common_dir(cwd)
     if git_dir is not None and git_dir != root and root not in git_dir.parents:
         mounts += ["-v", f"{git_dir}:{git_dir}:z"]
-    gitconfig = Path.home() / ".gitconfig"
-    if gitconfig.exists():
-        mounts += ["-v", f"{gitconfig}:/home/appuser/.gitconfig:ro,z"]
-    host_known_hosts = Path.home() / ".ssh" / "known_hosts"
-    if host_known_hosts.exists():
+    mounts += _git_state_mounts(profile_dir, cwd)
+    mounts += _local_settings_mounts(profile_dir, root, cwd)
+    gitconfig = _host_file_copy(profile_dir, Path.home() / ".gitconfig", "gitconfig")
+    if gitconfig is not None:
+        mounts += ["-v", f"{gitconfig}:{SANDBOX_GITCONFIG}:ro,z"]
+    host_known_hosts = _host_file_copy(
+        profile_dir, Path.home() / ".ssh" / "known_hosts", "host_known_hosts"
+    )
+    if host_known_hosts is not None:
         # Read-only *global* known_hosts: ssh verifies already-trusted hosts against it
         # but never writes it, so the sandbox can't modify the host's real file.
         mounts += ["-v", f"{host_known_hosts}:/etc/ssh/ssh_known_hosts:ro,z"]
@@ -1420,6 +1528,137 @@ def _launch_state_mounts(profile_dir: Path) -> list[str]:
     return mounts
 
 
+def _git_state_mounts(profile_dir: Path, cwd: Path) -> list[str]:
+    """Keep the VM from changing the git config and hooks that the host runs.
+
+    The work tree and its git dir are mounted read-write, so the agent could otherwise
+    set core.fsmonitor, core.sshCommand or an alias in .git/config, or plant a hook, and
+    the host would run it at its next git command in the repo: a shell prompt's
+    `git status` is enough, even while the VM is still running. Each git dir's config,
+    the repo's and its submodules', is mounted read-only over itself. git writes config
+    by renaming a lock file over it, which the mount refuses, so commands that save
+    settings there (push -u, branch -u, remote add) cannot save them; the briefing says
+    so. hooks/ becomes a throwaway copy (see _sandbox_hooks_copy).
+    """
+    common = _git_common_dir(cwd)
+    if common is None:
+        return []
+    mounts: list[str] = []
+    for git_dir in [common, *_submodule_git_dirs(common)]:
+        mounts += _git_dir_mounts(profile_dir, git_dir)
+    return mounts
+
+
+def _git_dir_mounts(profile_dir: Path, git_dir: Path) -> list[str]:
+    """Pin one git dir's config read-only and give the VM a copy of its hooks."""
+    config = git_dir / "config"
+    hooks = git_dir / "hooks"
+    for path in (config, hooks):
+        if path.is_symlink():
+            err_console.print(
+                f"[yellow]Warning: {path} is a symlink, which git does not create, so the "
+                f"sandbox cannot protect it. Check where it points.[/yellow]"
+            )
+    mounts: list[str] = []
+    if config.is_file() and not config.is_symlink():
+        mounts += ["-v", f"{config}:{config}:ro,z"]
+    if not hooks.is_symlink():
+        mounts += ["-v", f"{_sandbox_hooks_copy(profile_dir, hooks)}:{hooks}:z"]
+    return mounts
+
+
+def _submodule_git_dirs(git_dir: Path) -> list[Path]:
+    """Git dirs of the repo's submodules under modules/, nested submodules included."""
+    found: list[Path] = []
+    pending = [git_dir / "modules"]
+    while pending:
+        current = pending.pop()
+        if not current.is_dir() or current.is_symlink():
+            continue
+        for child in sorted(current.iterdir()):
+            # A link here could pass off another repo's git dir as a submodule's.
+            if child.is_symlink() or not child.is_dir():
+                continue
+            if (child / "HEAD").is_file() and (child / "objects").is_dir():
+                found.append(child)
+                pending.append(child / "modules")
+            else:
+                # A submodule named vendor/lib keeps its git dir in modules/vendor/lib.
+                pending.append(child)
+    return found
+
+
+def _sandbox_hooks_copy(profile_dir: Path, hooks: Path) -> Path:
+    """Refresh the VM's throwaway copy of a git dir's hooks/ and return its path.
+
+    The host's hooks keep running in the VM and `prek install` works there, but nothing
+    the VM writes reaches the hooks the host runs: each launch starts again from the
+    host's. Links are copied as links, never followed, which would copy whatever they
+    point at into the VM.
+    """
+    key = hashlib.sha256(str(hooks).encode()).hexdigest()[:16]
+    copy = _sandbox_state_dir(profile_dir) / "git-hooks" / key
+    copy.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        for entry in copy.iterdir():
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+    except OSError as exc:
+        err_console.print(
+            f"[red]Could not clear the sandbox's copy of {hooks} at {copy} ({exc}).[/red] "
+            f"A container in the VM may have written files your user cannot delete; "
+            f"remove them with: podman unshare rm -r {copy}"
+        )
+        sys.exit(1)
+    if hooks.is_dir():
+        try:
+            shutil.copytree(hooks, copy, symlinks=True, dirs_exist_ok=True)
+        except OSError as exc:
+            err_console.print(
+                f"[yellow]Warning: could not copy every hook from {hooks} into the "
+                f"sandbox ({exc}); git in the VM runs without the missing ones.[/yellow]"
+            )
+    return copy
+
+
+def _local_settings_paths(root: Path, cwd: Path) -> list[Path]:
+    """The .claude/settings.local.json files claude reads for a launch in cwd."""
+    return [
+        base / ".claude" / "settings.local.json" for base in dict.fromkeys((root, cwd))
+    ]
+
+
+def _local_settings_mounts(profile_dir: Path, root: Path, cwd: Path) -> list[str]:
+    """Per-launch copies of the project's .claude/settings.local.json for the VM.
+
+    claude on the host loads hooks from this file at the work tree root and at the
+    launch dir, and git ignores it, so a change made in the VM would run on the host
+    unnoticed. Where the file exists the VM gets a copy instead, never read through a
+    link (see _sandbox_settings_overlay). Where it does not, mounting one would create it
+    on the host, so a supervised session reports one the VM creates instead.
+    """
+    mounts: list[str] = []
+    for local in _local_settings_paths(root, cwd):
+        if not os.path.lexists(local) or local.is_dir():
+            continue
+        content = b"{}\n"
+        if local.is_symlink():
+            err_console.print(
+                f"[yellow]Warning: {local} is a symlink, so the sandbox gets empty "
+                f"local settings there instead of reading through it.[/yellow]"
+            )
+        else:
+            content = local.read_bytes()
+        key = hashlib.sha256(str(local).encode()).hexdigest()[:16]
+        copy = _sandbox_state_dir(profile_dir) / "local-settings" / f"{key}.json"
+        copy.parent.mkdir(mode=0o700, exist_ok=True)
+        copy.write_bytes(content)
+        mounts += ["-v", f"{copy}:{local}:z"]
+    return mounts
+
+
 def _linked_mounts(profile_dir: Path) -> list[str]:
     """Read-only mounts for the profile entries symlinked into the global ~/.claude.
 
@@ -1443,7 +1682,7 @@ def _linked_mounts(profile_dir: Path) -> list[str]:
         if target != expected:
             err_console.print(
                 f"[yellow]Warning: not mounting {link} into the sandbox: it points at "
-                f"{target}, not {expected}. Re-point it with: "
+                f"{_shown(str(target))}, not {expected}. Re-point it with: "
                 f"ln -sfn {expected} {link}[/yellow]"
             )
             continue
@@ -1508,6 +1747,9 @@ def _build_sandbox_argv(
         "--annotation",
         "krun.use_passt=1",
         "--userns=keep-id",
+        # podman otherwise passes the host's *_proxy variables in, a proxy URL's
+        # credentials included; the VM gets only what the launcher forwards.
+        "--http-proxy=false",
         "--device",
         "/dev/kvm",
     ]
@@ -2334,6 +2576,7 @@ def _run_sandbox_supervised(
             forwarding,
             bridge=(server.port, server.token),
         )
+        before = _host_trust_state(profile_dir, cwd)
         server.start()
         # close_fds=False: podman reads its --env-file through an inherited fd (see
         # _secret_env_file); Python opens every other fd non-inheritable, the bridge
@@ -2343,7 +2586,80 @@ def _run_sandbox_supervised(
         )
     finally:
         server.close()
+    _report_host_trust_changes(profile_dir, cwd, before)
     sys.exit(128 - returncode if returncode < 0 else returncode)
+
+
+def _shown(text: str) -> str:
+    """text made safe to print: VM-controlled names could carry markup or ANSI escapes."""
+    return escape("".join(char if char.isprintable() else "?" for char in text))
+
+
+def _mcp_servers_state(servers: object, scope: str) -> dict[str, object]:
+    if not isinstance(servers, dict):
+        return {}
+    return {
+        f"MCP server '{_shown(str(name))}' ({scope})": server
+        for name, server in servers.items()
+    }
+
+
+def _mcp_project_state(path: str, project: dict[str, Any]) -> dict[str, object]:
+    scope = f"project {_shown(path)}"
+    state = _mcp_servers_state(project.get("mcpServers"), scope)
+    approved = project.get("enabledMcpjsonServers")
+    if isinstance(approved, list):
+        for name in approved:
+            state[f"enabledMcpjsonServers '{_shown(str(name))}' ({scope})"] = True
+    if project.get("enableAllProjectMcpServers") is True:
+        state[f"enableAllProjectMcpServers ({scope})"] = True
+    return state
+
+
+def _host_trust_state(profile_dir: Path, cwd: Path) -> dict[str, object]:
+    """What the host would run from files the VM can write, keyed by a description.
+
+    Covers the MCP servers in the profile's .claude.json, the project approvals that
+    start .mcp.json servers without asking, and which .claude/settings.local.json files
+    claude reads for cwd exist. Only what adds or changes a command counts: claude itself
+    writes empty approval lists, and removing a server runs nothing.
+    """
+    state: dict[str, object] = {}
+    try:
+        data = json.loads((profile_dir / ".claude.json").read_bytes())
+    except (OSError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        state.update(_mcp_servers_state(data.get("mcpServers"), "user scope"))
+        projects = data.get("projects")
+        for path, project in projects.items() if isinstance(projects, dict) else []:
+            if isinstance(project, dict):
+                state.update(_mcp_project_state(str(path), project))
+    for local in _local_settings_paths(_sandbox_work_root(cwd), cwd):
+        if os.path.lexists(local):
+            state[escape(str(local))] = True
+    return state
+
+
+def _report_host_trust_changes(
+    profile_dir: Path, cwd: Path, before: dict[str, object]
+) -> None:
+    """Warn about what the session added or changed that claude will run on the host.
+
+    These stay writable from the VM: copies of .claude.json would lose the session's
+    own state, and a .claude/settings.local.json that did not exist had nothing to copy.
+    """
+    after = _host_trust_state(profile_dir, cwd)
+    changed = [key for key, value in after.items() if before.get(key) != value]
+    if not changed:
+        return
+    listing = "".join(f"\n  {key}" for key in changed)
+    err_console.print(
+        f"[yellow]Warning: the sandboxed session added or changed what claude runs on the "
+        f"host:{listing}\nThe MCP entries are in {profile_dir / '.claude.json'}. Check "
+        f"these before running claude on the host with this profile or in this "
+        f"project.[/yellow]"
+    )
 
 
 def _wait_forwarding_signals(proc: subprocess.Popen[bytes]) -> int:
@@ -2376,8 +2692,48 @@ def _sandbox_enabled(profile_dir: Path) -> bool:
     """
     if settings.sandbox is not None:
         return settings.sandbox
-    # lexists: a marker planted as a dangling link still counts, failing safe.
+    return _sandbox_marked(profile_dir)
+
+
+def _sandbox_marked(profile_dir: Path) -> bool:
+    """True when the profile has the .sandbox marker.
+
+    lexists: a marker planted as a dangling link still counts, failing safe.
+    """
     return os.path.lexists(profile_dir / SANDBOX_MARKER)
+
+
+def _sandbox_override_note() -> str | None:
+    """What CLAUDE_PROFILE_SANDBOX does to every launch while it is set, or None."""
+    if settings.sandbox is None:
+        return None
+    where = "in a microVM" if settings.sandbox else "on the host"
+    return f"CLAUDE_PROFILE_SANDBOX is set, so every profile launches {where} until it is unset."
+
+
+def _was_sandboxed(profile_dir: Path) -> bool:
+    """True when the profile is marked for the sandbox or has been launched in one."""
+    return _sandbox_marked(profile_dir) or _sandbox_state_path(profile_dir).is_dir()
+
+
+def _check_statusline_link(profile_dir: Path) -> None:
+    """Warn when a sandboxed profile's statusline.sh is not the global link `add` makes.
+
+    claude runs the statusline command on the host at every host launch of the profile.
+    The VM cannot change the global script, which it gets read-only, but it sees the
+    profile dir read-write, so it can swap the link for a script of its own.
+    """
+    link = profile_dir / STATUSLINE_FILE
+    if not os.path.lexists(link) or not _was_sandboxed(profile_dir):
+        return
+    expected = Path.home() / ".claude" / STATUSLINE_FILE
+    if link.is_symlink() and Path(os.readlink(link)) == expected:
+        return
+    err_console.print(
+        f"[yellow]Warning: {link} is not the link to {expected} that claude-profile "
+        f"creates. A sandboxed session can replace it, and claude runs it on the host. "
+        f"Check it, then relink it: ln -sfn {expected} {link}[/yellow]"
+    )
 
 
 def _launch_profile(name: str, claude_args: list[str]) -> None:
@@ -2392,6 +2748,7 @@ def _launch_profile(name: str, claude_args: list[str]) -> None:
     if _sandbox_enabled(d):
         _launch_sandbox(d, claude_args, extra_env)
         return
+    _check_statusline_link(d)
     shared, _host_loopback = _shared_settings_args(name, claude_args, sandbox=False)
     env = os.environ.copy()
     env["CLAUDE_CONFIG_DIR"] = str(d)

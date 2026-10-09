@@ -1,8 +1,10 @@
 # Sandbox image for `claude-profile` microVM mode (podman + krun runtime).
 # Build with: claude-profile build
 # Extend this file for project-specific tooling, then rebuild.
-# Tool versions and the base image are pinned; bump them deliberately.
-FROM registry.fedoraproject.org/fedora:44@sha256:b0b2ac1c4a682dea428ae05a0065824178ad951c304c3ac15c29daa8335e0599
+# Tool versions and the base image are pinned; bump them deliberately (the tag and the
+# digest together).
+ARG FEDORA_DIGEST=sha256:b0b2ac1c4a682dea428ae05a0065824178ad951c304c3ac15c29daa8335e0599
+FROM registry.fedoraproject.org/fedora:44@${FEDORA_DIGEST}
 
 RUN dnf install -y \
       git gh ripgrep fd-find jq yq less ca-certificates openssh-clients socat \
@@ -50,7 +52,11 @@ RUN useradd -m -u 1000 -U appuser \
 # back a native overlay ("upper fs missing required features"), and vfs copies every
 # layer. fuse-overlayfs gives real layered storage on any backing filesystem.
 RUN mkdir -p /etc/containers \
-    && printf '[storage]\ndriver = "overlay"\n[storage.options.overlay]\nmount_program = "/usr/bin/fuse-overlayfs"\n' \
+    && printf '%s\n' \
+       '[storage]' \
+       'driver = "overlay"' \
+       '[storage.options.overlay]' \
+       'mount_program = "/usr/bin/fuse-overlayfs"' \
        > /etc/containers/storage.conf
 
 # Route `podman` through rootful sudo inside the VM (see the wrapper script header).

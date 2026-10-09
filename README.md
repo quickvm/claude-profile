@@ -460,17 +460,48 @@ network egress — and the agent can read the profile credentials mounted into t
 genuinely untrusted code, prefer a full or cloud VM. This is based on the Fedora Magazine
 article [Sandbox AI coding agents with microVMs on Fedora Linux](https://fedoramagazine.org/sandbox-ai-coding-agents-with-microvms-on-fedora-linux/).
 
+Credentials the agent in the VM can read or use:
+
+- **Always:** the profile's Claude login (`.credentials.json` in the mounted profile
+  directory), the profile's `.env` values (as environment variables), tokens in the MCP
+  server entries of the profile's `.claude.json`, API keys in ancestor `.mcp.json` files
+  (see below), and anything in a copy of your `~/.gitconfig`, such as a token in a remote URL.
+- **When you turn them on:** your SSH agents (`CLAUDE_PROFILE_SANDBOX_SSH_AGENT`: it can
+  authenticate with your keys, not read them), gpg-agent (`CLAUDE_PROFILE_SANDBOX_GPG_AGENT`:
+  it can sign and decrypt, not read the secret keys), your GitHub token
+  (`CLAUDE_PROFILE_SANDBOX_GH`), the allowlisted Infisical logins
+  (`CLAUDE_PROFILE_SANDBOX_INFISICAL`), your Pulumi Cloud token
+  (`CLAUDE_PROFILE_SANDBOX_PULUMI`), the variables named in
+  `CLAUDE_PROFILE_SANDBOX_FORWARD_ENV`, your clipboard (`CLAUDE_PROFILE_SANDBOX_CLIPBOARD`,
+  read-only), and your logged-in browser through the Claude extension
+  (`CLAUDE_PROFILE_SANDBOX_CHROME`).
+
+Not mounted: `~/.ssh` (only a copy of `known_hosts`), your keyring, and other profiles'
+directories.
+
 What else the VM can reach:
 
 - **Writable state the host trusts later.** The profile directory and the working tree are
-  mounted read-write, so the agent can change files that run on the host afterwards. In the
-  profile: `.claude.json` (MCP server commands), `statusline.sh` and, unless the sandbox
-  overlays it, `settings.json` (hooks), all of which apply to a host launch of the same
-  profile (`CLAUDE_PROFILE_SANDBOX=0`). The `.sandbox` marker and `.env` are mounted
-  read-only, so the agent cannot switch the next launch to the host or plant variables in
-  it. In the repo: git hooks, `.git/config` and `.claude/` settings, which apply the next
-  time you run git or claude there on the host. Check changes to these before using them
-  on the host, or keep a sandboxed profile sandbox-only.
+  mounted read-write, so the agent could change files that run on the host afterwards. The
+  ones the launcher knows about are protected:
+  - The repo's `.git/config` (and each submodule's) is read-only in the VM, so the agent can't
+    set something like `core.fsmonitor` that your next `git status` would run. Git commands
+    that save config there can't save it: `git push -u` pushes but doesn't record the
+    upstream, and `git remote add` fails.
+  - `.git/hooks/`, the profile's `settings.json` and the project's
+    `.claude/settings.local.json` are copies in the VM, thrown away when it exits. Hooks you
+    have on the host still run in the VM.
+  - The `.sandbox` marker and `.env` are read-only, so the agent can't switch the next launch
+    to the host or plant variables in it.
+  - On a host launch of a sandboxed profile you're warned if `statusline.sh` is no longer the
+    link to `~/.claude/statusline.sh`.
+  - When a session that forwards anything (SSH, GPG, clipboard, Chrome) ends, you're told
+    which MCP servers or `.mcp.json` approvals it added to the profile's `.claude.json`, and
+    whether it created a `.claude/settings.local.json`. Other launches can't report this, so
+    check `.claude.json` yourself after them.
+
+  Everything else in the working tree, `.claude/settings.json` and `.mcp.json` included,
+  is yours to review as you would any change the agent makes.
 - **MCP config above the working directory.** Ancestor `.mcp.json` files (often
   `~/.mcp.json`) are mounted read-only, so any API keys in them are readable in the VM.
 - **The host's loopback.** When a bridge or a loopback hook is active, the VM runs with
@@ -494,7 +525,7 @@ What else the VM can reach:
 | `CLAUDE_PROFILE_SANDBOX_GH` | `false` | Forward your GitHub login into the VM as `GH_TOKEN` (read via `gh auth token`) so `gh` acts as you |
 | `CLAUDE_PROFILE_SANDBOX_INFISICAL` | _(empty)_ | Allowlist (comma-separated emails/domains) of infisical logins to forward into the VM as `INFISICAL_TOKEN`/`--token` |
 | `CLAUDE_PROFILE_SANDBOX_PULUMI` | `false` | Forward your Pulumi Cloud token into the VM as `PULUMI_ACCESS_TOKEN` so `pulumi` acts as you |
-| `CLAUDE_PROFILE_SANDBOX_FORWARD_ENV` | _(empty)_ | Comma-separated host env var names to copy into the VM (e.g. tokens MCP servers pass through as `-e VAR`) |
+| `CLAUDE_PROFILE_SANDBOX_FORWARD_ENV` | _(empty)_ | Comma-separated host env var names to copy into the VM (e.g. tokens MCP servers pass through as `-e VAR`, or `HTTPS_PROXY`: the host's proxy settings aren't passed in otherwise) |
 | `CLAUDE_PROFILE_SANDBOX` | _(unset)_ | Per-launch override: `1` forces microVM, `0` forces host; unset uses the profile's setting |
 
 ## License
