@@ -11,7 +11,6 @@ import os
 import re
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -101,21 +100,6 @@ SANDBOX_CA_EXTRACTED = "/etc/pki/ca-trust/extracted"
 # token travels in the secret env file (see _secret_env_file), never on podman's argv.
 SANDBOX_BRIDGE_PORT_ENV = "CLAUDE_SANDBOX_BRIDGE_PORT"
 SANDBOX_BRIDGE_TOKEN_ENV = "CLAUDE_SANDBOX_BRIDGE_TOKEN"
-# In-VM socket claude finds the Claude-in-Chrome native host at (its scan dir, under the
-# image user's name), relayed to the host's native host by the bridge's chrome service.
-SANDBOX_CHROME_SOCKET = "/tmp/claude-mcp-browser-bridge-appuser/host.sock"
-# Chrome Web Store id of the Claude extension, and the env var naming the in-VM path to
-# create so claude's extension detection (a readdir of
-# <chrome-user-data>/<profile>/Extensions/<id>) succeeds inside the sandbox.
-CHROME_EXTENSION_ID = "fcoeoabgfenejglbffodgkkbkcdhcgfn"
-SANDBOX_CHROME_EXT_PATH_ENV = "CLAUDE_SANDBOX_CHROME_EXT_PATH"
-# Chromium-family user-data dirs under ~/.config to look for the extension in.
-CHROME_USER_DATA_DIRS: tuple[str, ...] = (
-    "google-chrome",
-    "chromium",
-    "microsoft-edge",
-    "BraveSoftware/Brave-Browser",
-)
 # OAuth scopes claude accepts for Claude in Chrome. It gates the integration on the token
 # carrying one of these *before* every other enable condition, so a profile authenticated
 # with a setup-token (which grants user:inference only) silently reports "Disabled".
@@ -1701,7 +1685,6 @@ class _Forwarding:
     ssh_auth_sock: Path | None = None
     gpg_pubkeys: bytes | None = None  # host public keyring (gpg --export)
     clipboard: bool = False  # read-only host clipboard (the in-VM wl-paste shim)
-    chrome: bool = False  # Claude-in-Chrome relay and the browser-open shim
 
     def gpg(self) -> bool:
         """True when the host gpg-agent is bridged into the VM."""
@@ -1709,7 +1692,7 @@ class _Forwarding:
 
     def active(self) -> bool:
         """True when the launch needs the bridge server at all."""
-        return bool(self.forwards) or self.clipboard or self.chrome
+        return bool(self.forwards) or self.clipboard
 
 
 def _build_sandbox_argv(
@@ -1915,8 +1898,6 @@ def _forwarding_env(forwarding: _Forwarding | None) -> list[str]:
         return []
     env: list[str] = []
     sockets = [f"{guest}={service}" for _host, guest, service in forwarding.forwards]
-    if forwarding.chrome:
-        sockets.append(f"{SANDBOX_CHROME_SOCKET}=chrome")
     if sockets:
         env += ["-e", f"CLAUDE_SANDBOX_FORWARDS={','.join(sockets)}"]
     if forwarding.ssh_auth_sock is not None:
@@ -2044,26 +2025,6 @@ def _gpg_pubkeys_mounts(forwarding: _Forwarding | None) -> list[str]:
     return ["-v", f"{keyring}:{SANDBOX_GPG_PUBKEYS}:ro,z"]
 
 
-def _browser_bridge_live() -> bool:
-    """True when some Claude in Chrome native-host socket accepts connections.
-
-    A socket file can outlive its native host (nothing unlinks it after a crash or
-    browser exit), so each candidate is probed with a real connect — a directory
-    holding only stale sockets means no bridge.
-    """
-    for sock_path in sorted(bridges.native_host_dir().glob("*.sock")):
-        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        probe.settimeout(1.0)
-        try:
-            probe.connect(str(sock_path))
-        except OSError:
-            continue
-        finally:
-            probe.close()
-        return True
-    return False
-
-
 def _build_forwarding() -> _Forwarding:
     """Collect the agent forwards requested via settings."""
     forwards: list[tuple[Path, Path, str]] = []
@@ -2095,20 +2056,11 @@ def _build_forwarding() -> _Forwarding:
                 "gpg-agent socket is available, so GPG is not forwarded and signing will "
                 "fail in the sandbox. Check 'gpgconf --launch gpg-agent'.[/yellow]"
             )
-    if settings.sandbox_chrome and not _browser_bridge_live():
-        err_console.print(
-            "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_CHROME is set but no Claude in "
-            "Chrome native host is listening on the host yet. Make sure Chrome is "
-            "running with the Claude extension; in the sandbox, run /chrome and pick "
-            "'Reconnect extension' to wake it (that opens the connect page in your "
-            "host Chrome via the browser-open bridge).[/yellow]"
-        )
     return _Forwarding(
         forwards,
         ssh_auth_sock=ssh_auth,
         gpg_pubkeys=pubkeys,
         clipboard=settings.sandbox_clipboard,
-        chrome=settings.sandbox_chrome,
     )
 
 
@@ -2120,39 +2072,7 @@ def _bridge_services(forwarding: _Forwarding) -> dict[str, bridges.Service]:
     }
     if forwarding.clipboard:
         services["clipboard"] = bridges.clipboard
-    if forwarding.chrome:
-        services["chrome"] = bridges.chrome_relay
-        services["open"] = bridges.browser_open
     return services
-
-
-def _chrome_extension_guest_path() -> str | None:
-    """In-VM path to create so claude detects the extension, or None if it isn't installed.
-
-    claude reports "Extension: Installed" by readdir'ing
-    ``<chrome-user-data>/<profile>/Extensions/<id>``; the VM has no Chrome install, so it
-    always reports "Not detected" even with the bridge working. Find the extension in a
-    host browser profile and return the equivalent in-VM path — only the directory's
-    existence is checked, so the entrypoint just creates it. Returning None when the
-    extension is genuinely absent keeps the reported status honest, and the host's Chrome
-    profile (cookies, history, passwords) is never exposed to the VM.
-    """
-    config = Path.home() / ".config"
-    for browser in CHROME_USER_DATA_DIRS:
-        user_data = config / browser
-        if not user_data.is_dir():
-            continue
-        for profile in sorted(user_data.iterdir()):
-            if not profile.is_dir():
-                continue
-            if profile.name != "Default" and not profile.name.startswith("Profile "):
-                continue
-            if (profile / "Extensions" / CHROME_EXTENSION_ID).is_dir():
-                return (
-                    f"/home/appuser/.config/{browser}/{profile.name}"
-                    f"/Extensions/{CHROME_EXTENSION_ID}"
-                )
-    return None
 
 
 def _profile_oauth_scopes(profile_dir: Path) -> list[str] | None:
@@ -2174,8 +2094,7 @@ def _warn_missing_chrome_scope(profile_dir: Path) -> None:
     claude checks the OAuth scope first, ahead of ``--chrome`` and every other condition,
     so a profile authenticated with a setup-token (``user:inference`` only) reports
     "Status: Disabled" with no hint as to why. Surface that here instead, since the fix is
-    a re-login rather than anything the bridge can do. Unreadable credentials are left
-    alone — claude reports auth problems itself.
+    a re-login. Unreadable credentials are left alone — claude reports auth problems itself.
     """
     scopes = _profile_oauth_scopes(profile_dir)
     if scopes is None or CHROME_OAUTH_SCOPES & set(scopes):
@@ -2184,7 +2103,7 @@ def _warn_missing_chrome_scope(profile_dir: Path) -> None:
         f"[yellow]Warning: CLAUDE_PROFILE_SANDBOX_CHROME is set but profile "
         f"'{profile_dir.name}' has OAuth scopes {sorted(scopes)}, none of which claude "
         f"accepts for Claude in Chrome (needs one of {sorted(CHROME_OAUTH_SCOPES)}). "
-        f"Chrome will report 'Disabled' regardless of the bridge. A setup-token login "
+        f"Chrome will report 'Disabled'. A setup-token login "
         f"grants user:inference only — re-authenticate with a full OAuth login: "
         f"CLAUDE_PROFILE_SANDBOX=0 claude-profile {profile_dir.name} /login[/yellow]"
     )
@@ -2497,9 +2416,6 @@ def _launch_sandbox(
         )
     if settings.sandbox_chrome:
         _warn_missing_chrome_scope(profile_dir)
-        ext_path = _chrome_extension_guest_path()
-        if ext_path is not None:
-            extra_env = {**extra_env, SANDBOX_CHROME_EXT_PATH_ENV: ext_path}
     extra_env = _with_gh_token(extra_env)
     extra_env = _with_infisical_env(extra_env)
     extra_env = _with_pulumi_token(extra_env)

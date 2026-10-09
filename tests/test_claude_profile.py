@@ -2601,13 +2601,11 @@ def test_launch_supervised_when_forwarding(
 def test_bridge_services_match_the_forwarding(tmp_path: Path) -> None:
     sock = tmp_path / "agent.sock"
     fwd = claude_profile._Forwarding(
-        [(sock, sock, "ssh-0"), (sock, sock, "gpg")], clipboard=True, chrome=True
+        [(sock, sock, "ssh-0"), (sock, sock, "gpg")], clipboard=True
     )
     services = claude_profile._bridge_services(fwd)
-    assert set(services) == {"ssh-0", "gpg", "clipboard", "chrome", "open"}
+    assert set(services) == {"ssh-0", "gpg", "clipboard"}
     assert services["clipboard"] is bridges.clipboard
-    assert services["chrome"] is bridges.chrome_relay
-    assert services["open"] is bridges.browser_open
     assert set(claude_profile._bridge_services(claude_profile._Forwarding([]))) == set()
 
 
@@ -2904,80 +2902,6 @@ def test_launch_clipboard_no_wl_paste_exits(
 # ---------------------------------------------------------------------------
 
 
-def test_browser_bridge_live_true_with_listener(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    import socket as _socket
-
-    d = tmp_path / "bridge"
-    d.mkdir()
-    monkeypatch.setattr(bridges, "native_host_dir", lambda: d)
-    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-    srv.bind(str(d / "123.sock"))
-    srv.listen(1)
-    try:
-        assert claude_profile._browser_bridge_live() is True
-    finally:
-        srv.close()
-
-
-def test_browser_bridge_live_false_stale_socket(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    import socket as _socket
-
-    d = tmp_path / "bridge"
-    d.mkdir()
-    monkeypatch.setattr(bridges, "native_host_dir", lambda: d)
-    # Bound then closed without listen(): the socket file remains but connect is
-    # refused — a stale native-host socket left behind after a crash.
-    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-    srv.bind(str(d / "456.sock"))
-    srv.close()
-    assert claude_profile._browser_bridge_live() is False
-
-
-def test_browser_bridge_live_false_missing_dir(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(bridges, "native_host_dir", lambda: tmp_path / "nope")
-    assert claude_profile._browser_bridge_live() is False
-
-
-def test_build_forwarding_chrome_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(claude_profile.settings, "sandbox_chrome", True)
-    monkeypatch.setattr(claude_profile, "_browser_bridge_live", lambda: True)
-    fwd = claude_profile._build_forwarding()
-    assert fwd.forwards == []
-    assert fwd.chrome is True
-    assert fwd.active() is True
-
-
-def test_build_forwarding_chrome_even_when_not_live(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The guest still presents the socket and claude reconnects once the host's native
-    # host appears, so the bridge is set up regardless; the warning is informational.
-    monkeypatch.setattr(claude_profile.settings, "sandbox_chrome", True)
-    monkeypatch.setattr(claude_profile, "_browser_bridge_live", lambda: False)
-    assert claude_profile._build_forwarding().chrome is True
-
-
-def test_build_forwarding_no_chrome_when_disabled() -> None:
-    fwd = claude_profile._build_forwarding()
-    assert fwd.chrome is False
-    assert fwd.active() is False
-
-
-def test_forwarding_env_chrome_only() -> None:
-    # claude scans for the native host's socket, so the guest presents one that the
-    # bridge's chrome service relays.
-    fwd = claude_profile._Forwarding([], chrome=True)
-    env = claude_profile._forwarding_env(fwd)
-    socket_spec = f"{claude_profile.SANDBOX_CHROME_SOCKET}=chrome"
-    assert f"CLAUDE_SANDBOX_FORWARDS={socket_spec}" in env
-
-
 def test_argv_appends_chrome_flag_when_sandbox_chrome(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3014,43 +2938,6 @@ def test_argv_no_chrome_flag_when_disabled(
     cwd.mkdir()
     argv = _build_sandbox_argv(profile, cwd, [], {})
     assert "--chrome" not in argv
-
-
-def test_chrome_extension_guest_path_found(fake_home: Path) -> None:
-    ext = (
-        fake_home
-        / ".config"
-        / "google-chrome"
-        / "Default"
-        / "Extensions"
-        / claude_profile.CHROME_EXTENSION_ID
-    )
-    ext.mkdir(parents=True)
-    assert claude_profile._chrome_extension_guest_path() == (
-        f"/home/appuser/.config/google-chrome/Default/Extensions/"
-        f"{claude_profile.CHROME_EXTENSION_ID}"
-    )
-
-
-def test_chrome_extension_guest_path_none_when_absent(fake_home: Path) -> None:
-    (fake_home / ".config" / "google-chrome" / "Default").mkdir(parents=True)
-    assert claude_profile._chrome_extension_guest_path() is None
-
-
-def test_chrome_extension_guest_path_finds_numbered_profile(fake_home: Path) -> None:
-    ext = (
-        fake_home
-        / ".config"
-        / "chromium"
-        / "Profile 2"
-        / "Extensions"
-        / claude_profile.CHROME_EXTENSION_ID
-    )
-    ext.mkdir(parents=True)
-    assert claude_profile._chrome_extension_guest_path() == (
-        f"/home/appuser/.config/chromium/Profile 2/Extensions/"
-        f"{claude_profile.CHROME_EXTENSION_ID}"
-    )
 
 
 def test_sandbox_mounts_masks_profile_chrome_dir(
@@ -3123,50 +3010,6 @@ def test_warn_missing_chrome_scope_silent_without_creds(
     profile.mkdir()
     claude_profile._warn_missing_chrome_scope(profile)
     assert capsys.readouterr().err == ""
-
-
-def test_argv_chrome_adds_pasta_and_env(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
-    profile = tmp_path / "prof"
-    profile.mkdir()
-    cwd = tmp_path / "work"
-    cwd.mkdir()
-    fwd = claude_profile._Forwarding([], chrome=True)
-    argv = _build_sandbox_argv(profile, cwd, [], {}, fwd, bridge=(4321, "t0ken"))
-    assert any(arg.startswith("--network=pasta") for arg in argv)
-    assert "CLAUDE_SANDBOX_BRIDGE_PORT=4321" in argv
-    socket_spec = f"{claude_profile.SANDBOX_CHROME_SOCKET}=chrome"
-    assert f"CLAUDE_SANDBOX_FORWARDS={socket_spec}" in argv
-
-
-def test_launch_supervised_chrome_only(
-    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    profile = profiles_base / "work"
-    profile.mkdir(parents=True)
-    (profile / SANDBOX_MARKER).touch()
-    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
-    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
-    fwd = claude_profile._Forwarding([], chrome=True)
-    monkeypatch.setattr(claude_profile, "_build_forwarding", lambda: fwd)
-    servers = _record_bridge_servers(monkeypatch)
-    monkeypatch.chdir(_project(tmp_path))
-    with (
-        patch("subprocess.Popen") as popen,
-        patch("os.execvpe") as mock_exec,
-        pytest.raises(SystemExit) as exc_info,
-    ):
-        popen.return_value.wait.return_value = 0
-        _launch_profile("work", [])
-    assert exc_info.value.code == 0
-    mock_exec.assert_not_called()
-    popen.assert_called_once()
-    argv = popen.call_args[0][0]
-    assert any(arg.startswith("--network=pasta") for arg in argv)
-    [server] = servers
-    assert f"CLAUDE_SANDBOX_BRIDGE_PORT={server.port}" in argv
 
 
 # ---------------------------------------------------------------------------
