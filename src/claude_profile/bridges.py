@@ -12,11 +12,15 @@ from __future__ import annotations
 
 import contextlib
 import hmac
+import os
 import secrets
+import shutil
 import socket
+import subprocess
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # A service gets the connection right after the handshake line and owns it from there.
 Service = Callable[[socket.socket], None]
@@ -126,3 +130,94 @@ def _copy(source: socket.socket, destination: socket.socket) -> None:
     finally:
         with contextlib.suppress(OSError):
             destination.shutdown(socket.SHUT_WR)
+
+
+# wl-paste arguments the clipboard service runs: listing types and reading contents.
+# Anything else is refused; --watch, for one, runs a command on every clipboard change.
+CLIPBOARD_FLAGS = frozenset(
+    {"-l", "--list-types", "-t", "--type", "-n", "--no-newline"}
+)
+CLIPBOARD_TYPE_PREFIXES = ("image/", "text/")
+
+
+def clipboard(conn: socket.socket) -> None:
+    """Serve one read of the host clipboard through wl-paste.
+
+    Reads a line of wl-paste arguments and replies with a status line, "OK" or
+    "ERR <reason>", followed after OK by the clipboard bytes. The status lets the in-VM
+    shim fail like wl-paste does, e.g. on an empty clipboard, rather than exit 0 with
+    no output.
+    """
+    try:
+        args = read_line(conn).split()
+    except (OSError, ValueError):
+        return
+    if not all(
+        arg in CLIPBOARD_FLAGS or arg.startswith(CLIPBOARD_TYPE_PREFIXES)
+        for arg in args
+    ):
+        conn.sendall(b"ERR refused\n")
+        return
+    try:
+        result = subprocess.run(
+            ["wl-paste", *args], capture_output=True, check=False, timeout=10
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        conn.sendall(f"ERR {type(exc).__name__}\n".encode())
+        return
+    if result.returncode != 0:
+        conn.sendall(f"ERR exit {result.returncode}\n".encode())
+        return
+    conn.sendall(b"OK\n" + result.stdout)
+
+
+# Hosts whose /chrome pages the sandbox may open: claude's Claude-in-Chrome connect,
+# reconnect and permission pages.
+CHROME_PAGE_HOSTS = frozenset({"clau.de", "claude.ai"})
+
+
+def chrome_page_allowed(url: str) -> bool:
+    """True for https://clau.de or https://claude.ai URLs at /chrome or below it.
+
+    The sandbox decides what opens in the host's logged-in browser, so the URL is parsed
+    rather than prefix-matched: no other host, scheme, port or credentials.
+    """
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return False
+    if parts.scheme != "https" or parts.username or parts.password or port is not None:
+        return False
+    if parts.hostname not in CHROME_PAGE_HOSTS:
+        return False
+    return parts.path == "/chrome" or parts.path.startswith("/chrome/")
+
+
+def browser_open(conn: socket.socket) -> None:
+    """Open a Claude-in-Chrome page in the host's Chrome; reply "OK", or "NO" if refused."""
+    try:
+        url = read_line(conn)
+    except (OSError, ValueError):
+        return
+    chrome = _host_chrome()
+    if chrome is None or not chrome_page_allowed(url):
+        conn.sendall(b"NO\n")
+        return
+    subprocess.Popen(
+        [chrome, url],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    conn.sendall(b"OK\n")
+
+
+def _host_chrome() -> str | None:
+    for name in ("google-chrome", "google-chrome-stable"):
+        found = shutil.which(name)
+        if found is not None:
+            return found
+    default = "/opt/google/chrome/chrome"
+    return default if os.access(default, os.X_OK) else None
