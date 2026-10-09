@@ -1747,6 +1747,9 @@ def _build_sandbox_argv(
         "--annotation",
         "krun.use_passt=1",
         "--userns=keep-id",
+        # podman otherwise passes the host's *_proxy variables in, a proxy URL's
+        # credentials included; the VM gets only what the launcher forwards.
+        "--http-proxy=false",
         "--device",
         "/dev/kvm",
     ]

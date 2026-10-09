@@ -506,7 +506,7 @@ What else the VM can reach:
 | `CLAUDE_PROFILE_SANDBOX_GH` | `false` | Forward your GitHub login into the VM as `GH_TOKEN` (read via `gh auth token`) so `gh` acts as you |
 | `CLAUDE_PROFILE_SANDBOX_INFISICAL` | _(empty)_ | Allowlist (comma-separated emails/domains) of infisical logins to forward into the VM as `INFISICAL_TOKEN`/`--token` |
 | `CLAUDE_PROFILE_SANDBOX_PULUMI` | `false` | Forward your Pulumi Cloud token into the VM as `PULUMI_ACCESS_TOKEN` so `pulumi` acts as you |
-| `CLAUDE_PROFILE_SANDBOX_FORWARD_ENV` | _(empty)_ | Comma-separated host env var names to copy into the VM (e.g. tokens MCP servers pass through as `-e VAR`) |
+| `CLAUDE_PROFILE_SANDBOX_FORWARD_ENV` | _(empty)_ | Comma-separated host env var names to copy into the VM (e.g. tokens MCP servers pass through as `-e VAR`, or `HTTPS_PROXY`: the host's proxy settings aren't passed in otherwise) |
 | `CLAUDE_PROFILE_SANDBOX` | _(unset)_ | Per-launch override: `1` forces microVM, `0` forces host; unset uses the profile's setting |
 
 ## License

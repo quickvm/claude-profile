@@ -89,7 +89,8 @@ hand.
   common dir when it lives outside the CWD (so a worktree's `git`/`wt` work), and the
   profile dir at the in-VM config dir. VM sizing uses `krun.ram_mib`/`krun.cpus`
   annotations, not `--memory`/`--cpus`. `TERM`/`COLORTERM` are forwarded with `-e`; the
-  rest of the host environment is not. `.env` vars and forwarded tokens go through
+  rest of the host environment is not, and `--http-proxy=false` stops podman passing the
+  host's `*_proxy` variables (proxy credentials included) in behind the launcher's back. `.env` vars and forwarded tokens go through
   `_secret_env_file`: an unlinked file in the tmpfs `$XDG_RUNTIME_DIR` that podman reads
   as `--env-file /dev/fd/N`, so no value appears in podman's argv (world-readable in
   `/proc/<pid>/cmdline`) or in podman's own environment (where a `.env` written from inside

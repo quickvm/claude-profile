@@ -1454,6 +1454,17 @@ def _env_file_text(argv: list[str]) -> str:
     return Path(argv[argv.index("--env-file") + 1]).read_text()
 
 
+def test_argv_keeps_the_hosts_proxy_settings_out_of_the_vm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # podman passes the host's *_proxy variables into the container by default, a proxy
+    # URL's credentials included; the sandbox forwards only what it is told to.
+    monkeypatch.setenv("https_proxy", "http://user:hunter2@proxy.example:3128")
+    argv = _make_argv(monkeypatch, tmp_path, [])
+    assert "--http-proxy=false" in argv
+    assert not any("hunter2" in arg for arg in argv)
+
+
 def test_argv_passes_env_vars_off_the_command_line(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
