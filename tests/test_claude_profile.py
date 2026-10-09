@@ -11,15 +11,15 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Generator
 from pathlib import Path
-from typing import Any, Generator, Optional
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
 from typer.testing import CliRunner
 
 import claude_profile
-from claude_profile import browser_bridge_host
 from claude_profile import (
     SANDBOX_MARKER,
     SKIP_PERMISSIONS_FLAG,
@@ -30,6 +30,7 @@ from claude_profile import (
     _sandbox_image_user,
     _sandbox_mounts,
     app,
+    browser_bridge_host,
     main,
 )
 
@@ -1379,7 +1380,9 @@ def test_argv_env_file_has_no_path_and_survives_exec(
     env_file = argv[argv.index("--env-file") + 1]
     assert os.readlink(env_file).endswith("(deleted)")
     # podman opens it after exec, so a child process must be able to read it too.
-    child = subprocess.run(["cat", env_file], close_fds=False, capture_output=True)
+    child = subprocess.run(
+        ["cat", env_file], close_fds=False, capture_output=True, check=True
+    )
     assert child.stdout == b"TOKEN=a b=c # d\n"
 
 
@@ -1409,7 +1412,7 @@ def git_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return global_config
 
 
-def _vm_git_config(argv: list[str]) -> Optional[Path]:
+def _vm_git_config(argv: list[str]) -> Path | None:
     """Host path of the file the VM's git reads as its global config, if any."""
     prefix = "GIT_CONFIG_GLOBAL="
     guest = next((a.removeprefix(prefix) for a in argv if a.startswith(prefix)), None)
@@ -1422,11 +1425,11 @@ def _vm_git_config(argv: list[str]) -> Optional[Path]:
     )
 
 
-def _git_get(key: str, config: Path, repo: Optional[Path] = None) -> Optional[str]:
+def _git_get(key: str, config: Path, repo: Path | None = None) -> str | None:
     """What the VM's git would resolve for key, given its global config file."""
     cmd = ["git", *(["-C", str(repo)] if repo else []), "config", "--get", key]
     env = {**os.environ, "GIT_CONFIG_GLOBAL": str(config)}
-    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
     return result.stdout.strip() if result.returncode == 0 else None
 
 
@@ -2309,7 +2312,7 @@ def test_build_forwarding_ssh_warns_when_no_agent_is_live(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", True)
-    monkeypatch.setattr(claude_profile, "_ssh_agent_sockets", lambda: [])
+    monkeypatch.setattr(claude_profile, "_ssh_agent_sockets", list)
     fwd = claude_profile._build_forwarding()
     assert fwd.forwards == []
     assert "ssh" in capsys.readouterr().err.lower()
@@ -2934,6 +2937,7 @@ def _run_handler(handler: Path, request: str, bin_dir: Path) -> str:
         text=True,
         env=env,
         timeout=10,
+        check=True,
     )
     return result.stdout
 

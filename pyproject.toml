@@ -18,9 +18,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest==9.0.2",
-    "ruff==0.15.1",
-    "ty==0.0.17",
+    "pytest==9.1.1",
+    "ruff==0.16.10",
+    "ty==0.0.84",
 ]
 
 [project.scripts]
@@ -28,3 +28,7 @@ claude-profile = "claude_profile:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/claude_profile"]
+
+[tool.ruff.lint.flake8-bugbear]
+# typer's documented signature style builds each parameter with these calls.
+extend-immutable-calls = ["typer.Argument", "typer.Option"]

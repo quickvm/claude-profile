@@ -19,7 +19,7 @@ import time
 from dataclasses import KW_ONLY, dataclass
 from importlib import resources
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import typer
@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     # host-oriented MCP servers pass through as `-e VAR`). Empty = none forwarded.
     sandbox_forward_env: str = Field(default="")
     # Per-launch override of the .sandbox marker (CLAUDE_PROFILE_SANDBOX). None = use marker.
-    sandbox: Optional[bool] = Field(default=None)
+    sandbox: bool | None = Field(default=None)
 
 
 settings = Settings()
@@ -348,6 +348,7 @@ def _sandbox_image_exists() -> bool:
         result = subprocess.run(
             [settings.podman_bin, "image", "exists", settings.sandbox_image],
             capture_output=True,
+            check=False,
         )
     except FileNotFoundError:
         return False
@@ -368,6 +369,7 @@ def _sandbox_image_user() -> str:
             ],
             capture_output=True,
             text=True,
+            check=False,
         )
     except FileNotFoundError:
         return ""
@@ -420,6 +422,7 @@ def _sandbox_installed_tools() -> list[str]:
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         # Otherwise the skill would be rewritten listing no tools at all.
@@ -446,7 +449,7 @@ def sandbox_skill(
     check: bool = typer.Option(
         False, "--check", help="Verify the skill matches the image; exit 1 if stale."
     ),
-    path: Optional[Path] = typer.Option(
+    path: Path | None = typer.Option(
         None,
         "--path",
         help="SKILL.md path (default ~/.claude/skills/sandbox-tools/SKILL.md).",
@@ -506,7 +509,7 @@ RUN_VALUE_FLAGS: frozenset[str] = frozenset(
 )
 
 
-def _image_ref_from_args(args: list) -> Optional[str]:
+def _image_ref_from_args(args: list) -> str | None:
     """Pick the container image ref out of a podman/docker ``run`` arg list.
 
     The image is the first arg that is not a flag, a flag's value or a path, and whose
@@ -715,7 +718,7 @@ def remove_profile(
 @app.command("links")
 def manage_links(
     name: str = typer.Argument(..., help="Profile name"),
-    dir_name: Optional[str] = typer.Argument(
+    dir_name: str | None = typer.Argument(
         None,
         metavar="DIR",
         help=f"Directory to operate on. One of: {', '.join(LINKABLE_DIRS)}. Omit to apply to all.",
@@ -816,10 +819,10 @@ def _do_link(profile_dir: Path, dir_name: str) -> None:
 @app.command("env")
 def manage_env(
     name: str = typer.Argument(..., help="Profile name"),
-    set_var: Optional[list[str]] = typer.Option(
+    set_var: list[str] | None = typer.Option(
         None, "--set", help="Set a variable: KEY=VALUE"
     ),
-    unset_var: Optional[list[str]] = typer.Option(
+    unset_var: list[str] | None = typer.Option(
         None, "--unset", help="Unset a variable by name"
     ),
 ) -> None:
@@ -956,13 +959,14 @@ def _ensure_sandbox_image() -> None:
         sys.exit(1)
 
 
-def _git_toplevel(cwd: Path) -> Optional[Path]:
+def _git_toplevel(cwd: Path) -> Path | None:
     """Root of the git work tree containing cwd, or None outside one."""
     try:
         result = subprocess.run(
             ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
+            check=False,
         )
     except FileNotFoundError:
         return None
@@ -980,7 +984,7 @@ def _sandbox_work_root(cwd: Path) -> Path:
     return _git_toplevel(cwd) or cwd
 
 
-def _git_common_dir(cwd: Path) -> Optional[Path]:
+def _git_common_dir(cwd: Path) -> Path | None:
     """Return the absolute git common dir for cwd, or None if not in a repo.
 
     For a worktree this is the main repo's .git dir, which lives outside the
@@ -991,6 +995,7 @@ def _git_common_dir(cwd: Path) -> Optional[Path]:
             ["git", "-C", str(cwd), "rev-parse", "--git-common-dir"],
             capture_output=True,
             text=True,
+            check=False,
         )
     except FileNotFoundError:
         return None
@@ -1015,7 +1020,7 @@ def _sandbox_state_dir(profile_dir: Path) -> Path:
     return state
 
 
-def _sandbox_settings_overlay(profile_dir: Path) -> Optional[Path]:
+def _sandbox_settings_overlay(profile_dir: Path) -> Path | None:
     """Write a sandbox-tuned settings.json (host sudo deny stripped) to mount in the VM.
 
     The profile's settings.json is copied from the host and carries host-oriented deny
@@ -1210,7 +1215,7 @@ def _sandbox_known_hosts(profile_dir: Path) -> Path:
     return dest
 
 
-def _host_claude_binary() -> Optional[Path]:
+def _host_claude_binary() -> Path | None:
     """The host's Claude Code binary, when it came from the native installer.
 
     ``claude.ai/install.sh`` drops a self-contained executable at
@@ -1249,7 +1254,7 @@ def _stale_claude_copy(entry: Path) -> bool:
     return False
 
 
-def _sandbox_claude_binary() -> Optional[Path]:
+def _sandbox_claude_binary() -> Path | None:
     """Cache the host's Claude Code binary for the VM and return the cached copy.
 
     Without this the sandbox runs whatever version was baked into the image, which ages
@@ -1452,13 +1457,13 @@ class _Forwarding:
 
     forwards: list[tuple[Path, Path, int]]  # (host_socket, guest_path, tcp_port)
     _: KW_ONLY
-    ssh_auth_sock: Optional[Path] = None
-    gpg_pubkeys: Optional[bytes] = None  # host public keyring (gpg --export)
-    clipboard_port: Optional[int] = None  # host TCP port serving the clipboard bridge
-    browser_port: Optional[int] = (
+    ssh_auth_sock: Path | None = None
+    gpg_pubkeys: bytes | None = None  # host public keyring (gpg --export)
+    clipboard_port: int | None = None  # host TCP port serving the clipboard bridge
+    browser_port: int | None = (
         None  # host TCP port serving the Claude in Chrome socket bridge
     )
-    browser_open_port: Optional[int] = (
+    browser_open_port: int | None = (
         None  # host TCP port serving the browser-open bridge
     )
 
@@ -1482,7 +1487,7 @@ def _build_sandbox_argv(
     cwd: Path,
     claude_args: list[str],
     extra_env: dict[str, str],
-    forwarding: Optional[_Forwarding] = None,
+    forwarding: _Forwarding | None = None,
     *,
     host_loopback: bool = False,
 ) -> list[str]:
@@ -1575,13 +1580,14 @@ def _build_sandbox_argv(
     return argv + session + args
 
 
-def _git_config_get(cwd: Path, key: str) -> Optional[str]:
+def _git_config_get(cwd: Path, key: str) -> str | None:
     """The value git resolves for key in cwd on the host, or None if unset."""
     try:
         result = subprocess.run(
             ["git", "-C", str(cwd), "config", "--get", key],
             capture_output=True,
             text=True,
+            check=False,
         )
     except FileNotFoundError:
         return None
@@ -1656,7 +1662,7 @@ def _secret_env_file(env: dict[str, str]) -> str:
     return f"/dev/fd/{fd}"
 
 
-def _forwarding_env(forwarding: Optional[_Forwarding]) -> list[str]:
+def _forwarding_env(forwarding: _Forwarding | None) -> list[str]:
     """Env args telling the entrypoint which sockets to bridge and how."""
     if forwarding is None or not forwarding.active():
         return []
@@ -1705,6 +1711,7 @@ def _ssh_agent_status(sock: Path) -> int:
             env={**os.environ, "SSH_AUTH_SOCK": str(sock)},
             capture_output=True,
             timeout=5,
+            check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return 0
@@ -1737,7 +1744,7 @@ def _ssh_agent_sockets() -> list[Path]:
     return [sock for sock, _ in live]
 
 
-def _gpg_extra_socket() -> Optional[Path]:
+def _gpg_extra_socket() -> Path | None:
     """Path to the host gpg-agent restricted (signing-only) socket, starting one if needed.
 
     gpgconf reports the path whether or not an agent is running, but the socket only
@@ -1750,6 +1757,7 @@ def _gpg_extra_socket() -> Optional[Path]:
             ["gpgconf", "--list-dirs", "agent-extra-socket"],
             capture_output=True,
             text=True,
+            check=False,
         )
     except FileNotFoundError:
         return None
@@ -1758,14 +1766,16 @@ def _gpg_extra_socket() -> Optional[Path]:
         return None
     sock = Path(path)
     if not sock.exists():
-        subprocess.run(["gpgconf", "--launch", "gpg-agent"], capture_output=True)
+        subprocess.run(
+            ["gpgconf", "--launch", "gpg-agent"], capture_output=True, check=False
+        )
     return sock if sock.exists() else None
 
 
-def _export_gpg_pubkeys() -> Optional[bytes]:
+def _export_gpg_pubkeys() -> bytes | None:
     """Export of the host public keyring (no secret material), or None."""
     try:
-        result = subprocess.run(["gpg", "--export"], capture_output=True)
+        result = subprocess.run(["gpg", "--export"], capture_output=True, check=False)
     except FileNotFoundError:
         return None
     if result.returncode != 0 or not result.stdout:
@@ -1773,7 +1783,7 @@ def _export_gpg_pubkeys() -> Optional[bytes]:
     return result.stdout
 
 
-def _gpg_pubkeys_mounts(forwarding: Optional[_Forwarding]) -> list[str]:
+def _gpg_pubkeys_mounts(forwarding: _Forwarding | None) -> list[str]:
     """Read-only mount of the host public keyring for the entrypoint to import.
 
     A file rather than an env var: Linux caps a single argv or env string at 128 KiB,
@@ -1832,7 +1842,7 @@ def _browser_bridge_live() -> bool:
 def _build_forwarding() -> _Forwarding:
     """Collect the agent forwards requested via settings."""
     forwards: list[tuple[Path, Path, int]] = []
-    ssh_auth: Optional[Path] = None
+    ssh_auth: Path | None = None
     if settings.sandbox_ssh_agent:
         ssh = [
             (
@@ -1851,7 +1861,7 @@ def _build_forwarding() -> _Forwarding:
                 "agent was found (SSH_AUTH_SOCK or ~/.1password/agent.sock), so ssh in the "
                 "sandbox has no keys. Check 'ssh-add -l'.[/yellow]"
             )
-    pubkeys: Optional[bytes] = None
+    pubkeys: bytes | None = None
     if settings.sandbox_gpg_agent:
         extra = _gpg_extra_socket()
         if extra is not None:
@@ -1865,8 +1875,8 @@ def _build_forwarding() -> _Forwarding:
                 "fail in the sandbox. Check 'gpgconf --launch gpg-agent'.[/yellow]"
             )
     clipboard_port = _free_tcp_port() if settings.sandbox_clipboard else None
-    browser_port: Optional[int] = None
-    browser_open_port: Optional[int] = None
+    browser_port: int | None = None
+    browser_open_port: int | None = None
     if settings.sandbox_chrome:
         browser_port = _free_tcp_port()
         browser_open_port = _free_tcp_port()
@@ -1952,7 +1962,7 @@ def _start_browser_host_bridge(port: int) -> subprocess.Popen[bytes]:
     )
 
 
-def _chrome_extension_guest_path() -> Optional[str]:
+def _chrome_extension_guest_path() -> str | None:
     """In-VM path to create so claude detects the extension, or None if it isn't installed.
 
     claude reports "Extension: Installed" by readdir'ing
@@ -1981,7 +1991,7 @@ def _chrome_extension_guest_path() -> Optional[str]:
     return None
 
 
-def _profile_oauth_scopes(profile_dir: Path) -> Optional[list[str]]:
+def _profile_oauth_scopes(profile_dir: Path) -> list[str] | None:
     """Return the profile's OAuth scopes, or None if credentials are absent/unreadable."""
     try:
         data = json.loads((profile_dir / ".credentials.json").read_text())
@@ -2041,7 +2051,7 @@ def _start_browser_open_host_bridge(port: int) -> subprocess.Popen[bytes]:
     )
 
 
-def _gh_token() -> Optional[str]:
+def _gh_token() -> str | None:
     """Return the host's GitHub token via ``gh auth token``, or None if unavailable.
 
     Reads from wherever gh stores it (system keyring or hosts.yml). A short timeout
@@ -2053,6 +2063,7 @@ def _gh_token() -> Optional[str]:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
@@ -2104,7 +2115,7 @@ def _jwt_expired(token: str) -> bool:
     return exp <= time.time() + 30
 
 
-def _infisical_token(email: str) -> Optional[str]:
+def _infisical_token(email: str) -> str | None:
     """Return the live access token for an infisical login from the OS keyring.
 
     The CLI stores each login as a JSON ``UserCredentials`` blob under the keyring
@@ -2117,6 +2128,7 @@ def _infisical_token(email: str) -> Optional[str]:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
@@ -2262,7 +2274,7 @@ def _infisical_briefing(extra_env: dict[str, str]) -> str:
     )
 
 
-def _pulumi_token() -> Optional[str]:
+def _pulumi_token() -> str | None:
     """Return the Pulumi Cloud access token from ~/.pulumi/credentials.json, or None.
 
     pulumi stores a token per backend; we return the one for the current backend only

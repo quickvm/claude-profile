@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Host side of the sandbox Claude-in-Chrome bridge, with a service-worker keepalive.
 
 socat execs one copy of this per guest connection (stdin/stdout are wired to the guest
