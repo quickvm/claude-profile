@@ -266,16 +266,16 @@ verification, and host keys ssh accepts inside the VM are saved to a per-profile
 `known_hosts` that carries over to the next launch — your real `~/.ssh/known_hosts` is never
 modified.
 
-A microVM has its own kernel, so the socket can't be bind-mounted; a `socat` bridge relays
-the agent over pasta networking, with the host end bound to `127.0.0.1`. Managing that
-bridge means an SSH-agent launch runs the VM as a child process instead of exec'ing it (the
-TUI is unchanged). Requires `socat` on the host (`dnf install socat`).
+A microVM has its own kernel, so the socket can't be bind-mounted. Instead `claude-profile`
+relays the agent over pasta networking from a bridge it serves on the host's `127.0.0.1`,
+which means an SSH-agent launch runs the VM as a child process instead of exec'ing it (the
+TUI is unchanged).
 
-**Security:** while the VM runs, the agent is reachable on a TCP port on the host's
-`127.0.0.1`. The network can't reach it, but any local process can, whatever user it runs
-as, including containers on the host network and other sandbox VMs (they reach the host's
-loopback the same way). Code in the sandbox, or in any of those, can *use* your keys to
-authenticate (it cannot read them). Leave this off for untrusted work and on shared hosts.
+**Security:** while the VM runs, the bridge listens on a TCP port on the host's `127.0.0.1`.
+Every connection must start with a random token made for that launch and handed only to the
+VM, so other users' processes, containers on the host network and other sandbox VMs can't use
+your agent through it. Code in the sandbox can *use* your keys to authenticate (it cannot read
+them). Leave this off for untrusted work.
 
 ### GPG (signed commits)
 
@@ -291,8 +291,8 @@ bridge to your gpg-agent's restricted `S.gpg-agent.extra` socket. Signing happen
 host, so your secret keys (or smartcard) never enter the VM. gpg-agent applies your usual
 PIN and touch policy: with the PIN cached and no touch requirement, the sandbox can sign
 without any prompt. The restricted socket also allows decryption, so the sandbox can
-decrypt data encrypted to your keys, and like the SSH bridge its port is reachable by any
-local process while the VM runs. Your `~/.gitconfig` is mounted read-only too. Files it
+decrypt data encrypted to your keys. It goes through the same token-checked bridge as the
+SSH agent. Your `~/.gitconfig` is mounted read-only too. Files it
 pulls in with `include` or `includeIf` are not, so the launcher resolves `user.name` and
 `user.email` for the working directory on the host and passes them in as global config,
 together with `user.signingkey`, `commit.gpgsign` and `gpg.format` when GPG forwarding is
@@ -313,15 +313,15 @@ export CLAUDE_PROFILE_SANDBOX_CLIPBOARD=1
 claude-profile personal
 ```
 
-A host `socat` runs your real `wl-paste` on demand and streams only the clipboard bytes into
-the VM over the pasta bridge; an in-VM `wl-paste` shim feeds them to Claude Code. Requires
+The bridge runs your real `wl-paste` on demand, read-only invocations only, and streams just
+the clipboard bytes into the VM; an in-VM `wl-paste` shim feeds them to Claude Code. Requires
 `wl-paste` on the host (`dnf install wl-clipboard`) and a Wayland session.
 
 **Security:** deliberately *not* full Wayland forwarding. Proxying the whole compositor (e.g.
 waypipe) would also hand the sandbox screen capture and keystroke injection into your focused
 window — a practical escape. This bridge is **read-only clipboard**: the sandbox can read
-what's on your clipboard while it runs, and nothing else. Like the agent forwards, it
-supervises the VM as a child process (for bridge teardown) instead of exec'ing it.
+what's on your clipboard while it runs, and nothing else. Like the agent forwards, it runs
+the VM as a child process instead of exec'ing it, because `claude-profile` serves the bridge.
 
 ### GitHub CLI
 
@@ -488,7 +488,7 @@ What else the VM can reach:
 | `CLAUDE_PROFILE_SANDBOX_RAM_MIB` | `4096` | microVM memory in MiB |
 | `CLAUDE_PROFILE_SANDBOX_CPUS` | `4` | microVM vCPU count |
 | `CLAUDE_PROFILE_SANDBOX_SKIP_PERMISSIONS` | `true` | Auto-add `--dangerously-skip-permissions` in sandbox mode |
-| `CLAUDE_PROFILE_SANDBOX_SSH_AGENT` | `false` | Forward your SSH agent(s) into the VM via a socat/pasta bridge |
+| `CLAUDE_PROFILE_SANDBOX_SSH_AGENT` | `false` | Forward your SSH agent(s) into the VM through a token-checked bridge |
 | `CLAUDE_PROFILE_SANDBOX_GPG_AGENT` | `false` | Forward your gpg-agent (signing) into the VM; seeds public keys, mounts `~/.gitconfig` |
 | `CLAUDE_PROFILE_SANDBOX_CLIPBOARD` | `false` | Bridge your clipboard into the VM (read-only) so image paste works; needs `wl-paste` on the host |
 | `CLAUDE_PROFILE_SANDBOX_GH` | `false` | Forward your GitHub login into the VM as `GH_TOKEN` (read via `gh auth token`) so `gh` acts as you |

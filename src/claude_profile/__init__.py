@@ -7,7 +7,6 @@ import contextlib
 import hashlib
 import json
 import os
-import pwd
 import re
 import shutil
 import signal
@@ -27,6 +26,8 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from rich.console import Console
 from rich.table import Table
+
+from claude_profile import bridges
 
 
 class Settings(BaseSettings):
@@ -90,12 +91,13 @@ SANDBOX_IMAGE_STORE = "/var/lib/shared-mcp-store"
 # Trust anchors sourced by update-ca-trust. Same path on host and in the VM: the host's
 # copy is mounted straight over the image's (see _ca_trust_mounts).
 SANDBOX_CA_ANCHORS = "/etc/pki/ca-trust/source/anchors"
-# Env var carrying the host clipboard-bridge TCP port to the in-VM wl-paste shim.
-SANDBOX_CLIPBOARD_PORT_ENV = "CLAUDE_SANDBOX_CLIPBOARD_PORT"
-# Env var carrying the host browser-bridge TCP port to the in-VM entrypoint.
-SANDBOX_BROWSER_BRIDGE_PORT_ENV = "CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT"
-# Env var carrying the host browser-open TCP port to the in-VM google-chrome shim.
-SANDBOX_BROWSER_OPEN_PORT_ENV = "CLAUDE_SANDBOX_BROWSER_OPEN_PORT"
+# The bridge server's port and this launch's token, as the in-VM side sees them. The
+# token travels in the secret env file (see _secret_env_file), never on podman's argv.
+SANDBOX_BRIDGE_PORT_ENV = "CLAUDE_SANDBOX_BRIDGE_PORT"
+SANDBOX_BRIDGE_TOKEN_ENV = "CLAUDE_SANDBOX_BRIDGE_TOKEN"
+# In-VM socket claude finds the Claude-in-Chrome native host at (its scan dir, under the
+# image user's name), relayed to the host's native host by the bridge's chrome service.
+SANDBOX_CHROME_SOCKET = "/tmp/claude-mcp-browser-bridge-appuser/host.sock"
 # Chrome Web Store id of the Claude extension, and the env var naming the in-VM path to
 # create so claude's extension detection (a readdir of
 # <chrome-user-data>/<profile>/Extensions/<id>) succeeds inside the sandbox.
@@ -1453,33 +1455,22 @@ def _linked_mounts(profile_dir: Path) -> list[str]:
 
 @dataclass
 class _Forwarding:
-    """Plan for bridging host agents into the VM via socat over pasta."""
+    """What a launch bridges into the VM; a bridges.BridgeServer serves it."""
 
-    forwards: list[tuple[Path, Path, int]]  # (host_socket, guest_path, tcp_port)
+    forwards: list[tuple[Path, Path, str]]  # (host_socket, guest_path, service name)
     _: KW_ONLY
     ssh_auth_sock: Path | None = None
     gpg_pubkeys: bytes | None = None  # host public keyring (gpg --export)
-    clipboard_port: int | None = None  # host TCP port serving the clipboard bridge
-    browser_port: int | None = (
-        None  # host TCP port serving the Claude in Chrome socket bridge
-    )
-    browser_open_port: int | None = (
-        None  # host TCP port serving the browser-open bridge
-    )
+    clipboard: bool = False  # read-only host clipboard (the in-VM wl-paste shim)
+    chrome: bool = False  # Claude-in-Chrome relay and the browser-open shim
 
     def gpg(self) -> bool:
         """True when the host gpg-agent is bridged into the VM."""
-        agent = Path(SANDBOX_GNUPGHOME) / "S.gpg-agent"
-        return any(guest == agent for _host, guest, _port in self.forwards)
+        return any(service == "gpg" for _host, _guest, service in self.forwards)
 
     def active(self) -> bool:
-        """True when any host-side bridge (agent socket, clipboard, browser) is needed."""
-        return (
-            bool(self.forwards)
-            or self.clipboard_port is not None
-            or self.browser_port is not None
-            or self.browser_open_port is not None
-        )
+        """True when the launch needs the bridge server at all."""
+        return bool(self.forwards) or self.clipboard or self.chrome
 
 
 def _build_sandbox_argv(
@@ -1490,6 +1481,7 @@ def _build_sandbox_argv(
     forwarding: _Forwarding | None = None,
     *,
     host_loopback: bool = False,
+    bridge: tuple[int, str] | None = None,
 ) -> list[str]:
     """Assemble the `podman run` argv that boots claude in a krun microVM."""
     # A TTY only when both ends are terminals: with one, the in-VM claude takes its stdin
@@ -1541,6 +1533,10 @@ def _build_sandbox_argv(
         cwd, signing=forwarding is not None and forwarding.gpg()
     )
     argv += _forwarding_env(forwarding)
+    if bridge is not None:
+        port, token = bridge
+        argv += ["-e", f"{SANDBOX_BRIDGE_PORT_ENV}={port}"]
+        extra_env = {**extra_env, SANDBOX_BRIDGE_TOKEN_ENV: token}
     if extra_env:
         argv += ["--env-file", _secret_env_file(extra_env)]
     mounts = _sandbox_mounts(profile_dir, cwd)
@@ -1667,9 +1663,11 @@ def _forwarding_env(forwarding: _Forwarding | None) -> list[str]:
     if forwarding is None or not forwarding.active():
         return []
     env: list[str] = []
-    if forwarding.forwards:
-        spec = ",".join(f"{guest}={port}" for _host, guest, port in forwarding.forwards)
-        env += ["-e", f"CLAUDE_SANDBOX_FORWARDS={spec}"]
+    sockets = [f"{guest}={service}" for _host, guest, service in forwarding.forwards]
+    if forwarding.chrome:
+        sockets.append(f"{SANDBOX_CHROME_SOCKET}=chrome")
+    if sockets:
+        env += ["-e", f"CLAUDE_SANDBOX_FORWARDS={','.join(sockets)}"]
     if forwarding.ssh_auth_sock is not None:
         env += ["-e", f"SSH_AUTH_SOCK={forwarding.ssh_auth_sock}"]
     if forwarding.gpg_pubkeys is not None:
@@ -1679,20 +1677,7 @@ def _forwarding_env(forwarding: _Forwarding | None) -> list[str]:
             "-e",
             f"CLAUDE_SANDBOX_GPG_PUBKEYS_FILE={SANDBOX_GPG_PUBKEYS}",
         ]
-    if forwarding.clipboard_port is not None:
-        env += ["-e", f"{SANDBOX_CLIPBOARD_PORT_ENV}={forwarding.clipboard_port}"]
-    if forwarding.browser_port is not None:
-        env += ["-e", f"{SANDBOX_BROWSER_BRIDGE_PORT_ENV}={forwarding.browser_port}"]
-    if forwarding.browser_open_port is not None:
-        env += ["-e", f"{SANDBOX_BROWSER_OPEN_PORT_ENV}={forwarding.browser_open_port}"]
     return env
-
-
-def _free_tcp_port() -> int:
-    """Return an unused localhost TCP port for an agent bridge."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _ssh_agent_status(sock: Path) -> int:
@@ -1808,17 +1793,6 @@ def _gpg_pubkeys_mounts(forwarding: _Forwarding | None) -> list[str]:
     return ["-v", f"{keyring}:{SANDBOX_GPG_PUBKEYS}:ro,z"]
 
 
-def _browser_bridge_dir() -> Path:
-    """Host dir where Claude in Chrome native hosts bind their sockets.
-
-    Chrome spawns ``claude --chrome-native-host`` (stdio to the extension), which
-    binds ``/tmp/claude-mcp-browser-bridge-<username>/<pid>.sock``; claude sessions
-    discover the bridge by scanning that dir at startup. The username comes from the
-    uid, matching claude's own ``os.userInfo().username``.
-    """
-    return Path(f"/tmp/claude-mcp-browser-bridge-{pwd.getpwuid(os.getuid()).pw_name}")
-
-
 def _browser_bridge_live() -> bool:
     """True when some Claude in Chrome native-host socket accepts connections.
 
@@ -1826,7 +1800,7 @@ def _browser_bridge_live() -> bool:
     browser exit), so each candidate is probed with a real connect — a directory
     holding only stale sockets means no bridge.
     """
-    for sock_path in sorted(_browser_bridge_dir().glob("*.sock")):
+    for sock_path in sorted(bridges.native_host_dir().glob("*.sock")):
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         probe.settimeout(1.0)
         try:
@@ -1841,15 +1815,11 @@ def _browser_bridge_live() -> bool:
 
 def _build_forwarding() -> _Forwarding:
     """Collect the agent forwards requested via settings."""
-    forwards: list[tuple[Path, Path, int]] = []
+    forwards: list[tuple[Path, Path, str]] = []
     ssh_auth: Path | None = None
     if settings.sandbox_ssh_agent:
         ssh = [
-            (
-                sock,
-                Path(SANDBOX_AGENT_DIR) / f"ssh-agent-{index}.sock",
-                _free_tcp_port(),
-            )
+            (sock, Path(SANDBOX_AGENT_DIR) / f"ssh-agent-{index}.sock", f"ssh-{index}")
             for index, sock in enumerate(_ssh_agent_sockets())
         ]
         forwards += ssh
@@ -1866,7 +1836,7 @@ def _build_forwarding() -> _Forwarding:
         extra = _gpg_extra_socket()
         if extra is not None:
             guest = Path(SANDBOX_GNUPGHOME) / "S.gpg-agent"
-            forwards.append((extra, guest, _free_tcp_port()))
+            forwards.append((extra, guest, "gpg"))
             pubkeys = _export_gpg_pubkeys()
         else:
             err_console.print(
@@ -1874,92 +1844,35 @@ def _build_forwarding() -> _Forwarding:
                 "gpg-agent socket is available, so GPG is not forwarded and signing will "
                 "fail in the sandbox. Check 'gpgconf --launch gpg-agent'.[/yellow]"
             )
-    clipboard_port = _free_tcp_port() if settings.sandbox_clipboard else None
-    browser_port: int | None = None
-    browser_open_port: int | None = None
-    if settings.sandbox_chrome:
-        browser_port = _free_tcp_port()
-        browser_open_port = _free_tcp_port()
-        if not _browser_bridge_live():
-            err_console.print(
-                "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_CHROME is set but no Claude in "
-                "Chrome native host is listening on the host yet. Make sure Chrome is "
-                "running with the Claude extension; in the sandbox, run /chrome and pick "
-                "'Reconnect extension' to wake it (that opens the connect page in your "
-                "host Chrome via the browser-open bridge).[/yellow]"
-            )
+    if settings.sandbox_chrome and not _browser_bridge_live():
+        err_console.print(
+            "[yellow]Warning: CLAUDE_PROFILE_SANDBOX_CHROME is set but no Claude in "
+            "Chrome native host is listening on the host yet. Make sure Chrome is "
+            "running with the Claude extension; in the sandbox, run /chrome and pick "
+            "'Reconnect extension' to wake it (that opens the connect page in your "
+            "host Chrome via the browser-open bridge).[/yellow]"
+        )
     return _Forwarding(
         forwards,
         ssh_auth_sock=ssh_auth,
         gpg_pubkeys=pubkeys,
-        clipboard_port=clipboard_port,
-        browser_port=browser_port,
-        browser_open_port=browser_open_port,
+        clipboard=settings.sandbox_clipboard,
+        chrome=settings.sandbox_chrome,
     )
 
 
-def _start_host_bridge(agent_sock: Path, port: int) -> subprocess.Popen[bytes]:
-    """Bridge a host agent socket to a localhost TCP port the VM can reach."""
-    return subprocess.Popen(
-        [
-            "socat",
-            f"TCP-LISTEN:{port},bind=127.0.0.1,reuseaddr,fork",
-            f"UNIX-CONNECT:{agent_sock}",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def _clipboard_host_handler() -> Path:
-    """Path to the packaged host-side clipboard handler script."""
-    return Path(str(resources.files("claude_profile") / "clipboard_host.sh"))
-
-
-def _start_clipboard_host_bridge(port: int) -> subprocess.Popen[bytes]:
-    """Serve the host clipboard to the VM: socat execs a read-only wl-paste handler.
-
-    Each guest connection runs the handler with the socket on stdin/stdout; it reads
-    one request line (whitelisted wl-paste args) and streams the clipboard bytes
-    back. Only clipboard reads cross the boundary — no Wayland access is exposed to
-    the sandbox, unlike forwarding the compositor wholesale.
-    """
-    handler = _clipboard_host_handler()
-    return subprocess.Popen(
-        [
-            "socat",
-            f"TCP-LISTEN:{port},bind=127.0.0.1,reuseaddr,fork",
-            f"EXEC:bash {handler}",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def _browser_bridge_host_handler() -> Path:
-    """Path to the packaged host-side Claude-in-Chrome bridge proxy."""
-    return Path(str(resources.files("claude_profile") / "browser_bridge_host.py"))
-
-
-def _start_browser_host_bridge(port: int) -> subprocess.Popen[bytes]:
-    """Serve the host Claude in Chrome native-host socket to the VM.
-
-    socat execs the proxy per guest connection; it resolves the newest
-    ``claude --chrome-native-host`` socket (so the bridge follows Chrome's native host
-    across restarts, its pid changing each spawn), relays the framed messages, and
-    injects a keepalive during idle gaps so Chrome's MV3 service worker does not go idle
-    and kill the native host mid-session.
-    """
-    handler = _browser_bridge_host_handler()
-    return subprocess.Popen(
-        [
-            "socat",
-            f"TCP-LISTEN:{port},bind=127.0.0.1,reuseaddr,fork",
-            f"EXEC:python3 {handler}",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+def _bridge_services(forwarding: _Forwarding) -> dict[str, bridges.Service]:
+    """The bridge server's services for a launch, by the names the VM asks for."""
+    services = {
+        service: bridges.unix_relay(host)
+        for host, _guest, service in forwarding.forwards
+    }
+    if forwarding.clipboard:
+        services["clipboard"] = bridges.clipboard
+    if forwarding.chrome:
+        services["chrome"] = bridges.chrome_relay
+        services["open"] = bridges.browser_open
+    return services
 
 
 def _chrome_extension_guest_path() -> str | None:
@@ -2023,31 +1936,6 @@ def _warn_missing_chrome_scope(profile_dir: Path) -> None:
         f"Chrome will report 'Disabled' regardless of the bridge. A setup-token login "
         f"grants user:inference only — re-authenticate with a full OAuth login: "
         f"CLAUDE_PROFILE_SANDBOX=0 claude-profile {profile_dir.name} /login[/yellow]"
-    )
-
-
-def _browser_open_host_handler() -> Path:
-    """Path to the packaged host-side browser-open handler script."""
-    return Path(str(resources.files("claude_profile") / "browser_open_host.sh"))
-
-
-def _start_browser_open_host_bridge(port: int) -> subprocess.Popen[bytes]:
-    """Serve the host browser-open bridge to the VM.
-
-    socat execs the handler per guest connection; the handler opens a Claude connect
-    URL (relayed by the in-VM ``google-chrome`` shim) in the host's real Chrome, so the
-    sandboxed Claude Code can wake the extension itself. The handler whitelists only
-    Anthropic's clau.de/claude.ai chrome URLs.
-    """
-    handler = _browser_open_host_handler()
-    return subprocess.Popen(
-        [
-            "socat",
-            f"TCP-LISTEN:{port},bind=127.0.0.1,reuseaddr,fork",
-            f"EXEC:bash {handler}",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
     )
 
 
@@ -2415,57 +2303,47 @@ def _run_sandbox_supervised(
     extra_env: dict[str, str],
     forwarding: _Forwarding,
 ) -> None:
-    """Run the VM as a child so the host agent bridges are torn down on exit.
+    """Run the VM as a child while this process serves its bridges.
 
-    The exec model cannot manage the socat bridges' lifetime, so agent-forwarding
-    mode supervises podman instead. podman keeps the terminal in raw mode, so the
-    TUI behaves the same as the exec path.
+    The bridges are threads of this process (see bridges.BridgeServer), so they need it
+    alive while podman runs, which the exec path cannot do. podman keeps the terminal in
+    raw mode, so the TUI behaves the same as the exec path.
     """
-    if shutil.which("socat") is None:
-        err_console.print(
-            "[red]'socat' not found on host.[/red] Install it (e.g. dnf install socat) "
-            "or disable the sandbox agent-forwarding settings."
-        )
-        sys.exit(1)
-    if forwarding.clipboard_port is not None and shutil.which("wl-paste") is None:
+    if forwarding.clipboard and shutil.which("wl-paste") is None:
         err_console.print(
             "[red]'wl-paste' not found on host.[/red] Install wl-clipboard (e.g. "
             "dnf install wl-clipboard) or unset CLAUDE_PROFILE_SANDBOX_CLIPBOARD."
         )
         sys.exit(1)
-    # Build the argv before any bridge listens: building it can exit (see
-    # _secret_env_file), and a bridge started first would be left running.
-    argv = _build_sandbox_argv(profile_dir, cwd, claude_args, extra_env, forwarding)
-    bridges: list[subprocess.Popen[bytes]] = []
+    server = bridges.BridgeServer(_bridge_services(forwarding))
     try:
-        for host, _guest, port in forwarding.forwards:
-            bridges.append(_start_host_bridge(host, port))
-        if forwarding.clipboard_port is not None:
-            bridges.append(_start_clipboard_host_bridge(forwarding.clipboard_port))
-        if forwarding.browser_port is not None:
-            bridges.append(_start_browser_host_bridge(forwarding.browser_port))
-        if forwarding.browser_open_port is not None:
-            bridges.append(
-                _start_browser_open_host_bridge(forwarding.browser_open_port)
-            )
+        argv = _build_sandbox_argv(
+            profile_dir,
+            cwd,
+            claude_args,
+            extra_env,
+            forwarding,
+            bridge=(server.port, server.token),
+        )
+        server.start()
         # close_fds=False: podman reads its --env-file through an inherited fd (see
-        # _secret_env_file); Python opens every other fd non-inheritable.
+        # _secret_env_file); Python opens every other fd non-inheritable, the bridge
+        # server's socket included.
         returncode = _wait_forwarding_signals(
             subprocess.Popen(argv, env=os.environ.copy(), close_fds=False)
         )
     finally:
-        for bridge in bridges:
-            bridge.terminate()
+        server.close()
     sys.exit(128 - returncode if returncode < 0 else returncode)
 
 
 def _wait_forwarding_signals(proc: subprocess.Popen[bytes]) -> int:
     """Wait for proc, passing SIGTERM and SIGHUP on to it rather than dying from them.
 
-    Both signals kill this process outright by default, which skips the caller's
-    cleanup and leaves the host bridges listening after the session has ended; closing
-    the terminal window is enough to send SIGHUP. Forwarding them lets podman stop the
-    VM and exit normally, so the caller's ``finally`` still runs.
+    Both signals kill this process outright by default, and the bridges die with it
+    while podman, which a plain ``kill`` of this process does not reach, keeps the VM
+    running without them. Forwarding them lets podman stop the VM and exit normally, so
+    the session ends cleanly and the caller's ``finally`` still runs.
     """
 
     def forward(signum: int, _frame: object) -> None:

@@ -7,9 +7,11 @@ import contextlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from collections.abc import Generator
 from pathlib import Path
@@ -30,7 +32,7 @@ from claude_profile import (
     _sandbox_image_user,
     _sandbox_mounts,
     app,
-    browser_bridge_host,
+    bridges,
     main,
 )
 
@@ -2072,12 +2074,6 @@ def test_sandbox_mounts_no_gitconfig(
 # ---------------------------------------------------------------------------
 
 
-def test_free_tcp_port_returns_usable_port() -> None:
-    port = claude_profile._free_tcp_port()
-    assert isinstance(port, int)
-    assert 1024 <= port <= 65535
-
-
 def test_ssh_agent_sockets_includes_auth_and_1password(
     fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2164,19 +2160,27 @@ def test_forwarding_env_empty() -> None:
 
 def test_forwarding_env_ssh(tmp_path: Path) -> None:
     a = tmp_path / "a.sock"
-    fwd = claude_profile._Forwarding([(a, a, 1111)], ssh_auth_sock=a)
+    fwd = claude_profile._Forwarding([(a, a, "ssh-0")], ssh_auth_sock=a)
     env = claude_profile._forwarding_env(fwd)
-    assert f"CLAUDE_SANDBOX_FORWARDS={a}=1111" in env
+    assert f"CLAUDE_SANDBOX_FORWARDS={a}=ssh-0" in env
     assert f"SSH_AUTH_SOCK={a}" in env
     assert "GNUPGHOME=/home/appuser/.gnupg" not in env
+
+
+def test_forwarding_gpg_only_when_the_gpg_agent_is_bridged(tmp_path: Path) -> None:
+    # Signing config joins the VM's git identity only when signing can work there.
+    sock = tmp_path / "agent.sock"
+    assert claude_profile._Forwarding([(sock, sock, "ssh-0")]).gpg() is False
+    both = claude_profile._Forwarding([(sock, sock, "ssh-0"), (sock, sock, "gpg")])
+    assert both.gpg() is True
 
 
 def test_forwarding_env_gpg(tmp_path: Path) -> None:
     host = tmp_path / "S.gpg-agent.extra"
     guest = Path("/home/appuser/.gnupg/S.gpg-agent")
-    fwd = claude_profile._Forwarding([(host, guest, 2222)], gpg_pubkeys=b"ABC")
+    fwd = claude_profile._Forwarding([(host, guest, "gpg")], gpg_pubkeys=b"ABC")
     env = claude_profile._forwarding_env(fwd)
-    assert f"CLAUDE_SANDBOX_FORWARDS={guest}=2222" in env
+    assert f"CLAUDE_SANDBOX_FORWARDS={guest}=gpg" in env
     assert "GNUPGHOME=/home/appuser/.gnupg" in env
     assert (
         f"CLAUDE_SANDBOX_GPG_PUBKEYS_FILE={claude_profile.SANDBOX_GPG_PUBKEYS}" in env
@@ -2198,7 +2202,6 @@ def test_argv_gpg_pubkeys_reach_the_vm_as_a_file(
     extra.touch()
     monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", True)
     monkeypatch.setattr(claude_profile, "_gpg_extra_socket", lambda: extra)
-    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 6000)
     with patch("subprocess.run", fake_export):
         fwd = claude_profile._build_forwarding()
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
@@ -2273,10 +2276,9 @@ def test_build_forwarding_ssh_only(
     monkeypatch.setattr(
         claude_profile, "_ssh_agent_status", lambda s: 2
     )  # live w/ keys
-    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 5000)
     fwd = claude_profile._build_forwarding()
     guest = Path(claude_profile.SANDBOX_AGENT_DIR) / "ssh-agent-0.sock"
-    assert fwd.forwards == [(auth, guest, 5000)]
+    assert fwd.forwards == [(auth, guest, "ssh-0")]
     assert fwd.ssh_auth_sock == guest
     assert fwd.gpg_pubkeys is None
 
@@ -2290,9 +2292,8 @@ def test_build_forwarding_ssh_guest_path_stays_out_of_run_user(
     monkeypatch.setenv("SSH_AUTH_SOCK", str(auth))
     monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", True)
     monkeypatch.setattr(claude_profile, "_ssh_agent_sockets", lambda: [auth])
-    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 5000)
     fwd = claude_profile._build_forwarding()
-    guests = [guest for _host, guest, _port in fwd.forwards]
+    guests = [guest for _host, guest, _service in fwd.forwards]
     assert guests and not any(str(g).startswith("/run/user/") for g in guests)
 
 
@@ -2304,10 +2305,9 @@ def test_build_forwarding_gpg_only(
     monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", True)
     monkeypatch.setattr(claude_profile, "_gpg_extra_socket", lambda: extra)
     monkeypatch.setattr(claude_profile, "_export_gpg_pubkeys", lambda: b"ABC")
-    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 6000)
     fwd = claude_profile._build_forwarding()
     guest = Path(claude_profile.SANDBOX_GNUPGHOME) / "S.gpg-agent"
-    assert fwd.forwards == [(extra, guest, 6000)]
+    assert fwd.forwards == [(extra, guest, "gpg")]
     assert fwd.ssh_auth_sock is None
     assert fwd.gpg_pubkeys == b"ABC"
 
@@ -2349,11 +2349,15 @@ def test_argv_forwarding_adds_pasta_and_env(
     cwd = tmp_path / "work"
     cwd.mkdir()
     a = tmp_path / "a.sock"
-    fwd = claude_profile._Forwarding([(a, a, 1234)], ssh_auth_sock=a)
-    argv = _build_sandbox_argv(profile, cwd, [], {}, fwd)
+    fwd = claude_profile._Forwarding([(a, a, "ssh-0")], ssh_auth_sock=a)
+    argv = _build_sandbox_argv(profile, cwd, [], {}, fwd, bridge=(4321, "t0ken"))
     assert any(arg.startswith("--network=pasta") for arg in argv)
     assert f"SSH_AUTH_SOCK={a}" in argv
-    assert f"CLAUDE_SANDBOX_FORWARDS={a}=1234" in argv
+    assert f"CLAUDE_SANDBOX_FORWARDS={a}=ssh-0" in argv
+    assert "CLAUDE_SANDBOX_BRIDGE_PORT=4321" in argv
+    # The token unlocks the bridges, so it travels in the env file, not on argv.
+    assert not any("t0ken" in arg for arg in argv)
+    assert "CLAUDE_SANDBOX_BRIDGE_TOKEN=t0ken\n" in _env_file_text(argv)
 
 
 def test_argv_no_forwarding_no_pasta(
@@ -2369,6 +2373,21 @@ def test_argv_no_forwarding_no_pasta(
     assert not any(arg.startswith("CLAUDE_SANDBOX_FORWARDS") for arg in argv)
 
 
+def _record_bridge_servers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[bridges.BridgeServer]:
+    """Let the launch build real bridge servers, and keep them for inspection."""
+    servers: list[bridges.BridgeServer] = []
+    real = bridges.BridgeServer
+
+    def recording(services: dict[str, bridges.Service]) -> bridges.BridgeServer:
+        servers.append(real(services))
+        return servers[-1]
+
+    monkeypatch.setattr(bridges, "BridgeServer", recording)
+    return servers
+
+
 def test_launch_supervised_when_forwarding(
     profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2378,16 +2397,9 @@ def test_launch_supervised_when_forwarding(
     monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
     sock = Path("/run/x.sock")
-    fwd = claude_profile._Forwarding([(sock, sock, 1234)], ssh_auth_sock=sock)
+    fwd = claude_profile._Forwarding([(sock, sock, "ssh-0")], ssh_auth_sock=sock)
     monkeypatch.setattr(claude_profile, "_build_forwarding", lambda: fwd)
-    monkeypatch.setattr(claude_profile.shutil, "which", lambda _: "/usr/bin/socat")
-    started: list[tuple[Path, int]] = []
-
-    def fake_bridge(host: Path, port: int) -> Mock:
-        started.append((host, port))
-        return Mock()
-
-    monkeypatch.setattr(claude_profile, "_start_host_bridge", fake_bridge)
+    servers = _record_bridge_servers(monkeypatch)
     monkeypatch.chdir(_project(tmp_path))
     with (
         patch("subprocess.Popen") as popen,
@@ -2398,35 +2410,54 @@ def test_launch_supervised_when_forwarding(
         _launch_profile("work", [])
     assert exc_info.value.code == 0
     mock_exec.assert_not_called()
-    popen.assert_called_once()
-    assert any(arg.startswith("--network=pasta") for arg in popen.call_args[0][0])
-    assert started == [(sock, 1234)]
+    argv = popen.call_args[0][0]
+    assert any(arg.startswith("--network=pasta") for arg in argv)
+    [server] = servers
+    assert f"CLAUDE_SANDBOX_BRIDGE_PORT={server.port}" in argv
+    assert f"CLAUDE_SANDBOX_BRIDGE_TOKEN={server.token}\n" in _env_file_text(argv)
+    # Done with the VM, done listening.
+    with pytest.raises(ConnectionRefusedError):
+        socket.create_connection(("127.0.0.1", server.port), timeout=5)
+
+
+def test_bridge_services_match_the_forwarding(tmp_path: Path) -> None:
+    sock = tmp_path / "agent.sock"
+    fwd = claude_profile._Forwarding(
+        [(sock, sock, "ssh-0"), (sock, sock, "gpg")], clipboard=True, chrome=True
+    )
+    services = claude_profile._bridge_services(fwd)
+    assert set(services) == {"ssh-0", "gpg", "clipboard", "chrome", "open"}
+    assert services["clipboard"] is bridges.clipboard
+    assert services["chrome"] is bridges.chrome_relay
+    assert services["open"] is bridges.browser_open
+    assert set(claude_profile._bridge_services(claude_profile._Forwarding([]))) == set()
 
 
 SUPERVISOR_HARNESS = textwrap.dedent(
     """
-    import pathlib, shutil, subprocess, sys
+    import pathlib, sys
     import claude_profile
+    from claude_profile import bridges
 
-    bridge_pid, vm_pid = sys.argv[1], sys.argv[2]
+    bridge_port, vm_pid = sys.argv[1], sys.argv[2]
+    real = bridges.BridgeServer
 
-    def fake_bridge(host, port):
-        proc = subprocess.Popen(["sleep", "300"])
-        pathlib.Path(bridge_pid).write_text(str(proc.pid))
-        return proc
+    def recording(services):
+        server = real(services)
+        pathlib.Path(bridge_port).write_text(str(server.port))
+        return server
 
-    claude_profile._start_host_bridge = fake_bridge
+    bridges.BridgeServer = recording
     claude_profile._build_sandbox_argv = lambda *args, **kwargs: [
         "sh", "-c", f"echo $$ > {vm_pid}; exec sleep 300"
     ]
-    shutil.which = lambda name: "/usr/bin/" + name
     sock = pathlib.Path("/run/agent.sock")
     claude_profile._run_sandbox_supervised(
         pathlib.Path("/profile"),
         pathlib.Path("/cwd"),
         [],
         {},
-        claude_profile._Forwarding([(sock, sock, 1)]),
+        claude_profile._Forwarding([(sock, sock, "ssh-0")]),
     )
     """
 )
@@ -2460,26 +2491,24 @@ def _poll(condition: Any, timeout: float) -> bool:
 def test_supervised_launch_leaves_no_bridge_when_argv_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # Building the argv can exit (a value with a newline, an unwritable file). Bridges
-    # started before that kept relaying the SSH agent to any local process.
-    started: list[Mock] = []
-
-    def fake_bridge(host: Path, port: int) -> Mock:
-        started.append(Mock())
-        return started[-1]
-
+    # Building the argv can exit (a value with a newline, an unwritable file).
     def failing_argv(*args: object, **kwargs: object) -> list[str]:
         raise SystemExit(1)
 
     monkeypatch.setattr(claude_profile, "_build_sandbox_argv", failing_argv)
-    monkeypatch.setattr(claude_profile.shutil, "which", lambda name: "/usr/bin/" + name)
-    monkeypatch.setattr(claude_profile, "_start_host_bridge", fake_bridge)
+    servers = _record_bridge_servers(monkeypatch)
     sock = Path("/run/agent.sock")
     with pytest.raises(SystemExit):
         claude_profile._run_sandbox_supervised(
-            tmp_path, tmp_path, [], {}, claude_profile._Forwarding([(sock, sock, 1)])
+            tmp_path,
+            tmp_path,
+            [],
+            {},
+            claude_profile._Forwarding([(sock, sock, "ssh-0")]),
         )
-    assert all(bridge.terminate.called for bridge in started)
+    [server] = servers
+    with pytest.raises(ConnectionRefusedError):
+        socket.create_connection(("127.0.0.1", server.port), timeout=5)
 
 
 def test_supervised_launch_lets_podman_read_the_env_file(
@@ -2493,8 +2522,6 @@ def test_supervised_launch_lets_podman_read_the_env_file(
         "_build_sandbox_argv",
         lambda *args, **kwargs: ["sh", "-c", f'cat "{env_file}" > "{seen}"'],
     )
-    monkeypatch.setattr(claude_profile.shutil, "which", lambda name: "/usr/bin/" + name)
-    monkeypatch.setattr(claude_profile, "_start_host_bridge", lambda host, port: Mock())
     sock = Path("/run/agent.sock")
     try:
         with pytest.raises(SystemExit) as exc_info:
@@ -2503,7 +2530,7 @@ def test_supervised_launch_lets_podman_read_the_env_file(
                 tmp_path,
                 [],
                 {},
-                claude_profile._Forwarding([(sock, sock, 1)]),
+                claude_profile._Forwarding([(sock, sock, "ssh-0")]),
             )
     finally:
         os.close(int(env_file.rsplit("/", 1)[1]))
@@ -2511,14 +2538,67 @@ def test_supervised_launch_lets_podman_read_the_env_file(
     assert seen.read_text() == "TOKEN=x\n"
 
 
+def _echo_once(listener: socket.socket) -> None:
+    """Answer one connection with whatever it sent, as an agent answers a request."""
+    conn, _ = listener.accept()
+    with conn:
+        conn.sendall(b"".join(iter(lambda: conn.recv(4096), b"")))
+
+
+def test_supervised_launch_serves_its_agents_to_the_vm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Stand in for the VM: take the port and token the launch hands podman, and reach the
+    # agent through the bridge the way bridge-connect does.
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile, cwd = tmp_path / "prof", tmp_path / "work"
+    profile.mkdir()
+    cwd.mkdir()
+    agent_path = tmp_path / "agent.sock"
+    replies: list[bytes] = []
+    real_popen = subprocess.Popen
+
+    def vm(argv: list[str], **kwargs: Any) -> Any:
+        if argv[0] != claude_profile.settings.podman_bin:
+            return real_popen(argv, **kwargs)
+        port = next(
+            int(arg.split("=")[1])
+            for arg in argv
+            if arg.startswith("CLAUDE_SANDBOX_BRIDGE_PORT=")
+        )
+        env = dict(line.split("=", 1) for line in _env_file_text(argv).splitlines())
+        token = env["CLAUDE_SANDBOX_BRIDGE_TOKEN"]
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+            conn.sendall(f"{token} ssh-0\nping".encode())
+            conn.shutdown(socket.SHUT_WR)
+            replies.append(b"".join(iter(lambda: conn.recv(4096), b"")))
+        return Mock(**{"wait.return_value": 0})
+
+    monkeypatch.setattr(subprocess, "Popen", vm)
+    with socket.socket(socket.AF_UNIX) as agent:
+        agent.bind(str(agent_path))
+        agent.listen()
+        threading.Thread(target=_echo_once, args=(agent,), daemon=True).start()
+        guest = Path(claude_profile.SANDBOX_AGENT_DIR) / "ssh-agent-0.sock"
+        with pytest.raises(SystemExit) as exc_info:
+            claude_profile._run_sandbox_supervised(
+                profile,
+                cwd,
+                [],
+                {},
+                claude_profile._Forwarding([(agent_path, guest, "ssh-0")]),
+            )
+    assert exc_info.value.code == 0
+    assert replies == [b"ping"]
+
+
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
 def test_supervised_launch_stops_bridges_on_signal(tmp_path: Path, signum: int) -> None:
-    # Closing the terminal sends SIGHUP; `kill` and systemd send SIGTERM. Either must
-    # still tear the host bridges down, or they leave the forwarded agents reachable on
-    # host ports after the session is gone.
-    bridge_pid, vm_pid = tmp_path / "bridge.pid", tmp_path / "vm.pid"
+    # Closing the terminal sends SIGHUP; `kill` and systemd send SIGTERM. Either one is
+    # passed on to podman, and nothing is left listening on the bridge port after.
+    bridge_port, vm_pid = tmp_path / "bridge.port", tmp_path / "vm.pid"
     launcher = subprocess.Popen(
-        [sys.executable, "-c", SUPERVISOR_HARNESS, str(bridge_pid), str(vm_pid)]
+        [sys.executable, "-c", SUPERVISOR_HARNESS, str(bridge_port), str(vm_pid)]
     )
     try:
         assert _poll(lambda: vm_pid.exists() and vm_pid.read_text().strip(), 10)
@@ -2526,30 +2606,13 @@ def test_supervised_launch_stops_bridges_on_signal(tmp_path: Path, signum: int) 
         launcher.send_signal(signum)
         # The VM stand-in dies from the forwarded signal: exit 128+N, as a shell would.
         assert launcher.wait(timeout=10) == 128 + signum
-        bridge = int(bridge_pid.read_text())
-        assert _poll(lambda: _proc_state(bridge) in ("", "Z"), 5)
+        port = int(bridge_port.read_text())
+        with pytest.raises(ConnectionRefusedError):
+            socket.create_connection(("127.0.0.1", port), timeout=5)
     finally:
         launcher.kill()
-        for pidfile in (bridge_pid, vm_pid):
-            with contextlib.suppress(ValueError, OSError):
-                os.kill(int(pidfile.read_text()), signal.SIGKILL)
-
-
-def test_launch_agent_no_socat_exits(
-    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    profile = profiles_base / "work"
-    profile.mkdir(parents=True)
-    (profile / SANDBOX_MARKER).touch()
-    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
-    sock = Path("/run/x.sock")
-    fwd = claude_profile._Forwarding([(sock, sock, 1234)])
-    monkeypatch.setattr(claude_profile, "_build_forwarding", lambda: fwd)
-    monkeypatch.setattr(claude_profile.shutil, "which", lambda _: None)
-    monkeypatch.chdir(tmp_path)
-    with pytest.raises(SystemExit) as exc_info:
-        _launch_profile("work", [])
-    assert exc_info.value.code == 1
+        with contextlib.suppress(ValueError, OSError):
+            os.kill(int(vm_pid.read_text()), signal.SIGKILL)
 
 
 def test_launch_no_forwards_uses_exec(
@@ -2578,24 +2641,22 @@ def test_launch_no_forwards_uses_exec(
 
 def test_build_forwarding_clipboard_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(claude_profile.settings, "sandbox_clipboard", True)
-    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 7777)
     fwd = claude_profile._build_forwarding()
     assert fwd.forwards == []
-    assert fwd.clipboard_port == 7777
+    assert fwd.clipboard is True
     assert fwd.active() is True
 
 
 def test_build_forwarding_no_clipboard_when_disabled() -> None:
     fwd = claude_profile._build_forwarding()
-    assert fwd.clipboard_port is None
+    assert fwd.clipboard is False
     assert fwd.active() is False
 
 
 def test_forwarding_env_clipboard_only() -> None:
-    fwd = claude_profile._Forwarding([], clipboard_port=7777)
+    # The wl-paste shim reaches the bridge with the port and token alone: no socket.
+    fwd = claude_profile._Forwarding([], clipboard=True)
     env = claude_profile._forwarding_env(fwd)
-    assert f"{claude_profile.SANDBOX_CLIPBOARD_PORT_ENV}=7777" in env
-    # No agent sockets, so no CLAUDE_SANDBOX_FORWARDS entry is emitted.
     assert not any(e.startswith("CLAUDE_SANDBOX_FORWARDS") for e in env)
 
 
@@ -2607,16 +2668,10 @@ def test_argv_clipboard_adds_pasta_and_env(
     profile.mkdir()
     cwd = tmp_path / "work"
     cwd.mkdir()
-    fwd = claude_profile._Forwarding([], clipboard_port=7777)
-    argv = _build_sandbox_argv(profile, cwd, [], {}, fwd)
+    fwd = claude_profile._Forwarding([], clipboard=True)
+    argv = _build_sandbox_argv(profile, cwd, [], {}, fwd, bridge=(4321, "t0ken"))
     assert any(arg.startswith("--network=pasta") for arg in argv)
-    assert f"{claude_profile.SANDBOX_CLIPBOARD_PORT_ENV}=7777" in argv
-
-
-def test_clipboard_host_handler_is_packaged() -> None:
-    handler = claude_profile._clipboard_host_handler()
-    assert handler.name == "clipboard_host.sh"
-    assert handler.exists()
+    assert "CLAUDE_SANDBOX_BRIDGE_PORT=4321" in argv
 
 
 def test_launch_supervised_clipboard_only(
@@ -2627,25 +2682,10 @@ def test_launch_supervised_clipboard_only(
     (profile / SANDBOX_MARKER).touch()
     monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
-    fwd = claude_profile._Forwarding([], clipboard_port=7777)
+    fwd = claude_profile._Forwarding([], clipboard=True)
     monkeypatch.setattr(claude_profile, "_build_forwarding", lambda: fwd)
-    monkeypatch.setattr(claude_profile.shutil, "which", lambda _: "/usr/bin/tool")
-    host_bridges: list[tuple[Path, int]] = []
-
-    def fake_host_bridge(host: Path, port: int) -> Mock:
-        host_bridges.append((host, port))
-        return Mock()
-
-    clip_ports: list[int] = []
-
-    def fake_clip_bridge(port: int) -> Mock:
-        clip_ports.append(port)
-        return Mock()
-
-    monkeypatch.setattr(claude_profile, "_start_host_bridge", fake_host_bridge)
-    monkeypatch.setattr(
-        claude_profile, "_start_clipboard_host_bridge", fake_clip_bridge
-    )
+    monkeypatch.setattr(claude_profile.shutil, "which", lambda _: "/usr/bin/wl-paste")
+    servers = _record_bridge_servers(monkeypatch)
     monkeypatch.chdir(_project(tmp_path))
     with (
         patch("subprocess.Popen") as popen,
@@ -2656,32 +2696,29 @@ def test_launch_supervised_clipboard_only(
         _launch_profile("work", [])
     assert exc_info.value.code == 0
     mock_exec.assert_not_called()
-    popen.assert_called_once()
-    assert any(arg.startswith("--network=pasta") for arg in popen.call_args[0][0])
-    assert clip_ports == [7777]
-    assert host_bridges == []
+    [server] = servers
+    assert f"CLAUDE_SANDBOX_BRIDGE_PORT={server.port}" in popen.call_args[0][0]
 
 
 def test_launch_clipboard_no_wl_paste_exits(
-    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    profiles_base: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     profile = profiles_base / "work"
     profile.mkdir(parents=True)
     (profile / SANDBOX_MARKER).touch()
     monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
-    fwd = claude_profile._Forwarding([], clipboard_port=7777)
+    fwd = claude_profile._Forwarding([], clipboard=True)
     monkeypatch.setattr(claude_profile, "_build_forwarding", lambda: fwd)
-    # socat present on host, wl-paste absent.
-    monkeypatch.setattr(
-        claude_profile.shutil,
-        "which",
-        lambda name: None if name == "wl-paste" else "/usr/bin/socat",
-    )
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(claude_profile.shutil, "which", lambda name: None)
+    monkeypatch.chdir(_project(tmp_path))
     with pytest.raises(SystemExit) as exc_info:
         _launch_profile("work", [])
     assert exc_info.value.code == 1
+    assert "wl-paste" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -2696,7 +2733,7 @@ def test_browser_bridge_live_true_with_listener(
 
     d = tmp_path / "bridge"
     d.mkdir()
-    monkeypatch.setattr(claude_profile, "_browser_bridge_dir", lambda: d)
+    monkeypatch.setattr(bridges, "native_host_dir", lambda: d)
     srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
     srv.bind(str(d / "123.sock"))
     srv.listen(1)
@@ -2713,7 +2750,7 @@ def test_browser_bridge_live_false_stale_socket(
 
     d = tmp_path / "bridge"
     d.mkdir()
-    monkeypatch.setattr(claude_profile, "_browser_bridge_dir", lambda: d)
+    monkeypatch.setattr(bridges, "native_host_dir", lambda: d)
     # Bound then closed without listen(): the socket file remains but connect is
     # refused — a stale native-host socket left behind after a crash.
     srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
@@ -2725,54 +2762,42 @@ def test_browser_bridge_live_false_stale_socket(
 def test_browser_bridge_live_false_missing_dir(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(
-        claude_profile, "_browser_bridge_dir", lambda: tmp_path / "nope"
-    )
+    monkeypatch.setattr(bridges, "native_host_dir", lambda: tmp_path / "nope")
     assert claude_profile._browser_bridge_live() is False
 
 
 def test_build_forwarding_chrome_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(claude_profile.settings, "sandbox_chrome", True)
     monkeypatch.setattr(claude_profile, "_browser_bridge_live", lambda: True)
-    ports = iter([8888, 9999])
-    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: next(ports))
     fwd = claude_profile._build_forwarding()
     assert fwd.forwards == []
-    assert fwd.browser_port == 8888
-    assert fwd.browser_open_port == 9999
+    assert fwd.chrome is True
     assert fwd.active() is True
 
 
-def test_build_forwarding_chrome_port_set_even_when_not_live(
+def test_build_forwarding_chrome_even_when_not_live(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The guest still presents the socket and claude reconnects once the host's native
+    # host appears, so the bridge is set up regardless; the warning is informational.
     monkeypatch.setattr(claude_profile.settings, "sandbox_chrome", True)
     monkeypatch.setattr(claude_profile, "_browser_bridge_live", lambda: False)
-    monkeypatch.setattr(claude_profile, "_free_tcp_port", lambda: 8888)
-    # The guest still presents the socket and reconnects until the host native host
-    # appears, so the port is allocated regardless; the warning is informational.
-    fwd = claude_profile._build_forwarding()
-    assert fwd.browser_port == 8888
+    assert claude_profile._build_forwarding().chrome is True
 
 
 def test_build_forwarding_no_chrome_when_disabled() -> None:
     fwd = claude_profile._build_forwarding()
-    assert fwd.browser_port is None
+    assert fwd.chrome is False
     assert fwd.active() is False
 
 
 def test_forwarding_env_chrome_only() -> None:
-    fwd = claude_profile._Forwarding([], browser_port=8888)
+    # claude scans for the native host's socket, so the guest presents one that the
+    # bridge's chrome service relays.
+    fwd = claude_profile._Forwarding([], chrome=True)
     env = claude_profile._forwarding_env(fwd)
-    assert f"{claude_profile.SANDBOX_BROWSER_BRIDGE_PORT_ENV}=8888" in env
-    assert not any(e.startswith("CLAUDE_SANDBOX_FORWARDS") for e in env)
-
-
-def test_forwarding_env_browser_open() -> None:
-    fwd = claude_profile._Forwarding([], browser_open_port=9999)
-    env = claude_profile._forwarding_env(fwd)
-    assert f"{claude_profile.SANDBOX_BROWSER_OPEN_PORT_ENV}=9999" in env
-    assert fwd.active() is True
+    socket_spec = f"{claude_profile.SANDBOX_CHROME_SOCKET}=chrome"
+    assert f"CLAUDE_SANDBOX_FORWARDS={socket_spec}" in env
 
 
 def test_argv_appends_chrome_flag_when_sandbox_chrome(
@@ -2922,90 +2947,6 @@ def test_warn_missing_chrome_scope_silent_without_creds(
     assert capsys.readouterr().err == ""
 
 
-def _fake_tool(bin_dir: Path, name: str, record: Path) -> None:
-    """A stand-in for a host tool that records its arguments, one per line."""
-    bin_dir.mkdir(exist_ok=True)
-    tool = bin_dir / name
-    tool.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {record}\necho ran\n')
-    tool.chmod(0o755)
-
-
-def _run_handler(handler: Path, request: str, bin_dir: Path) -> str:
-    """Feed one request line to a host bridge handler, as socat does per connection."""
-    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
-    result = subprocess.run(
-        ["bash", str(handler)],
-        input=request + "\n",
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=10,
-        check=True,
-    )
-    return result.stdout
-
-
-@pytest.mark.parametrize(
-    ("request_line", "allowed"),
-    [
-        ("--list-types", True),
-        ("--no-newline --type image/png", True),
-        ("-t text/plain", True),
-        # --watch runs a command for every clipboard change: on the host.
-        ("--watch touch /tmp/pwned", False),
-        ("--primary", False),
-        ("--type image/png --watch sh", False),
-    ],
-)
-def test_clipboard_handler_runs_only_read_only_wl_paste(
-    tmp_path: Path, request_line: str, allowed: bool
-) -> None:
-    record = tmp_path / "wl-paste-args"
-    _fake_tool(tmp_path / "bin", "wl-paste", record)
-    handler = claude_profile._clipboard_host_handler()
-    output = _run_handler(handler, request_line, tmp_path / "bin")
-    assert record.exists() is allowed
-    if allowed:
-        assert record.read_text().split() == request_line.split()
-        assert output == "ran\n"
-
-
-@pytest.mark.parametrize(
-    ("url", "allowed"),
-    [
-        ("https://clau.de/chrome/reconnect", True),
-        ("https://claude.ai/chrome/connect", True),
-        ("https://example.com/chrome", False),
-        ("https://clau.de.example.com/chrome", False),
-        ("http://clau.de/chrome/reconnect", False),
-        ("javascript:alert(1)", False),
-    ],
-)
-def test_browser_open_handler_opens_only_claude_connect_pages(
-    tmp_path: Path, url: str, allowed: bool
-) -> None:
-    # It opens pages in the host's logged-in browser on the sandbox's say-so.
-    record = tmp_path / "chrome-args"
-    _fake_tool(tmp_path / "bin", "google-chrome", record)
-    handler = claude_profile._browser_open_host_handler()
-    output = _run_handler(handler, url, tmp_path / "bin")
-    assert output == ("OK\n" if allowed else "NO\n")
-    if allowed:
-        assert _poll(
-            record.exists, 5
-        )  # the handler starts the browser in the background
-        assert record.read_text() == url + "\n"
-    else:
-        time.sleep(0.2)
-        assert not record.exists()
-
-
-def test_browser_open_host_handler_is_packaged() -> None:
-    handler = claude_profile._browser_open_host_handler()
-    assert handler.name == "browser_open_host.sh"
-    assert handler.exists()
-
-
 def test_argv_chrome_adds_pasta_and_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3014,61 +2955,12 @@ def test_argv_chrome_adds_pasta_and_env(
     profile.mkdir()
     cwd = tmp_path / "work"
     cwd.mkdir()
-    fwd = claude_profile._Forwarding([], browser_port=8888)
-    argv = _build_sandbox_argv(profile, cwd, [], {}, fwd)
+    fwd = claude_profile._Forwarding([], chrome=True)
+    argv = _build_sandbox_argv(profile, cwd, [], {}, fwd, bridge=(4321, "t0ken"))
     assert any(arg.startswith("--network=pasta") for arg in argv)
-    assert f"{claude_profile.SANDBOX_BROWSER_BRIDGE_PORT_ENV}=8888" in argv
-
-
-def test_browser_bridge_host_handler_is_packaged() -> None:
-    handler = claude_profile._browser_bridge_host_handler()
-    assert handler.name == "browser_bridge_host.py"
-    assert handler.exists()
-
-
-def test_browser_bridge_write_all_delivers_every_byte(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # os.write may write only part of a buffer; a dropped tail would corrupt the
-    # length-prefixed frame stream the in-VM claude reads.
-    written: list[bytes] = []
-
-    def short_write(fd: int, data: bytes) -> int:
-        written.append(bytes(data[:3]))
-        return len(written[-1])
-
-    monkeypatch.setattr(browser_bridge_host.os, "write", short_write)
-    browser_bridge_host.write_all(1, b"\x0a\x00\x00\x000123456789")
-    assert b"".join(written) == b"\x0a\x00\x00\x000123456789"
-
-
-@pytest.mark.parametrize(
-    ("mode", "found"), [(0o700, True), (0o750, False), (0o755, False)]
-)
-def test_browser_bridge_uses_only_a_private_socket_dir(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: int, found: bool
-) -> None:
-    # claude's own client refuses a bridge dir others can write to; the host proxy
-    # must too, or another local user can plant a socket the VM's browser calls reach.
-    bridge_dir = tmp_path / "claude-mcp-browser-bridge-me"
-    bridge_dir.mkdir()
-    (bridge_dir / "123.sock").touch()
-    bridge_dir.chmod(mode)
-    monkeypatch.setattr(browser_bridge_host, "DIR", str(bridge_dir))
-    expected = str(bridge_dir / "123.sock") if found else None
-    assert browser_bridge_host.newest_sock() == expected
-
-
-def test_browser_bridge_ignores_a_symlinked_socket_dir(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    private = tmp_path / "elsewhere"
-    private.mkdir(mode=0o700)
-    (private / "123.sock").touch()
-    link = tmp_path / "claude-mcp-browser-bridge-me"
-    link.symlink_to(private)
-    monkeypatch.setattr(browser_bridge_host, "DIR", str(link))
-    assert browser_bridge_host.newest_sock() is None
+    assert "CLAUDE_SANDBOX_BRIDGE_PORT=4321" in argv
+    socket_spec = f"{claude_profile.SANDBOX_CHROME_SOCKET}=chrome"
+    assert f"CLAUDE_SANDBOX_FORWARDS={socket_spec}" in argv
 
 
 def test_launch_supervised_chrome_only(
@@ -3079,26 +2971,9 @@ def test_launch_supervised_chrome_only(
     (profile / SANDBOX_MARKER).touch()
     monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
-    fwd = claude_profile._Forwarding([], browser_port=8888, browser_open_port=9999)
+    fwd = claude_profile._Forwarding([], chrome=True)
     monkeypatch.setattr(claude_profile, "_build_forwarding", lambda: fwd)
-    monkeypatch.setattr(claude_profile.shutil, "which", lambda _: "/usr/bin/tool")
-    browser_ports: list[int] = []
-    browser_open_ports: list[int] = []
-
-    def fake_browser_bridge(port: int) -> Mock:
-        browser_ports.append(port)
-        return Mock()
-
-    def fake_browser_open_bridge(port: int) -> Mock:
-        browser_open_ports.append(port)
-        return Mock()
-
-    monkeypatch.setattr(
-        claude_profile, "_start_browser_host_bridge", fake_browser_bridge
-    )
-    monkeypatch.setattr(
-        claude_profile, "_start_browser_open_host_bridge", fake_browser_open_bridge
-    )
+    servers = _record_bridge_servers(monkeypatch)
     monkeypatch.chdir(_project(tmp_path))
     with (
         patch("subprocess.Popen") as popen,
@@ -3112,9 +2987,8 @@ def test_launch_supervised_chrome_only(
     popen.assert_called_once()
     argv = popen.call_args[0][0]
     assert any(arg.startswith("--network=pasta") for arg in argv)
-    assert f"{claude_profile.SANDBOX_BROWSER_OPEN_PORT_ENV}=9999" in argv
-    assert browser_ports == [8888]
-    assert browser_open_ports == [9999]
+    [server] = servers
+    assert f"CLAUDE_SANDBOX_BRIDGE_PORT={server.port}" in argv
 
 
 # ---------------------------------------------------------------------------
