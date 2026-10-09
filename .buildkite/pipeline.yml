@@ -1,0 +1,6 @@
+# claude-profile's CI. The Buildkite pipeline's one step uploads this file. The step runs on
+# the cluster's default queue, whose agents hold no secrets (the repository is public), in the
+# CI image .buildkite/run builds from .buildkite/Containerfile.
+steps:
+  - label: ":white_check_mark: prek hooks on every file"
+    command: .buildkite/run prek run --all-files
