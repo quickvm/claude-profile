@@ -246,8 +246,10 @@ hand.
   at the host's path: the entrypoint chowns each socket's parent dir, and when the host socket
   sits directly in `/run/user/<uid>` that made gpg move its socket dir there and miss the GPG
   bridge.
-- **known_hosts persistence:** `_sandbox_mounts` mounts the host's `~/.ssh/known_hosts`
-  read-only as the VM's *global* known_hosts (`/etc/ssh/ssh_known_hosts`, for verification)
+- **known_hosts persistence:** `_sandbox_mounts` mounts a copy of the host's `~/.ssh/known_hosts`
+  (`_host_file_copy`, refreshed every launch: `:z` on the real file would relabel it from
+  `ssh_home_t` for containers) read-only as the VM's *global* known_hosts
+  (`/etc/ssh/ssh_known_hosts`, for verification)
   and a per-profile writable `known_hosts` (`_sandbox_known_hosts`, in the state dir) as the
   *user* file, so
   ssh records newly accepted host keys there and they persist across launches — the host's
@@ -258,8 +260,9 @@ hand.
   (`gpg --export`, written to the data dir and mounted read-only at `SANDBOX_GPG_PUBKEYS` by
   `_gpg_pubkeys_mounts`, imported by `entrypoint.sh`; a file because a keyring easily
   outgrows the 128 KiB Linux allows one env string). Signing runs on the host,
-  so secret keys/smartcard never enter the VM. `_sandbox_mounts` also bind-mounts
-  `~/.gitconfig` read-only so signing config applies. Its `include`/`includeIf` files are not
+  so secret keys/smartcard never enter the VM. `_sandbox_mounts` also bind-mounts a copy of
+  `~/.gitconfig` (`_host_file_copy`, for the same relabelling reason) read-only so signing
+  config applies. Its `include`/`includeIf` files are not
   mounted, and a `gitdir:~/` condition could not match in the VM anyway (`~` is
   /home/appuser there), so `_git_identity_mounts` resolves `GIT_IDENTITY_KEYS` for the CWD on
   the host, writes them to a file in the data dir that first includes the mounted

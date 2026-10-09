@@ -2149,17 +2149,25 @@ def test_copied_statusline_not_mounted(
     assert _linked_specs(mounts) == []
 
 
-def test_sandbox_mounts_includes_gitconfig(
+def test_sandbox_mounts_a_copy_of_the_gitconfig(
     fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    # :z on the user's own file would relabel it for containers; the copy takes the label.
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
-    (fake_home / ".gitconfig").write_text("[user]\n  name = x\n")
+    gitconfig = fake_home / ".gitconfig"
+    gitconfig.write_text("[user]\n  name = x\n")
     profile = tmp_path / "prof"
     profile.mkdir()
     cwd = tmp_path / "work"
     cwd.mkdir()
+    in_vm = Path("/home/appuser/.gitconfig")
     mounts = _sandbox_mounts(profile, cwd)
-    assert f"{fake_home / '.gitconfig'}:/home/appuser/.gitconfig:ro,z" in mounts
+    assert _mount_source(mounts, in_vm, "ro,z").read_text() == "[user]\n  name = x\n"
+    assert not any(str(gitconfig) in spec for spec in mounts)
+    # Each launch copies it again, so host edits reach the next sandbox.
+    gitconfig.write_text("[user]\n  name = y\n")
+    copy = _mount_source(_sandbox_mounts(profile, cwd), in_vm, "ro,z")
+    assert copy.read_text() == "[user]\n  name = y\n"
 
 
 def test_sandbox_mounts_no_gitconfig(
@@ -4034,8 +4042,11 @@ def test_sandbox_mounts_known_hosts_global_ro_and_user_rw(
     cwd = tmp_path / "work"
     cwd.mkdir()
     mounts = _sandbox_mounts(profile, cwd)
-    # host file is the read-only global known_hosts (verification only)
-    assert f"{ssh / 'known_hosts'}:/etc/ssh/ssh_known_hosts:ro,z" in mounts
+    # A copy of the host file is the read-only global known_hosts (verification only); a
+    # copy so that :z relabels ours, not the user's ssh_home_t file.
+    copy = _mount_source(mounts, Path("/etc/ssh/ssh_known_hosts"), "ro,z")
+    assert copy.read_text() == "git.example.org ssh-ed25519 AAAA\n"
+    assert not any(str(ssh) in spec for spec in mounts)
     # per-profile writable user known_hosts persists newly accepted keys
     state = claude_profile._sandbox_state_dir(profile)
     assert f"{state / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z" in mounts
@@ -4288,9 +4299,11 @@ def _repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _mount_source(mounts: list[str], target: Path) -> Path:
-    """The host path a read-write mount puts at target."""
-    [source] = [spec.split(":")[0] for spec in mounts if spec.endswith(f":{target}:z")]
+def _mount_source(mounts: list[str], target: Path, options: str = "z") -> Path:
+    """The host path a mount with these options (read-write by default) puts at target."""
+    [source] = [
+        spec.split(":")[0] for spec in mounts if spec.endswith(f":{target}:{options}")
+    ]
     return Path(source)
 
 

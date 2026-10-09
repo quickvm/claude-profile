@@ -1277,6 +1277,20 @@ def _sandbox_known_hosts(profile_dir: Path) -> Path:
     return dest
 
 
+def _host_file_copy(profile_dir: Path, source: Path, name: str) -> Path | None:
+    """Copy a host file into the profile's state dir to mount; None when it is absent.
+
+    Mounting the user's own file with :z would relabel it for containers, out from under
+    the host's tools and restorecon (known_hosts is ssh_home_t), so the VM gets a copy,
+    refreshed every launch, and :z relabels that instead.
+    """
+    if not source.is_file():
+        return None
+    copy = _sandbox_state_dir(profile_dir) / name
+    copy.write_bytes(source.read_bytes())
+    return copy
+
+
 def _host_claude_binary() -> Path | None:
     """The host's Claude Code binary, when it came from the native installer.
 
@@ -1434,11 +1448,13 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
         mounts += ["-v", f"{git_dir}:{git_dir}:z"]
     mounts += _git_state_mounts(profile_dir, cwd)
     mounts += _local_settings_mounts(profile_dir, root, cwd)
-    gitconfig = Path.home() / ".gitconfig"
-    if gitconfig.exists():
-        mounts += ["-v", f"{gitconfig}:/home/appuser/.gitconfig:ro,z"]
-    host_known_hosts = Path.home() / ".ssh" / "known_hosts"
-    if host_known_hosts.exists():
+    gitconfig = _host_file_copy(profile_dir, Path.home() / ".gitconfig", "gitconfig")
+    if gitconfig is not None:
+        mounts += ["-v", f"{gitconfig}:{SANDBOX_GITCONFIG}:ro,z"]
+    host_known_hosts = _host_file_copy(
+        profile_dir, Path.home() / ".ssh" / "known_hosts", "host_known_hosts"
+    )
+    if host_known_hosts is not None:
         # Read-only *global* known_hosts: ssh verifies already-trusted hosts against it
         # but never writes it, so the sandbox can't modify the host's real file.
         mounts += ["-v", f"{host_known_hosts}:/etc/ssh/ssh_known_hosts:ro,z"]
