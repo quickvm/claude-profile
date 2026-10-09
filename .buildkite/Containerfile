@@ -1,0 +1,19 @@
+# The toolchain claude-profile's CI runs in: git, Python 3.13, uv and prek, which installs each
+# hook's own tools into the cache .buildkite/run mounts. Package versions follow Fedora 44's
+# updates; the base image, uv and prek are pinned.
+ARG FEDORA_DIGEST=sha256:b0b2ac1c4a682dea428ae05a0065824178ad951c304c3ac15c29daa8335e0599
+ARG UV_DIGEST=sha256:a7aed3216253ee804de3e2d8afa5073baa1a177335345d43845cd4165e43b711
+
+FROM ghcr.io/astral-sh/uv:0.12.21@${UV_DIGEST} AS uv
+
+FROM registry.fedoraproject.org/fedora:44@${FEDORA_DIGEST}
+
+RUN dnf install -y --setopt=install_weak_deps=False git-core python3.13 \
+    && dnf clean all
+
+COPY --from=uv /uv /uvx /usr/local/bin/
+
+# The project's environment lives outside the checkout, and uv uses Fedora's Python 3.13.
+ENV UV_PROJECT_ENVIRONMENT=/tmp/venv UV_PYTHON=3.13 UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy
+
+RUN UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin uv tool install prek==0.5.4

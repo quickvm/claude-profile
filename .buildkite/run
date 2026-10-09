@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Run a command in claude-profile's CI image (the Containerfile here, built when it changes) on
+# the agent's podman: as the agent's user, in the checkout, with a cache that outlives the job,
+# so prek and uv download the hooks' tools and the dev dependencies once per agent rather than
+# once per build. Rootless podman keeps the agent's user with keep-id; under rootful podman
+# --user gives the same.
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+image="localhost/claude-profile-ci:$(sha256sum "$here/Containerfile" | cut -c1-16)"
+if ! podman image exists "$image"; then
+	echo "--- :package: Building $image" >&2
+	podman build --tag "$image" --file "$here/Containerfile" "$here" >&2
+fi
+if [[ $(podman info --format '{{.Host.Security.Rootless}}') == true ]]; then
+	user=(--userns=keep-id)
+else
+	user=(--user "$(id -u):$(id -g)")
+fi
+cache="$HOME/cache"
+mkdir -p "$cache"
+exec podman run --rm --init "${user[@]}" --security-opt label=disable \
+	--volume "$PWD:$PWD" --workdir "$PWD" \
+	--volume "$cache:$cache" --env HOME="$cache" \
+	"$image" "$@"

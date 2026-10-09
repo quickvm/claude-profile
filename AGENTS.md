@@ -27,9 +27,11 @@ prek install          # git hook running .pre-commit-config.yaml on every commit
 | type check | `uv run ty check` |
 | tests | `uv run pytest -q` |
 
-The prek hooks run all of these plus shellcheck, gitleaks (secrets in staged changes),
-actionlint and zizmor on every commit; CI runs the same hooks on every file. To run them by
-hand:
+The prek hooks run all of these plus shellcheck, gitleaks (secrets in staged changes) and
+check-buildkite (the CI pipeline's schema) on every commit. CI runs the same hooks on every file
+in Buildkite: the pipeline uploads `.buildkite/pipeline.yml`, and `.buildkite/run` runs its step
+in the image `.buildkite/Containerfile` describes (git, Python 3.13, uv and prek, pinned), on the
+cluster's default queue, whose agents hold no secrets. To run the hooks by hand:
 
 ```sh
 prek run --all-files
