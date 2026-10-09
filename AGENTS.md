@@ -35,8 +35,10 @@ hand:
 prek run --all-files
 ```
 
-ruff enforces the limits below (complexity 8, 100-character lines). Bump hook versions with
-`prek auto-update --cooldown-days 7`, and the dev tools in pyproject's `dev` extra by hand.
+ruff enforces the limits below (complexity 8, 100-character lines), and
+`test_functions_stay_within_the_line_limit` the 100-line function limit. Bump hook versions
+with `prek auto-update --cooldown-days 7`, and the dev tools in pyproject's `dev` extra by
+hand.
 
 ## Architecture
 
@@ -123,8 +125,8 @@ ruff enforces the limits below (complexity 8, 100-character lines). Bump hook ve
   `entrypoint.sh` drops to a host-UID user (`runuser`) before exec'ing claude. Sandbox
   mode adds that flag unless `sandbox_skip_permissions` is false, the user already passed
   it, or the user passed `--permission-mode` (claude ranks the skip flag above it). The
-  sandbox's own flags (this one, `--chrome`, the briefing) go *before* the user's args, so
-  a subcommand's `--` arguments (`mcp add NAME -- CMD`) never pick them up.
+  sandbox's own flags (this one, `--chrome`, the briefing; `_sandbox_claude_args`) go *before*
+  the user's args, so a subcommand's `--` arguments (`mcp add NAME -- CMD`) never pick them up.
 - **Sandbox settings:** `podman_bin`, `sandbox_image`, `sandbox_ram_mib`, `sandbox_cpus`,
   `sandbox_skip_permissions`, `sandbox_ssh_agent`, `sandbox_gpg_agent`, `sandbox_clipboard`,
   `sandbox_chrome`, `sandbox_gh`, `sandbox_infisical`, `sandbox_pulumi`, `sandbox_forward_env`

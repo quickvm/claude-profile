@@ -1549,10 +1549,19 @@ def _build_sandbox_argv(
     argv += mounts
     argv += _gpg_pubkeys_mounts(forwarding)
     argv += ["-w", str(cwd), settings.sandbox_image, "claude"]
+    return argv + _sandbox_claude_args(claude_args, extra_env)
+
+
+def _sandbox_claude_args(
+    claude_args: list[str], extra_env: dict[str, str]
+) -> list[str]:
+    """claude's arguments in the VM: the sandbox's own flags, then the user's.
+
+    The sandbox's flags go first: after a subcommand's `--` they would become that
+    command's arguments (`claude mcp add NAME -- CMD ...` saved them into the server
+    definition).
+    """
     args = list(claude_args)
-    # The sandbox's own flags go before the user's args: after a subcommand's `--` they
-    # would become that command's arguments (`claude mcp add NAME -- CMD ...` saved them
-    # into the server definition).
     session: list[str] = []
     # An explicit --permission-mode wins: claude ranks the skip flag above it, so adding
     # the flag would silently turn e.g. a plan-mode run into bypassPermissions.
@@ -1573,7 +1582,7 @@ def _build_sandbox_argv(
             "--append-system-prompt",
             SANDBOX_BRIEFING + _infisical_briefing(extra_env),
         ]
-    return argv + session + args
+    return session + args
 
 
 def _git_config_get(cwd: Path, key: str) -> str | None:

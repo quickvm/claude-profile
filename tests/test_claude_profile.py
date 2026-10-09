@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import contextlib
 import json
@@ -3619,6 +3620,20 @@ def test_all_commands_registered_in_known_commands() -> None:
     registered = {c.name for c in claude_profile.app.registered_commands if c.name}
     missing = registered - claude_profile.KNOWN_COMMANDS
     assert not missing, f"commands missing from KNOWN_COMMANDS: {missing}"
+
+
+def test_functions_stay_within_the_line_limit() -> None:
+    # AGENTS.md caps functions at 100 lines; ruff checks the complexity limit but not this.
+    package = Path(claude_profile.__file__).parent
+    too_long = [
+        f"{path.name}: {node.name} ({node.end_lineno - node.lineno + 1} lines)"
+        for path in sorted(package.glob("*.py"))
+        for node in ast.walk(ast.parse(path.read_text()))
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.end_lineno is not None
+        and node.end_lineno - node.lineno + 1 > 100
+    ]
+    assert too_long == []
 
 
 # ---------------------------------------------------------------------------
