@@ -155,9 +155,9 @@ SANDBOX_BRIEFING = (
     "the host runs commands from are protected instead: this repo's .git/config is "
     "read-only, so git commands that save settings to it (push -u, branch -u, remote "
     "add, git config) cannot save them, though the push itself still works (prefer "
-    "`git push origin HEAD`); .git/hooks and this profile's settings.json are copies, "
-    "discarded when the session ends along with anything you install. You have "
-    "passwordless sudo for dnf and podman. To add a "
+    "`git push origin HEAD`); .git/hooks, this profile's settings.json and "
+    ".claude/settings.local.json are copies, discarded when the session ends along with "
+    "anything you install. You have passwordless sudo for dnf and podman. To add a "
     "missing tool use `sudo dnf "
     "install <pkg>` or `uv tool install <tool>` (see the sandbox-tools skill). Nested "
     "containers run rootful automatically — just use `podman` (it is wrapped to sudo "
@@ -1395,6 +1395,7 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
     if git_dir is not None and git_dir != root and root not in git_dir.parents:
         mounts += ["-v", f"{git_dir}:{git_dir}:z"]
     mounts += _git_state_mounts(profile_dir, cwd)
+    mounts += _local_settings_mounts(profile_dir, root, cwd)
     gitconfig = Path.home() / ".gitconfig"
     if gitconfig.exists():
         mounts += ["-v", f"{gitconfig}:/home/appuser/.gitconfig:ro,z"]
@@ -1535,6 +1536,42 @@ def _sandbox_hooks_copy(profile_dir: Path, hooks: Path) -> Path:
                 f"sandbox ({exc}); git in the VM runs without the missing ones.[/yellow]"
             )
     return copy
+
+
+def _local_settings_paths(root: Path, cwd: Path) -> list[Path]:
+    """The .claude/settings.local.json files claude reads for a launch in cwd."""
+    return [
+        base / ".claude" / "settings.local.json" for base in dict.fromkeys((root, cwd))
+    ]
+
+
+def _local_settings_mounts(profile_dir: Path, root: Path, cwd: Path) -> list[str]:
+    """Per-launch copies of the project's .claude/settings.local.json for the VM.
+
+    claude on the host loads hooks from this file at the work tree root and at the
+    launch dir, and git ignores it, so a change made in the VM would run on the host
+    unnoticed. Where the file exists the VM gets a copy instead, never read through a
+    link (see _sandbox_settings_overlay). Where it does not, mounting one would create it
+    on the host, so a supervised session reports one the VM creates instead.
+    """
+    mounts: list[str] = []
+    for local in _local_settings_paths(root, cwd):
+        if not os.path.lexists(local) or local.is_dir():
+            continue
+        content = b"{}\n"
+        if local.is_symlink():
+            err_console.print(
+                f"[yellow]Warning: {local} is a symlink, so the sandbox gets empty "
+                f"local settings there instead of reading through it.[/yellow]"
+            )
+        else:
+            content = local.read_bytes()
+        key = hashlib.sha256(str(local).encode()).hexdigest()[:16]
+        copy = _sandbox_state_dir(profile_dir) / "local-settings" / f"{key}.json"
+        copy.parent.mkdir(mode=0o700, exist_ok=True)
+        copy.write_bytes(content)
+        mounts += ["-v", f"{copy}:{local}:z"]
+    return mounts
 
 
 def _linked_mounts(profile_dir: Path) -> list[str]:

@@ -181,6 +181,11 @@ hand.
   in the VM and `prek install` works there, each launch starts again from the host's, and links
   are copied as links so none is followed into the VM. A symlinked `config` or `hooks` is left
   alone with a warning.
+- **Local project settings:** claude loads hooks from `.claude/settings.local.json` at the work
+  tree root and at the launch dir (`_local_settings_paths`), and git ignores the file, so a change
+  made in the VM would run on the host unnoticed. `_local_settings_mounts` gives the VM a copy of
+  each one that exists, never read through a link. Where none exists, mounting one would create it
+  on the host, so it is left out and the post-session report below flags one the VM creates.
 - **Shared settings (`shared-settings.json`):** settings every profile should get (hooks, for
   example) live once in `<profiles_base>/shared-settings.json` instead of being copied into each
   profile's `settings.json`. `_shared_settings_args` loads it at every launch, replaces

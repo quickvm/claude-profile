@@ -4318,3 +4318,54 @@ def test_sandbox_mounts_no_git_state_outside_a_repo(tmp_path: Path) -> None:
     cwd = tmp_path / "work"
     cwd.mkdir()
     assert not any("/.git/" in spec for spec in _sandbox_mounts(profile, cwd))
+
+
+def test_sandbox_mounts_give_the_vm_copies_of_local_project_settings(
+    real_git_toplevel: None, tmp_path: Path
+) -> None:
+    # claude loads hooks from .claude/settings.local.json at the work tree root and at
+    # the launch dir, and git ignores the file, so a change there would go unnoticed.
+    repo = _repo(tmp_path)
+    sub = repo / "backend"
+    sub.mkdir()
+    for base in (repo, sub):
+        (base / ".claude").mkdir()
+        (base / ".claude" / "settings.local.json").write_text(
+            f'{{"at": "{base.name}"}}'
+        )
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    mounts = _sandbox_mounts(profile, sub)
+    for base in (repo, sub):
+        local = base / ".claude" / "settings.local.json"
+        copy = _mount_source(mounts, local)
+        assert copy != local
+        assert copy.read_text() == local.read_text()
+
+
+def test_sandbox_mounts_no_local_settings_copy_when_there_is_none(
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    mounts = _sandbox_mounts(profile, cwd)
+    assert not any("settings.local.json" in spec for spec in mounts)
+    assert not (cwd / ".claude").exists()
+
+
+def test_local_settings_copy_never_reads_through_a_link(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    secret = tmp_path / "creds.json"
+    secret.write_text('{"accessToken": "sk-secret"}')
+    cwd = tmp_path / "work"
+    (cwd / ".claude").mkdir(parents=True)
+    local = cwd / ".claude" / "settings.local.json"
+    local.symlink_to(secret)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    copy = _mount_source(_sandbox_mounts(profile, cwd), local)
+    assert json.loads(copy.read_text()) == {}
+    assert "settings.local.json" in _unwrapped(capsys.readouterr().err)
