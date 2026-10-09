@@ -15,6 +15,7 @@ small and focused — this is not a framework.
 ```sh
 uv venv
 uv pip install -e ".[dev]"
+prek install          # git hook running .pre-commit-config.yaml on every commit
 ```
 
 ## Toolchain
@@ -26,11 +27,16 @@ uv pip install -e ".[dev]"
 | type check | `uv run ty check` |
 | tests | `uv run pytest -q` |
 
-Run all checks before committing:
+The prek hooks run all of these plus shellcheck, gitleaks (secrets in staged changes),
+actionlint and zizmor on every commit; CI runs the same hooks on every file. To run them by
+hand:
 
 ```sh
-uv run ruff check src/ && uv run ruff format --check src/ && uv run ty check && uv run pytest -q
+prek run --all-files
 ```
+
+ruff enforces the limits below (complexity 8, 100-character lines). Bump hook versions with
+`prek auto-update --cooldown-days 7`, and the dev tools in pyproject's `dev` extra by hand.
 
 ## Architecture
 
