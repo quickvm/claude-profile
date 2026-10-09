@@ -166,6 +166,21 @@ hand.
   profile's credentials, so the VM gets `{}` and a warning instead. claude's settings writer falls
   back to an in-place write when its rename fails with EBUSY, as it does onto a file mount, so
   in-VM settings changes work.
+- **Repo git state:** the work tree and its git dir are mounted read-write, and the host later
+  runs commands from git's config and hooks. `_git_state_mounts` covers the repo's git dir and
+  each submodule's (`_submodule_git_dirs`, nested ones and names with slashes included; links
+  under `modules/` are skipped so one cannot pass off another repo's git dir). Each `config` is
+  mounted read-only over itself, so the VM cannot set `core.fsmonitor`, `core.sshCommand`, an
+  alias or the like, which the host's next git command would run (a shell prompt's `git status`
+  is enough, even while the VM runs). A throwaway copy would not help: git writes config by
+  renaming a lock file over it, and krun refuses a rename onto any file mount with EBUSY, so
+  commands that save config (`push -u`, `branch -u`, `remote add`) cannot save it either way.
+  `push -u` and `branch -u` still exit 0 after printing "could not write config file"; `remote
+  add` fails. `SANDBOX_BRIEFING` tells the agent. `hooks/` becomes a throwaway copy
+  (`_sandbox_hooks_copy`, in the state dir, keyed by the hooks path): the host's hooks still run
+  in the VM and `prek install` works there, each launch starts again from the host's, and links
+  are copied as links so none is followed into the VM. A symlinked `config` or `hooks` is left
+  alone with a warning.
 - **Shared settings (`shared-settings.json`):** settings every profile should get (hooks, for
   example) live once in `<profiles_base>/shared-settings.json` instead of being copied into each
   profile's `settings.json`. `_shared_settings_args` loads it at every launch, replaces

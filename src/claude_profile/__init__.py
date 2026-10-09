@@ -151,10 +151,13 @@ SANDBOX_BRIEFING = (
     "podman/krun VM (confirm with /run/.containerenv). The host filesystem is visible "
     "only where it is mounted: the working directory and its git dir, this profile's "
     "Claude config, and a few read-only files. Whatever you change under those mounts "
-    "persists on the host, where the user later runs it outside the sandbox — git hooks "
-    "and git config, .claude/ settings, and this profile's config included — so treat "
-    "those changes as you would on the host. Anything you install is discarded when "
-    "the session ends, and you have passwordless sudo for dnf and podman. To add a "
+    "persists on the host, so treat those changes as you would on the host. The files "
+    "the host runs commands from are protected instead: this repo's .git/config is "
+    "read-only, so git commands that save settings to it (push -u, branch -u, remote "
+    "add, git config) cannot save them, though the push itself still works (prefer "
+    "`git push origin HEAD`); .git/hooks and this profile's settings.json are copies, "
+    "discarded when the session ends along with anything you install. You have "
+    "passwordless sudo for dnf and podman. To add a "
     "missing tool use `sudo dnf "
     "install <pkg>` or `uv tool install <tool>` (see the sandbox-tools skill). Nested "
     "containers run rootful automatically — just use `podman` (it is wrapped to sudo "
@@ -1391,6 +1394,7 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
     git_dir = _git_common_dir(cwd)
     if git_dir is not None and git_dir != root and root not in git_dir.parents:
         mounts += ["-v", f"{git_dir}:{git_dir}:z"]
+    mounts += _git_state_mounts(profile_dir, cwd)
     gitconfig = Path.home() / ".gitconfig"
     if gitconfig.exists():
         mounts += ["-v", f"{gitconfig}:/home/appuser/.gitconfig:ro,z"]
@@ -1436,6 +1440,101 @@ def _launch_state_mounts(profile_dir: Path) -> list[str]:
         if path.is_file() and not path.is_symlink():
             mounts += ["-v", f"{path}:{SANDBOX_CONFIG_DIR}/{name}:ro,z"]
     return mounts
+
+
+def _git_state_mounts(profile_dir: Path, cwd: Path) -> list[str]:
+    """Keep the VM from changing the git config and hooks that the host runs.
+
+    The work tree and its git dir are mounted read-write, so the agent could otherwise
+    set core.fsmonitor, core.sshCommand or an alias in .git/config, or plant a hook, and
+    the host would run it at its next git command in the repo: a shell prompt's
+    `git status` is enough, even while the VM is still running. Each git dir's config,
+    the repo's and its submodules', is mounted read-only over itself. git writes config
+    by renaming a lock file over it, which the mount refuses, so commands that save
+    settings there (push -u, branch -u, remote add) cannot save them; the briefing says
+    so. hooks/ becomes a throwaway copy (see _sandbox_hooks_copy).
+    """
+    common = _git_common_dir(cwd)
+    if common is None:
+        return []
+    mounts: list[str] = []
+    for git_dir in [common, *_submodule_git_dirs(common)]:
+        mounts += _git_dir_mounts(profile_dir, git_dir)
+    return mounts
+
+
+def _git_dir_mounts(profile_dir: Path, git_dir: Path) -> list[str]:
+    """Pin one git dir's config read-only and give the VM a copy of its hooks."""
+    config = git_dir / "config"
+    hooks = git_dir / "hooks"
+    for path in (config, hooks):
+        if path.is_symlink():
+            err_console.print(
+                f"[yellow]Warning: {path} is a symlink, which git does not create, so the "
+                f"sandbox cannot protect it. Check where it points.[/yellow]"
+            )
+    mounts: list[str] = []
+    if config.is_file() and not config.is_symlink():
+        mounts += ["-v", f"{config}:{config}:ro,z"]
+    if not hooks.is_symlink():
+        mounts += ["-v", f"{_sandbox_hooks_copy(profile_dir, hooks)}:{hooks}:z"]
+    return mounts
+
+
+def _submodule_git_dirs(git_dir: Path) -> list[Path]:
+    """Git dirs of the repo's submodules under modules/, nested submodules included."""
+    found: list[Path] = []
+    pending = [git_dir / "modules"]
+    while pending:
+        current = pending.pop()
+        if not current.is_dir() or current.is_symlink():
+            continue
+        for child in sorted(current.iterdir()):
+            # A link here could pass off another repo's git dir as a submodule's.
+            if child.is_symlink() or not child.is_dir():
+                continue
+            if (child / "HEAD").is_file() and (child / "objects").is_dir():
+                found.append(child)
+                pending.append(child / "modules")
+            else:
+                # A submodule named vendor/lib keeps its git dir in modules/vendor/lib.
+                pending.append(child)
+    return found
+
+
+def _sandbox_hooks_copy(profile_dir: Path, hooks: Path) -> Path:
+    """Refresh the VM's throwaway copy of a git dir's hooks/ and return its path.
+
+    The host's hooks keep running in the VM and `prek install` works there, but nothing
+    the VM writes reaches the hooks the host runs: each launch starts again from the
+    host's. Links are copied as links, never followed, which would copy whatever they
+    point at into the VM.
+    """
+    key = hashlib.sha256(str(hooks).encode()).hexdigest()[:16]
+    copy = _sandbox_state_dir(profile_dir) / "git-hooks" / key
+    copy.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        for entry in copy.iterdir():
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+    except OSError as exc:
+        err_console.print(
+            f"[red]Could not clear the sandbox's copy of {hooks} at {copy} ({exc}).[/red] "
+            f"A container in the VM may have written files your user cannot delete; "
+            f"remove them with: podman unshare rm -r {copy}"
+        )
+        sys.exit(1)
+    if hooks.is_dir():
+        try:
+            shutil.copytree(hooks, copy, symlinks=True, dirs_exist_ok=True)
+        except OSError as exc:
+            err_console.print(
+                f"[yellow]Warning: could not copy every hook from {hooks} into the "
+                f"sandbox ({exc}); git in the VM runs without the missing ones.[/yellow]"
+            )
+    return copy
 
 
 def _linked_mounts(profile_dir: Path) -> list[str]:
