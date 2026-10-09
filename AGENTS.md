@@ -461,7 +461,11 @@ hand.
 - **`sandbox` subcommand & override:** `sandbox <name> --on/--off` toggles the `.sandbox`
   marker on an existing profile (shows status when no flag). `_sandbox_enabled()` decides
   per launch: the `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state
-  `Optional[bool]`) wins when set, otherwise the marker.
+  `bool | None`) wins when set, otherwise the marker (`_sandbox_marked`, which uses `lexists`
+  so a dangling marker link counts, failing safe). The status, `--on`/`--off` and `list` print
+  `_sandbox_override_note` while the override is set, or they would show the marker while
+  launches did something else; `list` and `_was_sandboxed` read the marker the same way the
+  launch does. `--on` replaces a linked marker rather than `touch` its target.
 
 ## Conventions
 

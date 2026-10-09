@@ -1610,6 +1610,30 @@ def test_list_shows_sandbox_indicator(profiles_base: Path) -> None:
     assert "microVM" in result.output
 
 
+def test_list_notes_an_override(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    monkeypatch.setattr(claude_profile.settings, "sandbox", True)
+    out = " ".join(runner.invoke(app, ["list"]).output.split())
+    assert "CLAUDE_PROFILE_SANDBOX" in out
+
+
+def test_list_quiet_without_an_override(profiles_base: Path) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    assert "CLAUDE_PROFILE_SANDBOX" not in runner.invoke(app, ["list"]).output
+
+
+def test_list_counts_a_dangling_marker_link_as_sandboxed(
+    profiles_base: Path, tmp_path: Path
+) -> None:
+    # The launch counts it, failing safe, so the listing must agree.
+    boxed = profiles_base / "boxed"
+    boxed.mkdir(parents=True)
+    (boxed / SANDBOX_MARKER).symlink_to(tmp_path / "gone")
+    assert "microVM" in runner.invoke(app, ["list"]).output
+
+
 # ---------------------------------------------------------------------------
 # _launch_profile sandbox routing
 # ---------------------------------------------------------------------------
@@ -1861,6 +1885,57 @@ def test_sandbox_on_and_off_exits_1(profiles_base: Path) -> None:
     result = runner.invoke(app, ["sandbox", "work", "--on", "--off"])
     assert result.exit_code == 1
     assert "mutually exclusive" in result.output
+
+
+def test_sandbox_status_names_an_override_that_wins(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # CLAUDE_PROFILE_SANDBOX decides the launch, so the status must say what will happen.
+    p = profiles_base / "work"
+    p.mkdir(parents=True)
+    (p / SANDBOX_MARKER).touch()
+    monkeypatch.setattr(claude_profile.settings, "sandbox", False)
+    out = " ".join(runner.invoke(app, ["sandbox", "work"]).output.split())
+    assert "launches on: host" in out
+    assert "CLAUDE_PROFILE_SANDBOX" in out
+    assert "microVM" in out  # the profile's own setting
+
+
+def test_sandbox_on_notes_an_override_that_keeps_launches_on_the_host(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile.settings, "sandbox", False)
+    result = runner.invoke(app, ["sandbox", "work", "--on"])
+    assert result.exit_code == 0
+    assert "CLAUDE_PROFILE_SANDBOX" in " ".join(result.output.split())
+
+
+def test_sandbox_on_quiet_about_an_override_that_agrees(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile.settings, "sandbox", True)
+    result = runner.invoke(app, ["sandbox", "work", "--on"])
+    assert "CLAUDE_PROFILE_SANDBOX" not in result.output
+
+
+def test_sandbox_on_replaces_a_linked_marker(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # touch() would follow the link and create its target instead.
+    p = profiles_base / "work"
+    p.mkdir(parents=True)
+    target = tmp_path / "elsewhere"
+    (p / SANDBOX_MARKER).symlink_to(target)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    result = runner.invoke(app, ["sandbox", "work", "--on"])
+    assert result.exit_code == 0
+    assert not target.exists()
+    assert (p / SANDBOX_MARKER).is_file()
+    assert not (p / SANDBOX_MARKER).is_symlink()
 
 
 # ---------------------------------------------------------------------------

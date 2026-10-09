@@ -246,10 +246,13 @@ def list_profiles() -> None:
             status = (
                 f"[red]✗ not authenticated[/red] (run: claude-profile {p.name} /login)"
             )
-        sandbox = "✓ microVM" if (p / SANDBOX_MARKER).exists() else "—"
+        sandbox = "✓ microVM" if _sandbox_marked(p) else "—"
         table.add_row(p.name, status, sandbox)
 
     console.print(table)
+    note = _sandbox_override_note()
+    if note is not None:
+        console.print(note)
 
 
 def _setup_dir_link(profile_dir: Path, dir_name: str, link: bool) -> None:
@@ -688,13 +691,15 @@ def manage_sandbox(
         err_console.print(f"[red]Profile '{name}' does not exist.[/red]")
         raise typer.Exit(code=1)
 
-    marker = d / SANDBOX_MARKER
     if not on and not off:
-        state = "microVM" if marker.exists() else "host"
-        console.print(f"Profile '{name}' launches on: {state}")
+        _print_sandbox_status(name, d)
         return
 
+    marker = d / SANDBOX_MARKER
     if on:
+        # touch() would follow a linked marker and create its target instead.
+        if marker.is_symlink():
+            marker.unlink()
         marker.touch()
         console.print(f"[green]Sandbox enabled for '{name}'.[/green]")
         if not _sandbox_image_exists():
@@ -702,6 +707,19 @@ def manage_sandbox(
     else:
         marker.unlink(missing_ok=True)
         console.print(f"[green]Sandbox disabled for '{name}' (runs on host).[/green]")
+    note = _sandbox_override_note()
+    if note is not None and settings.sandbox != on:
+        console.print(f"[yellow]{note}[/yellow]")
+
+
+def _print_sandbox_status(name: str, profile_dir: Path) -> None:
+    """Say where the profile launches, and why when CLAUDE_PROFILE_SANDBOX decides it."""
+    state = "microVM" if _sandbox_enabled(profile_dir) else "host"
+    console.print(f"Profile '{name}' launches on: {state}")
+    note = _sandbox_override_note()
+    if note is not None:
+        own = "microVM" if _sandbox_marked(profile_dir) else "host"
+        console.print(f"{note} Its own setting is {own}.")
 
 
 @app.command("remove")
@@ -2610,14 +2628,28 @@ def _sandbox_enabled(profile_dir: Path) -> bool:
     """
     if settings.sandbox is not None:
         return settings.sandbox
-    # lexists: a marker planted as a dangling link still counts, failing safe.
+    return _sandbox_marked(profile_dir)
+
+
+def _sandbox_marked(profile_dir: Path) -> bool:
+    """True when the profile has the .sandbox marker.
+
+    lexists: a marker planted as a dangling link still counts, failing safe.
+    """
     return os.path.lexists(profile_dir / SANDBOX_MARKER)
+
+
+def _sandbox_override_note() -> str | None:
+    """What CLAUDE_PROFILE_SANDBOX does to every launch while it is set, or None."""
+    if settings.sandbox is None:
+        return None
+    where = "in a microVM" if settings.sandbox else "on the host"
+    return f"CLAUDE_PROFILE_SANDBOX is set, so every profile launches {where} until it is unset."
 
 
 def _was_sandboxed(profile_dir: Path) -> bool:
     """True when the profile is marked for the sandbox or has been launched in one."""
-    marked = os.path.lexists(profile_dir / SANDBOX_MARKER)
-    return marked or _sandbox_state_path(profile_dir).is_dir()
+    return _sandbox_marked(profile_dir) or _sandbox_state_path(profile_dir).is_dir()
 
 
 def _check_statusline_link(profile_dir: Path) -> None:
