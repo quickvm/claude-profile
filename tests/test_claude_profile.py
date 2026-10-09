@@ -2858,10 +2858,9 @@ def test_sandbox_mounts_masks_profile_chrome_dir(
     cwd = tmp_path / "work"
     cwd.mkdir()
     mounts = _sandbox_mounts(profile, cwd)
-    assert (
-        f"{claude_profile._sandbox_state_dir(profile) / 'chrome'}:{claude_profile.SANDBOX_CONFIG_DIR}/chrome:z"
-        in mounts
-    )
+    state = claude_profile._sandbox_state_dir(profile)
+    config = claude_profile.SANDBOX_CONFIG_DIR
+    assert f"{state / 'chrome'}:{config}/chrome:z" in mounts
     # the real wrapper is untouched on the host
     assert (profile / "chrome" / "chrome-native-host").read_text() == "host wrapper\n"
 
@@ -4038,11 +4037,9 @@ def test_sandbox_mounts_known_hosts_global_ro_and_user_rw(
     # host file is the read-only global known_hosts (verification only)
     assert f"{ssh / 'known_hosts'}:/etc/ssh/ssh_known_hosts:ro,z" in mounts
     # per-profile writable user known_hosts persists newly accepted keys
-    assert (
-        f"{claude_profile._sandbox_state_dir(profile) / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z"
-        in mounts
-    )
-    assert (claude_profile._sandbox_state_dir(profile) / "known_hosts").exists()
+    state = claude_profile._sandbox_state_dir(profile)
+    assert f"{state / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z" in mounts
+    assert (state / "known_hosts").exists()
 
 
 def test_sandbox_mounts_user_known_hosts_without_host_file(
@@ -4056,10 +4053,8 @@ def test_sandbox_mounts_user_known_hosts_without_host_file(
     mounts = _sandbox_mounts(profile, cwd)
     # no host known_hosts -> no global mount, but the writable user file is still provided
     assert not any("/etc/ssh/ssh_known_hosts" in m for m in mounts)
-    assert (
-        f"{claude_profile._sandbox_state_dir(profile) / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z"
-        in mounts
-    )
+    state = claude_profile._sandbox_state_dir(profile)
+    assert f"{state / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z" in mounts
 
 
 def test_sandbox_known_hosts_creates_empty(tmp_path: Path) -> None:

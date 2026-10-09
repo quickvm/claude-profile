@@ -32,3 +32,18 @@ packages = ["src/claude_profile"]
 [tool.ruff.lint.flake8-bugbear]
 # typer's documented signature style builds each parameter with these calls.
 extend-immutable-calls = ["typer.Argument", "typer.Option"]
+
+[tool.ruff.lint]
+# AGENTS.md limits: cyclomatic complexity 8 per function and 100-character lines. The
+# formatter keeps its own 88-column wrap.
+extend-select = ["C901", "E501"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 8
+
+[tool.ruff.lint.pycodestyle]
+max-line-length = 100
+
+[tool.ruff.lint.per-file-ignores]
+# main() relays through closures (complexity 19); the authenticated bridge rewrite replaces it.
+"src/claude_profile/browser_bridge_host.py" = ["C901"]
