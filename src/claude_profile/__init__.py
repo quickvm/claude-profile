@@ -11,10 +11,12 @@ import os
 import re
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from dataclasses import KW_ONLY, dataclass
 from importlib import resources
 from pathlib import Path
@@ -43,6 +45,7 @@ class Settings(BaseSettings):
     )
     claude_bin: str = Field(default="claude")
     podman_bin: str = Field(default="podman")
+    infisical_bin: str = Field(default="infisical")
     sandbox_image: str = Field(default="claude-profile-sandbox:latest")
     sandbox_ram_mib: int = Field(default=4096)
     sandbox_cpus: int = Field(default=4)
@@ -121,6 +124,69 @@ SANDBOX_STRIP_DENY_PREFIXES: tuple[str, ...] = (
 # podman's default host.containers.internal address under pasta; mapping it to the
 # host loopback lets the agent bridge bind to 127.0.0.1 instead of all interfaces.
 SANDBOX_HOST_LOOPBACK = "169.254.1.2"
+# Infisical Agent Vault (see _route_agent_vault). A profile opts in with these keys in its
+# .env, which the VM can't change; claude-profile reads them and claude never sees them.
+AGENT_VAULT_PREFIX = "CLAUDE_PROFILE_AGENT_VAULT_"
+AGENT_VAULT_REQUIRED: tuple[str, ...] = ("BUNDLE", "PROXY", "CA_FINGERPRINT")
+AGENT_VAULT_OPTIONAL: tuple[str, ...] = ("INFISICAL_PROFILE", "NO_PROXY")
+AGENT_VAULT_FINGERPRINT = re.compile(r"SHA256(:[0-9A-F]{2}){32}")
+# Set when a launch execs `infisical agent-vault run`, to the profile's name: the launch
+# the CLI starts finds it and goes on to claude instead of wrapping itself again.
+AGENT_VAULT_RUN_ENV = "CLAUDE_PROFILE_AGENT_VAULT_RUN"
+# Tells the VM whether its credentials are brokered: "active" or "unavailable".
+AGENT_VAULT_STATE_ENV = "CLAUDE_SANDBOX_AGENT_VAULT"
+AGENT_VAULT_SESSION_TTL = "24h"
+AGENT_VAULT_PREFLIGHT_TIMEOUT = 5.0
+# claude's own traffic skips the proxy: the Claude API, the OAuth hosts (claude 2.1.296
+# refreshes its token at platform.claude.com) and the Claude in Chrome bridge. Through it,
+# the proxy would decrypt every prompt and the profile's OAuth tokens, and a proxy outage
+# would take claude down too. Both forms of each apex domain, because clients disagree:
+# proxy-from-env (axios) matches `claude.ai` exactly, and Go's `.claude.ai` skips the apex.
+AGENT_VAULT_NO_PROXY: tuple[str, ...] = (
+    ".anthropic.com",
+    "claude.ai",
+    ".claude.ai",
+    "claude.com",
+    ".claude.com",
+    ".claudeusercontent.com",
+)
+# What `infisical agent-vault run` sets for its child. The proxy URLs (and the CLI's copy
+# for OpenClaw) carry the session token; the CA variables name a file holding only the
+# proxy's CA.
+AGENT_VAULT_PROXY_URL_VARS: tuple[str, ...] = (
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "https_proxy",
+    "http_proxy",
+)
+AGENT_VAULT_SESSION_VARS: tuple[str, ...] = (
+    *AGENT_VAULT_PROXY_URL_VARS,
+    "OPENCLAW_PROXY_URL",
+)
+AGENT_VAULT_PROXY_VARS: tuple[str, ...] = ("NO_PROXY", "no_proxy", "NODE_USE_ENV_PROXY")
+AGENT_VAULT_CA_VARS: tuple[str, ...] = (
+    "SSL_CERT_FILE",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "DENO_CERT",
+)
+# The VM's system bundle, which /etc/ssl/cert.pem and the image's other default paths
+# link to. A vault launch mounts the combined bundle over it.
+SANDBOX_VM_CA_BUNDLE = "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+AGENT_VAULT_BRIEFING = (
+    " Credentials are brokered: your HTTP(S) traffic goes through an Infisical Agent Vault "
+    "proxy, which attaches the real credential to requests for the services in this "
+    "session's access bundle. Token variables such as GH_TOKEN hold placeholders, not "
+    "secrets, and tools authenticate with them as they are. HTTPS_PROXY and HTTP_PROXY "
+    "carry this session's token: never print, log or copy them."
+)
+AGENT_VAULT_UNAVAILABLE_BRIEFING = (
+    " Agent Vault was unavailable when this session started, so no credentials are "
+    "brokered: requests to services that need one will fail to authenticate. Tell the user "
+    "instead of looking for credentials elsewhere."
+)
 # Git settings resolved on the host for the CWD and given to the VM (see
 # _git_identity_mounts). Signing settings go only when GPG is forwarded.
 GIT_IDENTITY_KEYS: tuple[str, ...] = ("user.name", "user.email")
@@ -1704,6 +1770,7 @@ def _build_sandbox_argv(
     *,
     host_loopback: bool = False,
     bridge: tuple[int, str] | None = None,
+    vault_ca: Path | None = None,
 ) -> list[str]:
     """Assemble the `podman run` argv that boots claude in a krun microVM."""
     # A TTY only when both ends are terminals: with one, the in-VM claude takes its stdin
@@ -1772,6 +1839,10 @@ def _build_sandbox_argv(
         # (no native install, or the copy failed) the image's claude may update itself.
         argv += ["-e", "DISABLE_AUTOUPDATER=1"]
     argv += mounts
+    if vault_ca is not None:
+        # Over the VM's system bundle, after any host trust store mount, so every default
+        # path (/etc/ssl/cert.pem and the rest link to it) trusts the proxy's CA too.
+        argv += ["-v", f"{vault_ca}:{SANDBOX_VM_CA_BUNDLE}:ro,z"]
     argv += _gpg_pubkeys_mounts(forwarding)
     argv += ["-w", str(cwd), settings.sandbox_image, "claude"]
     return argv + _sandbox_claude_args(claude_args, extra_env)
@@ -1805,7 +1876,9 @@ def _sandbox_claude_args(
     if not _has_option(args, "--append-system-prompt"):
         session += [
             "--append-system-prompt",
-            SANDBOX_BRIEFING + _infisical_briefing(extra_env),
+            SANDBOX_BRIEFING
+            + _infisical_briefing(extra_env)
+            + _agent_vault_briefing(extra_env),
         ]
     return session + args
 
@@ -2400,8 +2473,283 @@ def _with_forwarded_env(extra_env: dict[str, str]) -> dict[str, str]:
     return forwarded
 
 
+@dataclass(frozen=True)
+class _AgentVault:
+    """A profile's Agent Vault settings: the CLAUDE_PROFILE_AGENT_VAULT_* keys in its .env."""
+
+    bundle: str
+    proxy: str
+    ca_fingerprint: str
+    infisical_profile: str = ""
+    no_proxy: tuple[str, ...] = ()
+
+
+@dataclass
+class _VaultRun:
+    """How an opted-in launch goes: the CLI's variables when brokered, None when not."""
+
+    session: dict[str, str] | None
+
+    def state(self) -> str:
+        """The AGENT_VAULT_STATE_ENV value the VM gets."""
+        return "unavailable" if self.session is None else "active"
+
+
+def _split_agent_vault(
+    profile_dir: Path, profile_env: dict[str, str]
+) -> tuple[_AgentVault | None, dict[str, str]]:
+    """Separate the profile's Agent Vault keys from the env claude gets.
+
+    BUNDLE switches the vault on; unset, the profile launches without it and keeps the
+    other keys for next time. A misspelled key, or BUNDLE without the keys it needs,
+    fails the launch rather than quietly running without the vault.
+    """
+    rest = {
+        k: v for k, v in profile_env.items() if not k.startswith(AGENT_VAULT_PREFIX)
+    }
+    keys = {
+        k.removeprefix(AGENT_VAULT_PREFIX): v
+        for k, v in profile_env.items()
+        if k.startswith(AGENT_VAULT_PREFIX)
+    }
+    problems = _agent_vault_problems(keys)
+    if problems:
+        err_console.print(
+            f"[red]The Agent Vault settings in {profile_dir / '.env'} can't be used: "
+            f"{escape('; '.join(problems))}. Fix them with `claude-profile env "
+            f"{profile_dir.name} --set KEY=VALUE`, or unset {AGENT_VAULT_PREFIX}BUNDLE "
+            f"to launch without Agent Vault.[/red]"
+        )
+        sys.exit(1)
+    if not keys.get("BUNDLE"):
+        return None, rest
+    hosts = keys.get("NO_PROXY", "").split(",")
+    vault = _AgentVault(
+        bundle=keys["BUNDLE"],
+        proxy=keys["PROXY"],
+        ca_fingerprint=keys["CA_FINGERPRINT"].upper(),
+        infisical_profile=keys.get("INFISICAL_PROFILE", ""),
+        no_proxy=tuple(host.strip() for host in hosts if host.strip()),
+    )
+    return vault, rest
+
+
+def _agent_vault_problems(keys: dict[str, str]) -> list[str]:
+    """What is wrong with a profile's Agent Vault keys (prefix removed), if anything."""
+    known = AGENT_VAULT_REQUIRED + AGENT_VAULT_OPTIONAL
+    problems = [
+        f"{AGENT_VAULT_PREFIX}{key} is not a setting"
+        for key in sorted(keys)
+        if key not in known
+    ]
+    if keys.get("BUNDLE"):
+        problems += [
+            f"{AGENT_VAULT_PREFIX}{key} is not set"
+            for key in AGENT_VAULT_REQUIRED
+            if not keys.get(key)
+        ]
+    fingerprint = keys.get("CA_FINGERPRINT", "")
+    if fingerprint and not AGENT_VAULT_FINGERPRINT.fullmatch(fingerprint.upper()):
+        problems.append(
+            f"{AGENT_VAULT_PREFIX}CA_FINGERPRINT is not a fingerprint like SHA256:9F:2C:... "
+            f"(32 bytes), as the Proxies page shows it"
+        )
+    return problems
+
+
+def _agent_vault_ca_fingerprint(proxy: str) -> str:
+    """The SHA-256 fingerprint of the CA the proxy serves, written as the Proxies page has it.
+
+    Asked directly, never through a proxy: the launcher's environment may name one.
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    url = f"http://{proxy}/_agent-vault/ca"
+    with opener.open(url, timeout=AGENT_VAULT_PREFLIGHT_TIMEOUT) as response:
+        body = json.load(response)
+    certificate = body.get("certificate") if isinstance(body, dict) else None
+    if not isinstance(certificate, str):
+        raise TypeError("the response has no certificate")
+    digest = hashlib.sha256(ssl.PEM_cert_to_DER_cert(certificate)).hexdigest().upper()
+    return "SHA256:" + ":".join(digest[i : i + 2] for i in range(0, len(digest), 2))
+
+
+def _agent_vault_preflight(vault: _AgentVault) -> str | None:
+    """Why this launch can't use the vault, or None when the proxy serves the pinned CA.
+
+    `infisical agent-vault run` checks the same pin, but its failure ends the launch.
+    Checking first lets the usual outage, the proxy being down, launch without the vault.
+    """
+    if shutil.which(settings.infisical_bin) is None:
+        return f"the infisical CLI ({settings.infisical_bin}) is not installed"
+    try:
+        served = _agent_vault_ca_fingerprint(vault.proxy)
+    except (OSError, ValueError, TypeError) as exc:
+        return f"the proxy at {vault.proxy} did not serve its CA ({exc})"
+    if served != vault.ca_fingerprint:
+        return (
+            f"the proxy at {vault.proxy} serves the CA {served}, not the pinned "
+            f"{vault.ca_fingerprint}"
+        )
+    return None
+
+
+def _exec_agent_vault_run(
+    name: str, vault: _AgentVault, claude_args: list[str]
+) -> None:
+    """Replace this process with `infisical agent-vault run` around this same launch.
+
+    The CLI mints a session over the profile's access bundle with your Infisical login,
+    checks the proxy's CA against the pin and starts the launch again as its child, with
+    the proxy and CA variables set. When the child exits, on SIGHUP or SIGTERM too, it
+    revokes the session. The child finds its profile's name in AGENT_VAULT_RUN_ENV and
+    goes on to claude. Unlike every other launch, this one leaves a process between the
+    terminal and claude: the CLI has to outlive claude to revoke the session.
+    """
+    argv = [settings.infisical_bin, "agent-vault", "run", "--silent"]
+    if vault.infisical_profile:
+        argv += ["--profile", vault.infisical_profile]
+    argv += [
+        "--access-bundle",
+        vault.bundle,
+        "--proxy",
+        vault.proxy,
+        "--ca-fingerprint",
+        vault.ca_fingerprint,
+        "--ttl",
+        AGENT_VAULT_SESSION_TTL,
+        "--no-proxy",
+        ",".join((*AGENT_VAULT_NO_PROXY, *vault.no_proxy)),
+        "--",
+        sys.argv[0],
+        name,
+        *claude_args,
+    ]
+    os.execvpe(settings.infisical_bin, argv, {**os.environ, AGENT_VAULT_RUN_ENV: name})
+
+
+def _route_agent_vault(
+    name: str, vault: _AgentVault, claude_args: list[str]
+) -> _VaultRun | None:
+    """Send a launch that opted in through the vault; None once it has exec'd the CLI.
+
+    The launch the CLI starts takes the CLI's variables. Before that, a pre-flight
+    decides: with the proxy serving the pinned CA the launch execs the CLI, otherwise it
+    goes ahead without the vault and says so.
+    """
+    if os.environ.get(AGENT_VAULT_RUN_ENV) == name:
+        return _VaultRun(_take_agent_vault_session())
+    reason = _agent_vault_preflight(vault)
+    if reason is None:
+        _exec_agent_vault_run(name, vault, claude_args)
+        return None
+    err_console.print(
+        f"[bold red]Agent Vault is unavailable: {escape(reason)}. Launching {name} without "
+        f"it, so the services it brokers won't authenticate this session.[/bold red]"
+    )
+    return _VaultRun(None)
+
+
+def _take_agent_vault_session() -> dict[str, str]:
+    """Remove the variables `infisical agent-vault run` set from this process; return them.
+
+    What the launch runs on the host from here on (podman, git, gh) gets the host's own
+    environment back, not a proxy and a CA file holding only the proxy's root. Each
+    launch path then gives claude its share.
+    """
+    os.environ.pop(AGENT_VAULT_RUN_ENV, None)
+    names = (*AGENT_VAULT_SESSION_VARS, *AGENT_VAULT_PROXY_VARS, *AGENT_VAULT_CA_VARS)
+    session = {name: os.environ.pop(name) for name in names if name in os.environ}
+    if "HTTPS_PROXY" not in session or "SSL_CERT_FILE" not in session:
+        err_console.print(
+            f"[red]{AGENT_VAULT_RUN_ENV} is set, but HTTPS_PROXY or SSL_CERT_FILE is not, so "
+            f"this launch did not come from `infisical agent-vault run`. Unset "
+            f"{AGENT_VAULT_RUN_ENV} and launch again.[/red]"
+        )
+        sys.exit(1)
+    return session
+
+
+def _system_ca_bundle() -> Path:
+    """The host's system CA bundle, where OpenSSL was built to look for it."""
+    return Path(ssl.get_default_verify_paths().openssl_cafile)
+
+
+def _agent_vault_ca_bundle(proxy_ca: Path) -> Path:
+    """Write the host's system CA bundle with the proxy's CA appended; return the file.
+
+    The CLI points every TLS variable at a file holding only the proxy's CA, so HTTPS
+    that skips the proxy (the NO_PROXY hosts, claude's own among them) fails to verify
+    in curl, git and Python. With the system roots alongside, proxied and direct
+    connections both verify. Named by content, like the git identity files.
+    """
+    try:
+        content = f"{_system_ca_bundle().read_text().rstrip()}\n{proxy_ca.read_text()}"
+    except OSError as exc:
+        err_console.print(
+            f"[red]Can't build the CA bundle for Agent Vault: {escape(str(exc))}.[/red]"
+        )
+        sys.exit(1)
+    digest = hashlib.sha256(content.encode()).hexdigest()[:16]
+    bundle = _data_dir() / "agent-vault" / f"ca-bundle-{digest}.pem"
+    if not bundle.exists():
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        partial = bundle.with_name(f".{bundle.name}.{os.getpid()}.partial")
+        partial.write_text(content)
+        os.replace(partial, bundle)
+    return bundle
+
+
+def _agent_vault_host_env(session: dict[str, str]) -> dict[str, str]:
+    """A host launch's share of the session: all of it, with TLS on the combined bundle."""
+    bundle = str(_agent_vault_ca_bundle(Path(session["SSL_CERT_FILE"])))
+    return {**session, **dict.fromkeys(AGENT_VAULT_CA_VARS, bundle)}
+
+
+def _with_agent_vault(
+    extra_env: dict[str, str], vault_run: _VaultRun | None
+) -> tuple[dict[str, str], Path | None]:
+    """Add the vault's share of the VM env; return it with the CA bundle to mount, if any.
+
+    The proxy URLs carry the session token, so they travel in the secret env file with
+    the rest of extra_env; the CLI's copy for OpenClaw stays out. The VM's NO_PROXY adds
+    the host's loopback, where bridged services and loopback hooks listen.
+    """
+    if vault_run is None:
+        return extra_env, None
+    env = {**extra_env, AGENT_VAULT_STATE_ENV: vault_run.state()}
+    session = vault_run.session
+    if session is None:
+        return env, None
+    hosts = (
+        session.get("NO_PROXY", ""),
+        SANDBOX_HOST_LOOPBACK,
+        "host.containers.internal",
+    )
+    no_proxy = ",".join(host for host in hosts if host)
+    env.update(
+        {name: session[name] for name in AGENT_VAULT_PROXY_URL_VARS if name in session}
+    )
+    env.update({"NO_PROXY": no_proxy, "no_proxy": no_proxy, "NODE_USE_ENV_PROXY": "1"})
+    env.update(dict.fromkeys(AGENT_VAULT_CA_VARS, SANDBOX_VM_CA_BUNDLE))
+    return env, _agent_vault_ca_bundle(Path(session["SSL_CERT_FILE"]))
+
+
+def _agent_vault_briefing(extra_env: dict[str, str]) -> str:
+    """The system-prompt note on brokered credentials, for a launch that opted in."""
+    state = extra_env.get(AGENT_VAULT_STATE_ENV)
+    if state == "active":
+        return AGENT_VAULT_BRIEFING
+    if state == "unavailable":
+        return AGENT_VAULT_UNAVAILABLE_BRIEFING
+    return ""
+
+
 def _launch_sandbox(
-    profile_dir: Path, claude_args: list[str], extra_env: dict[str, str]
+    profile_dir: Path,
+    claude_args: list[str],
+    extra_env: dict[str, str],
+    *,
+    vault_run: _VaultRun | None = None,
 ) -> None:
     """Launch a podman krun microVM running claude (optionally bridging agents)."""
     _refuse_home_mount(Path.cwd())
@@ -2420,6 +2768,7 @@ def _launch_sandbox(
     extra_env = _with_infisical_env(extra_env)
     extra_env = _with_pulumi_token(extra_env)
     extra_env = _with_forwarded_env(extra_env)
+    extra_env, vault_ca = _with_agent_vault(extra_env, vault_run)
     shared, host_loopback = _shared_settings_args(
         profile_dir.name, claude_args, sandbox=True
     )
@@ -2427,10 +2776,17 @@ def _launch_sandbox(
     cwd = Path.cwd()
     forwarding = _build_forwarding()
     if forwarding.active():
-        _run_sandbox_supervised(profile_dir, cwd, claude_args, extra_env, forwarding)
+        _run_sandbox_supervised(
+            profile_dir, cwd, claude_args, extra_env, forwarding, vault_ca=vault_ca
+        )
         return
     argv = _build_sandbox_argv(
-        profile_dir, cwd, claude_args, extra_env, host_loopback=host_loopback
+        profile_dir,
+        cwd,
+        claude_args,
+        extra_env,
+        host_loopback=host_loopback,
+        vault_ca=vault_ca,
     )
     os.execvpe(settings.podman_bin, argv, os.environ.copy())
 
@@ -2469,6 +2825,8 @@ def _run_sandbox_supervised(
     claude_args: list[str],
     extra_env: dict[str, str],
     forwarding: _Forwarding,
+    *,
+    vault_ca: Path | None = None,
 ) -> None:
     """Run the VM as a child while this process serves its bridges.
 
@@ -2491,6 +2849,7 @@ def _run_sandbox_supervised(
             extra_env,
             forwarding,
             bridge=(server.port, server.token),
+            vault_ca=vault_ca,
         )
         before = _host_trust_state(profile_dir, cwd)
         server.start()
@@ -2660,17 +3019,25 @@ def _launch_profile(name: str, claude_args: list[str]) -> None:
             f"Create it with: claude-profile add {name}"
         )
         sys.exit(1)
-    extra_env = _load_profile_env(d)
+    vault, extra_env = _split_agent_vault(d, _load_profile_env(d))
+    vault_run = None
+    if vault is not None:
+        vault_run = _route_agent_vault(name, vault, claude_args)
+        if vault_run is None:
+            return  # exec'd `infisical agent-vault run`, which starts this launch again
     if _sandbox_enabled(d):
-        _launch_sandbox(d, claude_args, extra_env)
+        _launch_sandbox(d, claude_args, extra_env, vault_run=vault_run)
         return
     _check_statusline_link(d)
     shared, _host_loopback = _shared_settings_args(name, claude_args, sandbox=False)
     env = os.environ.copy()
     env["CLAUDE_CONFIG_DIR"] = str(d)
     env.update(extra_env)
-    # exec replaces this process - no wrapper in between, which matters for
-    # claude's TUI (raw terminal mode, signal handling, etc.)
+    if vault_run is not None and vault_run.session is not None:
+        env.update(_agent_vault_host_env(vault_run.session))
+    # exec replaces this process - no wrapper in between, which matters for claude's TUI
+    # (raw terminal mode, signal handling, etc.). An Agent Vault launch keeps the CLI as
+    # claude's parent, which signals pass through (see _exec_agent_vault_run).
     os.execvpe(settings.claude_bin, [settings.claude_bin, *shared, *claude_args], env)
 
 

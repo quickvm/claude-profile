@@ -50,9 +50,10 @@ hand.
   is shadowed by the profile-launch path (a test enforces the two stay in sync).
 - **Profile isolation:** `CLAUDE_CONFIG_DIR` env var is set to the profile
   directory before `os.execvpe()` replaces the process with `claude`. No wrapper
-  process remains — this is intentional for correct TUI behavior.
+  process remains — this is intentional for correct TUI behavior. Agent Vault launches are
+  the one exception: `infisical agent-vault run` stays as claude's parent to revoke the session.
 - **Settings:** `pydantic-settings` reads `CLAUDE_PROFILE_*` env vars. No config
-  file on disk.
+  file on disk. The per-profile Agent Vault keys live in the profile's `.env` (see below).
 - **Linkable dirs:** `LINKABLE_DIRS = ("commands", "skills", "hooks")` centralises which
   directories can be symlinked to `~/.claude`. `hooks` is there because a hook or statusLine
   command written as `~/.claude/hooks/...` resolves to the profile dir inside the sandbox,
@@ -424,6 +425,33 @@ hand.
   plant `LD_PRELOAD` and the like in `.env` for that launch. `_load_profile_env` refuses a
   `.env` that is a symlink (its target's KEY=VALUE lines would reach the VM, and `env --set`
   would overwrite the target), and `_sandbox_enabled` counts even a dangling marker link.
+- **Agent Vault (`_split_agent_vault`, `_route_agent_vault`):** a profile opts in with
+  `CLAUDE_PROFILE_AGENT_VAULT_*` keys in its `.env`: `BUNDLE` switches it on and then needs `PROXY`
+  and `CA_FINGERPRINT`; `INFISICAL_PROFILE` and `NO_PROXY` are optional. They are there, not in
+  `CLAUDE_PROFILE_*` env vars, because they differ per profile, and because `.env` is pinned
+  read-only in the VM: a config the VM could plant would send the next launch, and the real
+  session it mints, to a proxy and CA of its choosing. `_split_agent_vault` strips them from
+  claude's env and fails the launch on an unknown key (even with `BUNDLE` unset, so a typo can't
+  switch the vault off) or a missing required one. `_route_agent_vault` runs a pre-flight
+  (`_agent_vault_preflight`: the CLI is installed, and the proxy's `/_agent-vault/ca`, fetched with
+  no proxy, matches the pin). If it passes, `_exec_agent_vault_run` execs `infisical agent-vault
+  run --access-bundle … --ttl 24h --no-proxy <AGENT_VAULT_NO_PROXY plus the NO_PROXY key> --
+  claude-profile <name> <args>` with `AGENT_VAULT_RUN_ENV=<name>`. The CLI mints the session with
+  the user's Infisical login, checks the pin again, and revokes the session when its child exits,
+  SIGHUP and SIGTERM included (checked with CLI 0.43.140). If the pre-flight fails, the launch
+  goes ahead without the vault: a red banner, and in the VM `CLAUDE_SANDBOX_AGENT_VAULT=unavailable`
+  plus `AGENT_VAULT_UNAVAILABLE_BRIEFING`. The child launch matches its own name in
+  `AGENT_VAULT_RUN_ENV` (another profile's doesn't count, so a launch from inside a session mints
+  its own), and `_take_agent_vault_session` pops the CLI's variables from `os.environ`, so podman,
+  git and gh run with the host's own environment. The CLI's CA file holds only the proxy's root,
+  which breaks direct HTTPS in curl, git and Python, so `_agent_vault_ca_bundle` writes the system
+  bundle (`_system_ca_bundle`) plus that root to the data dir, named by content. Host launches give
+  claude the CLI's variables with every CA variable on that bundle (`_agent_vault_host_env`).
+  Sandbox launches (`_with_agent_vault`) put the proxy URLs in the secret env file
+  (`OPENCLAW_PROXY_URL` stays out), add the host loopback to `NO_PROXY`, set
+  `NODE_USE_ENV_PROXY=1`, point the CA variables at `SANDBOX_VM_CA_BUNDLE`, and mount the bundle
+  there read-only after `_ca_trust_mounts`, so every default path in the image trusts the proxy's
+  CA without an entrypoint change. Placeholder tokens are ordinary `.env` values.
 - **`sandbox` subcommand & override:** `sandbox <name> --on/--off` toggles the `.sandbox`
   marker on an existing profile (shows status when no flag). `_sandbox_enabled()` decides
   per launch: the `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state
