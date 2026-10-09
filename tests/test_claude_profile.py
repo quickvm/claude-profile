@@ -1182,6 +1182,11 @@ def test_sandbox_mounts_host_claude_read_only(
 # ---------------------------------------------------------------------------
 
 
+def _unwrapped(err: str) -> str:
+    """err without whitespace: rich wraps long paths mid-word at the console width."""
+    return "".join(err.split())
+
+
 def test_sandbox_settings_overlay_strips_sudo(tmp_path: Path) -> None:
     prof = tmp_path / "prof"
     prof.mkdir()
@@ -1204,7 +1209,6 @@ def test_sandbox_settings_overlay_strips_sudo(tmp_path: Path) -> None:
         )
     )
     overlay = claude_profile._sandbox_settings_overlay(prof)
-    assert overlay is not None
     assert overlay == claude_profile._sandbox_state_dir(prof) / "settings.json"
     deny = json.loads(overlay.read_text())["permissions"]["deny"]
     # sudo + ssh/aws guards stripped inside the VM.
@@ -1220,45 +1224,70 @@ def test_sandbox_settings_overlay_strips_sudo(tmp_path: Path) -> None:
     assert data["env"] == {"X": "1"}
 
 
-def test_sandbox_settings_overlay_none_when_no_sudo_deny(tmp_path: Path) -> None:
+def test_sandbox_settings_overlay_copies_settings_without_a_sudo_deny(
+    tmp_path: Path,
+) -> None:
+    # The VM gets a copy either way: claude on the host runs the hooks and statusline
+    # command in settings.json, so the VM must not write the real file.
     prof = tmp_path / "prof"
     prof.mkdir()
-    (prof / "settings.json").write_text(
-        json.dumps({"permissions": {"deny": ["Bash(rm -rf *)"]}})
-    )
-    assert claude_profile._sandbox_settings_overlay(prof) is None
+    text = json.dumps({"permissions": {"deny": ["Bash(rm -rf *)"]}})
+    (prof / "settings.json").write_text(text)
+    overlay = claude_profile._sandbox_settings_overlay(prof)
+    assert overlay.read_text() == text
+    overlay.write_text('{"hooks": "planted"}')
+    assert (prof / "settings.json").read_text() == text
 
 
-def test_sandbox_settings_overlay_warns_when_it_cannot_be_written(
+def test_sandbox_settings_overlay_exits_when_it_cannot_be_written(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # Without the copy the VM would write the profile's real settings.json.
     prof = tmp_path / "prof"
     prof.mkdir()
-    (prof / "settings.json").write_text(
-        json.dumps({"permissions": {"deny": ["Bash(sudo *)"]}})
-    )
+    (prof / "settings.json").write_text("{}")
     (
         claude_profile._sandbox_state_dir(prof) / "settings.json"
     ).mkdir()  # writing over a directory fails
-    assert claude_profile._sandbox_settings_overlay(prof) is None
-    assert "deny rules" in " ".join(capsys.readouterr().err.split())
+    with pytest.raises(SystemExit):
+        claude_profile._sandbox_settings_overlay(prof)
+    assert "settings.json" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("content", ["null", "[]", '"text"'])
-def test_sandbox_settings_overlay_ignores_settings_that_are_not_an_object(
+@pytest.mark.parametrize("content", ["null", "[]", '"text"', "{not json"])
+def test_sandbox_settings_overlay_copies_settings_it_cannot_tune(
     tmp_path: Path, content: str
 ) -> None:
     # Valid JSON that is not an object crashed every sandbox launch.
     prof = tmp_path / "prof"
     prof.mkdir()
     (prof / "settings.json").write_text(content)
-    assert claude_profile._sandbox_settings_overlay(prof) is None
+    assert claude_profile._sandbox_settings_overlay(prof).read_text() == content
 
 
-def test_sandbox_settings_overlay_none_when_no_settings(tmp_path: Path) -> None:
+def test_sandbox_settings_overlay_creates_missing_settings(tmp_path: Path) -> None:
+    # A file to mount over: podman would otherwise create an empty one on the host.
     prof = tmp_path / "prof"
     prof.mkdir()
-    assert claude_profile._sandbox_settings_overlay(prof) is None
+    overlay = claude_profile._sandbox_settings_overlay(prof)
+    assert json.loads((prof / "settings.json").read_text()) == {}
+    assert json.loads(overlay.read_text()) == {}
+
+
+def test_sandbox_settings_overlay_never_reads_through_a_link(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The profile dir is writable from the VM, so a link there may have been aimed at
+    # another profile's credentials to get them copied into the next sandbox.
+    secret = tmp_path / "other" / ".credentials.json"
+    secret.parent.mkdir()
+    secret.write_text('{"accessToken": "sk-secret"}')
+    prof = tmp_path / "prof"
+    prof.mkdir()
+    (prof / "settings.json").symlink_to(secret)
+    overlay = claude_profile._sandbox_settings_overlay(prof)
+    assert json.loads(overlay.read_text()) == {}
+    assert "settings.json" in _unwrapped(capsys.readouterr().err)
 
 
 def test_sandbox_mounts_adds_settings_overlay(

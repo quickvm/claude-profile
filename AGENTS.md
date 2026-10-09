@@ -153,15 +153,19 @@ hand.
   guest netstack). Without it libkrun defaults to TSI socket impersonation, whose stubbed
   `setsockopt` reads `SO_REUSEADDR` back as 0 (aborting gRPC) and whose AF_INET interception breaks
   container DNS — see the passt-networking note on `_build_sandbox_argv`.
-- **Sandbox settings overlay:** the profile's `settings.json` is copied from the host and carries
-  host-oriented deny rules; `deny` wins even under `--dangerously-skip-permissions`, so a blanket
-  `Bash(sudo *)` deny blocks the sandbox's own scoped `sudo dnf`/`sudo podman`.
-  `_sandbox_settings_overlay` writes `settings.json` in the profile's state dir (the
-  profile settings with any deny matching `SANDBOX_STRIP_DENY_PREFIXES` — `Bash(sudo`,
-  `Read(~/.ssh`, `Edit(~/.ssh` and `Read(~/.aws` — removed) and `_sandbox_mounts`
-  bind-mounts it over `settings.json` **inside the VM only**, read-write so in-VM setting writes
-  hit the throwaway overlay (regenerated each launch), not the real profile settings. Host launches
-  are untouched and keep the sudo deny.
+- **Sandbox settings overlay:** claude on the host runs the hooks and statusline command in the
+  profile's `settings.json`, so the VM never writes the real file. `_sandbox_settings_overlay`
+  writes a copy to the profile's state dir every launch and `_sandbox_mounts` bind-mounts it over
+  `settings.json` **inside the VM only**, read-write so in-VM setting writes hit the throwaway
+  copy. The copy drops any deny matching `SANDBOX_STRIP_DENY_PREFIXES` (`Bash(sudo`,
+  `Read(~/.ssh`, `Edit(~/.ssh`, `Read(~/.aws`): the profile's rules are host-oriented, `deny`
+  wins even under `--dangerously-skip-permissions`, and a blanket `Bash(sudo *)` deny blocks the
+  sandbox's own scoped `sudo dnf`/`sudo podman`. Host launches keep the sudo deny. A missing
+  `settings.json` is created as `{}` so there is a file to mount over (podman would create an
+  empty one), and a symlinked one is never read through: the VM could have aimed it at another
+  profile's credentials, so the VM gets `{}` and a warning instead. claude's settings writer falls
+  back to an in-place write when its rename fails with EBUSY, as it does onto a file mount, so
+  in-VM settings changes work.
 - **Shared settings (`shared-settings.json`):** settings every profile should get (hooks, for
   example) live once in `<profiles_base>/shared-settings.json` instead of being copied into each
   profile's `settings.json`. `_shared_settings_args` loads it at every launch, replaces

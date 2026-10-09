@@ -1022,47 +1022,66 @@ def _sandbox_state_dir(profile_dir: Path) -> Path:
     return state
 
 
-def _sandbox_settings_overlay(profile_dir: Path) -> Path | None:
-    """Write a sandbox-tuned settings.json (host sudo deny stripped) to mount in the VM.
+def _sandbox_settings_overlay(profile_dir: Path) -> Path:
+    """Write the VM's per-launch copy of the profile's settings.json; return its path.
 
-    The profile's settings.json is copied from the host and carries host-oriented deny
-    rules (e.g. ``Bash(sudo *)``) that still apply inside the VM — deny wins even under
-    --dangerously-skip-permissions. The microVM is the isolation boundary and grants
-    scoped sudo, so we strip those denies into an overlay mounted only in the VM; the
-    profile's real settings.json (used by host launches) is untouched. Returns the
-    overlay path, or None when there is no settings.json or nothing to strip.
+    claude on the host runs the hooks and statusline command in settings.json, and the
+    VM sees the profile dir read-write, so the VM gets this copy mounted over the file
+    instead: settings it changes last the session and never reach the host. The copy
+    drops the host-oriented deny rules matching SANDBOX_STRIP_DENY_PREFIXES (e.g.
+    ``Bash(sudo *)``): deny wins even under --dangerously-skip-permissions, and the VM
+    grants scoped sudo. A missing settings.json is created as ``{}`` so there is a file
+    to mount over, which podman would otherwise create empty on the host. A linked one is
+    never read through: the VM could have aimed the link at another profile's
+    credentials to get them copied into the next sandbox.
     """
     src = profile_dir / "settings.json"
-    if not src.exists():
-        return None
-    try:
-        data = json.loads(src.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    perms = data.get("permissions")
-    if not isinstance(perms, dict) or not isinstance(perms.get("deny"), list):
-        return None
-    deny = perms["deny"]
-    kept = [
-        rule
-        for rule in deny
-        if not (isinstance(rule, str) and rule.startswith(SANDBOX_STRIP_DENY_PREFIXES))
-    ]
-    if len(kept) == len(deny):
-        return None
-    perms["deny"] = kept
+    if src.is_symlink():
+        err_console.print(
+            f"[yellow]Warning: {src} is a symlink, so the sandbox gets empty settings "
+            f"instead of reading through it. Replace it with a regular file to use "
+            f"these settings in the sandbox.[/yellow]"
+        )
+        content = b"{}\n"
+    else:
+        if not src.exists():
+            src.write_text("{}\n")
+        content = _sandbox_settings_content(src)
     overlay = _sandbox_state_dir(profile_dir) / "settings.json"
     try:
-        overlay.write_text(json.dumps(data, indent=2))
+        overlay.write_bytes(content)
     except OSError as exc:
         err_console.print(
-            f"[yellow]Warning: could not write {overlay} ({exc}), so the profile's "
-            f"deny rules, including Bash(sudo …), stay in force in the sandbox.[/yellow]"
+            f"[red]Could not write the sandbox's copy of settings.json to {overlay} "
+            f"({exc}).[/red] Without it the VM would change the profile's real settings."
         )
-        return None
+        sys.exit(1)
     return overlay
+
+
+def _sandbox_settings_content(src: Path) -> bytes:
+    """The profile's settings.json as the VM gets it, the host's sudo denies dropped."""
+    try:
+        raw = src.read_bytes()
+    except OSError as exc:
+        err_console.print(f"[red]Could not read {src} ({exc}).[/red]")
+        sys.exit(1)
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    perms = data.get("permissions") if isinstance(data, dict) else None
+    if not isinstance(perms, dict) or not isinstance(perms.get("deny"), list):
+        return raw
+    kept = [
+        rule
+        for rule in perms["deny"]
+        if not (isinstance(rule, str) and rule.startswith(SANDBOX_STRIP_DENY_PREFIXES))
+    ]
+    if len(kept) == len(perms["deny"]):
+        return raw
+    perms["deny"] = kept
+    return json.dumps(data, indent=2).encode()
 
 
 def _has_option(args: list[str], name: str) -> bool:
@@ -1365,11 +1384,10 @@ def _sandbox_mounts(profile_dir: Path, cwd: Path) -> list[str]:
         "-v",
         f"{_sandbox_chrome_overlay(profile_dir)}:{SANDBOX_CONFIG_DIR}/chrome:z",
     ]
+    # Override just settings.json inside the VM; writes land in the throwaway overlay
+    # (regenerated each launch), not the profile's real settings.json.
     overlay = _sandbox_settings_overlay(profile_dir)
-    if overlay is not None:
-        # Override just settings.json inside the VM; writes land in the throwaway
-        # overlay (regenerated each launch), not the profile's real settings.json.
-        mounts += ["-v", f"{overlay}:{SANDBOX_CONFIG_DIR}/settings.json:z"]
+    mounts += ["-v", f"{overlay}:{SANDBOX_CONFIG_DIR}/settings.json:z"]
     git_dir = _git_common_dir(cwd)
     if git_dir is not None and git_dir != root and root not in git_dir.parents:
         mounts += ["-v", f"{git_dir}:{git_dir}:z"]
