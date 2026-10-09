@@ -1122,6 +1122,34 @@ def test_sandbox_claude_binary_caches_copy(
     assert os.access(cached, os.X_OK)  # must still be executable in the VM
 
 
+def test_sandbox_claude_binary_clones_where_the_filesystem_can(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # On btrfs or XFS the copy shares the 256 MB binary's blocks instead of writing them.
+    # tmpfs can't, so the kernel's FICLONE is stood in for here; the copy above falls back.
+    binary = _native_install(tmp_path)
+    monkeypatch.setattr(claude_profile, "_host_claude_binary", lambda: binary)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    clones: list[int] = []
+
+    def ficlone(fd: int, request: int, source_fd: int) -> int:
+        assert request == claude_profile.FICLONE
+        os.write(fd, os.pread(source_fd, 1 << 20, 0))
+        clones.append(fd)
+        return 0
+
+    def no_copy(*args: object) -> None:
+        raise AssertionError("copied although the clone worked")
+
+    monkeypatch.setattr(claude_profile.fcntl, "ioctl", ficlone)
+    monkeypatch.setattr(claude_profile.shutil, "copyfile", no_copy)
+    cached = claude_profile._sandbox_claude_binary()
+    assert clones
+    assert cached is not None
+    assert cached.read_text() == binary.read_text()
+    assert os.access(cached, os.X_OK)
+
+
 def test_sandbox_claude_binary_reuses_existing_copy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

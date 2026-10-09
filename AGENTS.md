@@ -102,9 +102,12 @@ hand.
   image's claude stays in play). `_sandbox_claude_binary` copies it to
   `~/.local/share/claude-profile/claude/<version>` — the mount needs an SELinux `:z`
   relabel and relabelling the user's real install is not ours to do — pruning older
-  versions (a `.partial` copy only once the launch writing it has exited), and `_sandbox_mounts` mounts that copy read-only at `SANDBOX_HOST_CLAUDE`
-  (`/opt/claude-host/claude`). The entrypoint points `~/.local/bin/claude` at it before
-  dropping privileges. The copy happens only when the host updates (version dirs are
+  versions (a `.partial` copy only once the launch writing it has exited). The copy is a reflink
+  where the filesystem can (`_clone_or_copy`: `FICLONE`, falling back to a plain copy), so on
+  btrfs or XFS it shares the binary's blocks rather than writing 244 MiB per update; Python 3.13's
+  `shutil.copy` writes them all. `_sandbox_mounts` mounts that copy read-only at
+  `SANDBOX_HOST_CLAUDE` (`/opt/claude-host/claude`). The entrypoint points `~/.local/bin/claude`
+  at it before dropping privileges. The copy happens only when the host updates (version dirs are
   immutable). `_build_sandbox_argv` also sets `DISABLE_AUTOUPDATER=1` when the mount is
   present: the VM is ephemeral, so an in-VM update would download a release only to
   discard it, and would move the session off the host's version mid-run.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -89,6 +90,8 @@ SANDBOX_GPG_PUBKEYS = "/opt/claude-host/gpg-pubkeys"
 SANDBOX_HOST_CLAUDE = "/opt/claude-host/claude"
 # In-VM path where the shared, read-only MCP image store is mounted (additionalimagestore).
 SANDBOX_IMAGE_STORE = "/var/lib/shared-mcp-store"
+# ioctl that makes a file share another's blocks (a reflink), from linux/fs.h.
+FICLONE = 0x40049409
 # Trust anchors, and the bundles update-ca-trust extracts from them and the system roots.
 # Same paths on host and in the VM: the host's are mounted over the image's (see
 # _ca_trust_mounts).
@@ -1356,7 +1359,7 @@ def _sandbox_claude_binary() -> Path | None:
         if not dest.exists():
             # Copy to a temp name and rename, so an interrupted launch can't leave a
             # truncated binary that later launches would mistake for a complete one.
-            shutil.copy(source, partial)
+            _clone_or_copy(source, partial)
             os.replace(partial, dest)
         for entry in cache.iterdir():
             if entry != dest and _stale_claude_copy(entry):
@@ -1370,6 +1373,22 @@ def _sandbox_claude_binary() -> Path | None:
         )
         return None
     return dest
+
+
+def _clone_or_copy(source: Path, dest: Path) -> None:
+    """Copy source to dest, sharing its blocks (a reflink) where the filesystem can.
+
+    On btrfs or XFS the clone is instant and takes no space, where a copy of the claude
+    binary writes 256 MB at every host update; elsewhere, or across filesystems, the
+    ioctl fails and a plain copy runs. The mode is copied either way, so the binary stays
+    executable.
+    """
+    try:
+        with source.open("rb") as src, dest.open("wb") as dst:
+            fcntl.ioctl(dst.fileno(), FICLONE, src.fileno())
+    except OSError:
+        shutil.copyfile(source, dest)
+    shutil.copymode(source, dest)
 
 
 def _ancestor_mcp_json(cwd: Path) -> list[Path]:
