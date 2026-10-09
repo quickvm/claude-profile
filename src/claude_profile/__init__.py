@@ -25,6 +25,7 @@ import typer
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from claude_profile import bridges
@@ -1602,7 +1603,7 @@ def _linked_mounts(profile_dir: Path) -> list[str]:
         if target != expected:
             err_console.print(
                 f"[yellow]Warning: not mounting {link} into the sandbox: it points at "
-                f"{target}, not {expected}. Re-point it with: "
+                f"{_shown(str(target))}, not {expected}. Re-point it with: "
                 f"ln -sfn {expected} {link}[/yellow]"
             )
             continue
@@ -2493,6 +2494,7 @@ def _run_sandbox_supervised(
             forwarding,
             bridge=(server.port, server.token),
         )
+        before = _host_trust_state(profile_dir, cwd)
         server.start()
         # close_fds=False: podman reads its --env-file through an inherited fd (see
         # _secret_env_file); Python opens every other fd non-inheritable, the bridge
@@ -2502,7 +2504,80 @@ def _run_sandbox_supervised(
         )
     finally:
         server.close()
+    _report_host_trust_changes(profile_dir, cwd, before)
     sys.exit(128 - returncode if returncode < 0 else returncode)
+
+
+def _shown(text: str) -> str:
+    """text made safe to print: VM-controlled names could carry markup or ANSI escapes."""
+    return escape("".join(char if char.isprintable() else "?" for char in text))
+
+
+def _mcp_servers_state(servers: object, scope: str) -> dict[str, object]:
+    if not isinstance(servers, dict):
+        return {}
+    return {
+        f"MCP server '{_shown(str(name))}' ({scope})": server
+        for name, server in servers.items()
+    }
+
+
+def _mcp_project_state(path: str, project: dict[str, Any]) -> dict[str, object]:
+    scope = f"project {_shown(path)}"
+    state = _mcp_servers_state(project.get("mcpServers"), scope)
+    approved = project.get("enabledMcpjsonServers")
+    if isinstance(approved, list):
+        for name in approved:
+            state[f"enabledMcpjsonServers '{_shown(str(name))}' ({scope})"] = True
+    if project.get("enableAllProjectMcpServers") is True:
+        state[f"enableAllProjectMcpServers ({scope})"] = True
+    return state
+
+
+def _host_trust_state(profile_dir: Path, cwd: Path) -> dict[str, object]:
+    """What the host would run from files the VM can write, keyed by a description.
+
+    Covers the MCP servers in the profile's .claude.json, the project approvals that
+    start .mcp.json servers without asking, and which .claude/settings.local.json files
+    claude reads for cwd exist. Only what adds or changes a command counts: claude itself
+    writes empty approval lists, and removing a server runs nothing.
+    """
+    state: dict[str, object] = {}
+    try:
+        data = json.loads((profile_dir / ".claude.json").read_bytes())
+    except (OSError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        state.update(_mcp_servers_state(data.get("mcpServers"), "user scope"))
+        projects = data.get("projects")
+        for path, project in projects.items() if isinstance(projects, dict) else []:
+            if isinstance(project, dict):
+                state.update(_mcp_project_state(str(path), project))
+    for local in _local_settings_paths(_sandbox_work_root(cwd), cwd):
+        if os.path.lexists(local):
+            state[escape(str(local))] = True
+    return state
+
+
+def _report_host_trust_changes(
+    profile_dir: Path, cwd: Path, before: dict[str, object]
+) -> None:
+    """Warn about what the session added or changed that claude will run on the host.
+
+    These stay writable from the VM: copies of .claude.json would lose the session's
+    own state, and a .claude/settings.local.json that did not exist had nothing to copy.
+    """
+    after = _host_trust_state(profile_dir, cwd)
+    changed = [key for key, value in after.items() if before.get(key) != value]
+    if not changed:
+        return
+    listing = "".join(f"\n  {key}" for key in changed)
+    err_console.print(
+        f"[yellow]Warning: the sandboxed session added or changed what claude runs on the "
+        f"host:{listing}\nThe MCP entries are in {profile_dir / '.claude.json'}. Check "
+        f"these before running claude on the host with this profile or in this "
+        f"project.[/yellow]"
+    )
 
 
 def _wait_forwarding_signals(proc: subprocess.Popen[bytes]) -> int:

@@ -114,7 +114,8 @@ hand.
   without exposing the global target writable. Only a link whose target is exactly
   `~/.claude/<name>` is mounted: the profile dir is writable from inside the VM, so a link
   aimed anywhere else may have been planted there to get that host path mounted on the next
-  launch (it is skipped with a warning). `add` symlinks `statusline.sh` rather than
+  launch (it is skipped with a warning, its target passed through `_shown`). `add` symlinks
+  `statusline.sh` rather than
   copying it: settings run `~/.claude/statusline.sh`, which inside the VM is the *profile's*
   file (there `~/.claude` is the profile dir), so a copy silently drifted from the host's
   global script. Mounting the global script straight over that path instead would leave an
@@ -191,6 +192,16 @@ hand.
   profile that is marked for the sandbox or has a sandbox state dir (`_was_sandboxed`; the state
   dir also catches `CLAUDE_PROFILE_SANDBOX=1` launches), `_check_statusline_link` warns unless
   `statusline.sh` is absent or the link to `~/.claude/statusline.sh`.
+- **Post-session report:** `.claude.json` stays writable from the VM (a copy would lose the
+  session's own state), so supervised launches snapshot what it makes the host run
+  (`_host_trust_state`: MCP server definitions at user and project scope, `enabledMcpjsonServers`
+  approvals, `enableAllProjectMcpServers`, and which `.claude/settings.local.json` files exist)
+  before the VM starts, and `_report_host_trust_changes` lists what was added or changed after it
+  exits. Only additions and changes count: claude writes empty approval lists itself, and
+  removing a server runs nothing. Names only, never command lines or env, which carry tokens; and
+  `_shown` replaces non-printable characters and escapes rich markup, since the names come from
+  the VM and printed raw could drive the terminal (OSC 52, for one, writes the clipboard). Exec
+  launches have no process left to report from.
 - **Shared settings (`shared-settings.json`):** settings every profile should get (hooks, for
   example) live once in `<profiles_base>/shared-settings.json` instead of being copied into each
   profile's `settings.json`. `_shared_settings_args` loads it at every launch, replaces
