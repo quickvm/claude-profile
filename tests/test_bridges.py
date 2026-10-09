@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
+import pwd
 import socket
+import struct
 import threading
 import time
 from collections.abc import Generator
@@ -217,3 +220,124 @@ def test_browser_open_opens_only_claude_chrome_pages(
     else:
         time.sleep(0.2)
         assert not record.exists()
+
+
+def _frame(obj: dict) -> bytes:
+    body = json.dumps(obj).encode()
+    return struct.pack("<I", len(body)) + body
+
+
+def _read_frame(conn: socket.socket) -> dict:
+    header = b""
+    while len(header) < 4:
+        header += conn.recv(4 - len(header))
+    size = struct.unpack("<I", header)[0]
+    body = b""
+    while len(body) < size:
+        body += conn.recv(size - len(body))
+    return json.loads(body)
+
+
+@pytest.fixture()
+def native_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Generator[list[dict], None, None]:
+    """A stand-in Claude-in-Chrome native host in a private bridge dir.
+
+    It first sends the reply the extension gives to a keepalive, then answers each
+    frame it receives with {"echo": frame}. Yields the frames it received.
+    """
+    bridge_dir = tmp_path / "claude-mcp-browser-bridge-me"
+    bridge_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(bridges, "native_host_dir", lambda: bridge_dir)
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(str(bridge_dir / "4242.sock"))
+    server.listen()
+    received: list[dict] = []
+
+    def serve() -> None:
+        try:
+            conn, _ = server.accept()
+        except OSError:
+            return
+        with conn:
+            keepalive_reply = {"result": {"content": bridges.KEEPALIVE_REPLY}}
+            conn.sendall(_frame(keepalive_reply))
+            with contextlib.suppress(OSError, struct.error, json.JSONDecodeError):
+                while True:
+                    frame = _read_frame(conn)
+                    received.append(frame)
+                    conn.sendall(_frame({"echo": frame}))
+
+    threading.Thread(target=serve, daemon=True).start()
+    yield received
+    server.close()
+
+
+def test_chrome_relay_passes_frames_and_swallows_keepalive_replies(
+    native_host: list[dict],
+) -> None:
+    server = bridges.BridgeServer({"chrome": bridges.chrome_relay})
+    server.start()
+    try:
+        with _connect(server, f"{server.token} chrome") as client:
+            client.sendall(_frame({"method": "execute_tool", "id": 1}))
+            # The native host's keepalive reply comes first and must not reach claude.
+            assert _read_frame(client) == {"echo": {"method": "execute_tool", "id": 1}}
+    finally:
+        server.close()
+
+
+def test_chrome_relay_sends_a_keepalive_when_idle(
+    native_host: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Chrome's MV3 service worker idles out after ~30s and takes the native host with it.
+    monkeypatch.setattr(bridges, "KEEPALIVE_INTERVAL", 0.2)
+    server = bridges.BridgeServer({"chrome": bridges.chrome_relay})
+    server.start()
+    try:
+        with _connect(server, f"{server.token} chrome"):
+            deadline = time.monotonic() + 5
+            while not native_host and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert native_host and native_host[0]["method"] == bridges.KEEPALIVE_METHOD
+    finally:
+        server.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "found"), [(0o700, True), (0o750, False), (0o755, False)]
+)
+def test_native_host_socket_only_from_a_private_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: int, found: bool
+) -> None:
+    # claude's own client refuses a bridge dir others can write to; the relay must too,
+    # or another local user can plant a socket the VM's browser calls reach.
+    bridge_dir = tmp_path / "claude-mcp-browser-bridge-me"
+    bridge_dir.mkdir()
+    (bridge_dir / "123.sock").touch()
+    bridge_dir.chmod(mode)
+    monkeypatch.setattr(bridges, "native_host_dir", lambda: bridge_dir)
+    expected = bridge_dir / "123.sock" if found else None
+    assert bridges.newest_native_host_socket() == expected
+
+
+def test_native_host_socket_ignores_a_symlinked_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    private = tmp_path / "elsewhere"
+    private.mkdir(mode=0o700)
+    (private / "123.sock").touch()
+    link = tmp_path / "claude-mcp-browser-bridge-me"
+    link.symlink_to(private)
+    monkeypatch.setattr(bridges, "native_host_dir", lambda: link)
+    assert bridges.newest_native_host_socket() is None
+
+
+def test_native_host_dir_uses_the_uids_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    # claude names the dir after os.userInfo().username, which comes from the uid, not
+    # from $USER; getpass.getuser() reads $USER first.
+    monkeypatch.setenv("USER", "someone-else")
+    monkeypatch.setenv("LOGNAME", "someone-else")
+    name = pwd.getpwuid(os.getuid()).pw_name
+    assert bridges.native_host_dir() == Path(f"/tmp/claude-mcp-browser-bridge-{name}")
