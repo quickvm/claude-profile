@@ -507,7 +507,11 @@ What else the VM can reach:
   signed in with the profile's claude.ai login, which the VM holds. So while the extension is
   signed in to that account, anything in the VM can drive your logged-in Chrome with
   `claude --chrome`, whether or not `CLAUDE_PROFILE_SANDBOX_CHROME` is set (that setting only
-  adds the flag). The extension's site permissions are the limit.
+  adds the flag). The sandbox runs claude with `--dangerously-skip-permissions`, so Claude Code
+  doesn't ask before those actions either; the extension's site permissions are the remaining
+  check. To limit what a session can reach, install the extension in a separate Chrome profile
+  that isn't signed in to accounts you care about, narrow its site permissions, and turn it off
+  when you aren't using it.
 - **The host's loopback.** When a bridge or a loopback hook is active, the VM runs with
   `--map-host-loopback`, which reaches every service listening on the host's `127.0.0.1`,
   not only the bridges.
