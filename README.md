@@ -460,6 +460,25 @@ network egress — and the agent can read the profile credentials mounted into t
 genuinely untrusted code, prefer a full or cloud VM. This is based on the Fedora Magazine
 article [Sandbox AI coding agents with microVMs on Fedora Linux](https://fedoramagazine.org/sandbox-ai-coding-agents-with-microvms-on-fedora-linux/).
 
+Credentials the agent in the VM can read or use:
+
+- **Always:** the profile's Claude login (`.credentials.json` in the mounted profile
+  directory), the profile's `.env` values (as environment variables), tokens in the MCP
+  server entries of the profile's `.claude.json`, API keys in ancestor `.mcp.json` files
+  (see below), and anything in a copy of your `~/.gitconfig`, such as a token in a remote URL.
+- **When you turn them on:** your SSH agents (`CLAUDE_PROFILE_SANDBOX_SSH_AGENT`: it can
+  authenticate with your keys, not read them), gpg-agent (`CLAUDE_PROFILE_SANDBOX_GPG_AGENT`:
+  it can sign and decrypt, not read the secret keys), your GitHub token
+  (`CLAUDE_PROFILE_SANDBOX_GH`), the allowlisted Infisical logins
+  (`CLAUDE_PROFILE_SANDBOX_INFISICAL`), your Pulumi Cloud token
+  (`CLAUDE_PROFILE_SANDBOX_PULUMI`), the variables named in
+  `CLAUDE_PROFILE_SANDBOX_FORWARD_ENV`, your clipboard (`CLAUDE_PROFILE_SANDBOX_CLIPBOARD`,
+  read-only), and your logged-in browser through the Claude extension
+  (`CLAUDE_PROFILE_SANDBOX_CHROME`).
+
+Not mounted: `~/.ssh` (only a copy of `known_hosts`), your keyring, and other profiles'
+directories.
+
 What else the VM can reach:
 
 - **Writable state the host trusts later.** The profile directory and the working tree are
