@@ -89,7 +89,8 @@ hand.
   common dir when it lives outside the CWD (so a worktree's `git`/`wt` work), and the
   profile dir at the in-VM config dir. VM sizing uses `krun.ram_mib`/`krun.cpus`
   annotations, not `--memory`/`--cpus`. `TERM`/`COLORTERM` are forwarded with `-e`; the
-  rest of the host environment is not. `.env` vars and forwarded tokens go through
+  rest of the host environment is not, and `--http-proxy=false` stops podman passing the
+  host's `*_proxy` variables (proxy credentials included) in behind the launcher's back. `.env` vars and forwarded tokens go through
   `_secret_env_file`: an unlinked file in the tmpfs `$XDG_RUNTIME_DIR` that podman reads
   as `--env-file /dev/fd/N`, so no value appears in podman's argv (world-readable in
   `/proc/<pid>/cmdline`) or in podman's own environment (where a `.env` written from inside
@@ -102,9 +103,12 @@ hand.
   image's claude stays in play). `_sandbox_claude_binary` copies it to
   `~/.local/share/claude-profile/claude/<version>` — the mount needs an SELinux `:z`
   relabel and relabelling the user's real install is not ours to do — pruning older
-  versions (a `.partial` copy only once the launch writing it has exited), and `_sandbox_mounts` mounts that copy read-only at `SANDBOX_HOST_CLAUDE`
-  (`/opt/claude-host/claude`). The entrypoint points `~/.local/bin/claude` at it before
-  dropping privileges. The copy happens only when the host updates (version dirs are
+  versions (a `.partial` copy only once the launch writing it has exited). The copy is a reflink
+  where the filesystem can (`_clone_or_copy`: `FICLONE`, falling back to a plain copy), so on
+  btrfs or XFS it shares the binary's blocks rather than writing 244 MiB per update; Python 3.13's
+  `shutil.copy` writes them all. `_sandbox_mounts` mounts that copy read-only at
+  `SANDBOX_HOST_CLAUDE` (`/opt/claude-host/claude`). The entrypoint points `~/.local/bin/claude`
+  at it before dropping privileges. The copy happens only when the host updates (version dirs are
   immutable). `_build_sandbox_argv` also sets `DISABLE_AUTOUPDATER=1` when the mount is
   present: the VM is ephemeral, so an in-VM update would download a release only to
   discard it, and would move the session off the host's version mid-run.
@@ -209,7 +213,8 @@ hand.
   `?profile={profile}`), and passes the result as `--settings <json>`; claude merges that over
   the profile's own settings, and hook entries from both run. A user-supplied `--settings`
   wins (the shared file is skipped with a warning), and an unreadable or non-object file fails
-  the launch. In the sandbox, `_rewrite_loopback_hooks` re-points HTTP hooks aimed at
+  the launch. In the sandbox, `_strip_sandbox_denies` drops the same host-oriented denies from it
+  as from the settings.json copy, and `_rewrite_loopback_hooks` re-points HTTP hooks aimed at
   `127.0.0.1`/`localhost` at `SANDBOX_HOST_LOOPBACK`, and `_build_sandbox_argv(host_loopback=…)`
   adds `--map-host-loopback` even when no agent bridge is active — inside the VM, 127.0.0.1 is
   the VM itself, so without both a local hook receiver would silently never
@@ -245,8 +250,10 @@ hand.
   at the host's path: the entrypoint chowns each socket's parent dir, and when the host socket
   sits directly in `/run/user/<uid>` that made gpg move its socket dir there and miss the GPG
   bridge.
-- **known_hosts persistence:** `_sandbox_mounts` mounts the host's `~/.ssh/known_hosts`
-  read-only as the VM's *global* known_hosts (`/etc/ssh/ssh_known_hosts`, for verification)
+- **known_hosts persistence:** `_sandbox_mounts` mounts a copy of the host's `~/.ssh/known_hosts`
+  (`_host_file_copy`, refreshed every launch: `:z` on the real file would relabel it from
+  `ssh_home_t` for containers) read-only as the VM's *global* known_hosts
+  (`/etc/ssh/ssh_known_hosts`, for verification)
   and a per-profile writable `known_hosts` (`_sandbox_known_hosts`, in the state dir) as the
   *user* file, so
   ssh records newly accepted host keys there and they persist across launches — the host's
@@ -257,8 +264,9 @@ hand.
   (`gpg --export`, written to the data dir and mounted read-only at `SANDBOX_GPG_PUBKEYS` by
   `_gpg_pubkeys_mounts`, imported by `entrypoint.sh`; a file because a keyring easily
   outgrows the 128 KiB Linux allows one env string). Signing runs on the host,
-  so secret keys/smartcard never enter the VM. `_sandbox_mounts` also bind-mounts
-  `~/.gitconfig` read-only so signing config applies. Its `include`/`includeIf` files are not
+  so secret keys/smartcard never enter the VM. `_sandbox_mounts` also bind-mounts a copy of
+  `~/.gitconfig` (`_host_file_copy`, for the same relabelling reason) read-only so signing
+  config applies. Its `include`/`includeIf` files are not
   mounted, and a `gitdir:~/` condition could not match in the VM anyway (`~` is
   /home/appuser there), so `_git_identity_mounts` resolves `GIT_IDENTITY_KEYS` for the CWD on
   the host, writes them to a file in the data dir that first includes the mounted
@@ -430,18 +438,22 @@ hand.
   by every project under that directory. `_mcp_container_images` reads them too, so a container
   server declared there is cacheable by `sandbox-cache` rather than re-pulled every launch.
 - **Host CA trust (`_ca_trust_mounts`):** the image ships only public roots, so anything served by a
-  private CA (internal registries, git remotes, APIs) fails TLS in the VM. The host's custom anchors
-  (`SANDBOX_CA_ANCHORS`, `/etc/pki/ca-trust/source/anchors`) are bind-mounted at the same path — the
-  only place `update-ca-trust` reads, and empty in the image, so the mount masks nothing. Uniquely
-  among the mounts it uses plain `:ro` with **no `:z`**: relabelling is for paths the container
-  writes, SELinux already lets containers read `cert_t`, and `:z` would relabel a root-owned system
-  dir out from under the host's own TLS clients (and fail outright for a rootless podman that cannot
-  chcon it). Anchors are inert source material, so `entrypoint.sh` runs `update-ca-trust extract` as
-  root to regenerate the bundles curl/git/openssl consume. Node and Python ignore the system store
-  entirely, which would leave `npx` MCP servers still failing, so after dropping privileges the
-  entrypoint points `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` at the extracted
-  bundle (image roots plus the host's); an explicitly forwarded value wins. No-op when the host has
-  no custom anchors.
+  private CA (internal registries, git remotes, APIs) fails TLS in the VM. When the host has custom
+  anchors (`SANDBOX_CA_ANCHORS`, `/etc/pki/ca-trust/source/anchors`), the launcher mounts them and
+  the host's extracted bundles (`SANDBOX_CA_EXTRACTED`, `/etc/pki/ca-trust/extracted`: its system
+  roots merged with those anchors by its own `update-ca-trust`) at the same paths, so the bundles'
+  relative links and every path the image's tools use (`/etc/pki/tls/cert.pem`, `ca-bundle.crt`)
+  resolve to the host's trust store. Running `update-ca-trust extract` in the VM instead took
+  about 7 s of every launch (boot to exit fell from 13.7 s to 4.6 s on a host with six anchors).
+  Anchors with no extracted dir trust nothing, so that case warns and mounts neither. Uniquely
+  among the mounts these use plain `:ro` with **no `:z`**: relabelling is for paths the container
+  writes, SELinux already lets containers read `cert_t`, and `:z` would relabel root-owned system
+  dirs out from under the host's own TLS clients (and fail outright for a rootless podman that
+  cannot chcon them). Node and Python ignore the system store entirely, which would leave `npx` MCP
+  servers still failing, so after dropping privileges the entrypoint points
+  `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` at the extracted bundle when the
+  anchors are mounted; an explicitly forwarded value wins. No-op when the host has no custom
+  anchors.
 - **MCP image cache (`sandbox-cache`):** container MCP images would be re-pulled every launch (the
   VM is ephemeral). `claude-profile sandbox-cache <name>` discovers the podman/docker MCP images from
   the profile's `.claude.json` and any ancestor `.mcp.json` (`_mcp_container_images`), pulls them
@@ -461,7 +473,11 @@ hand.
 - **`sandbox` subcommand & override:** `sandbox <name> --on/--off` toggles the `.sandbox`
   marker on an existing profile (shows status when no flag). `_sandbox_enabled()` decides
   per launch: the `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state
-  `Optional[bool]`) wins when set, otherwise the marker.
+  `bool | None`) wins when set, otherwise the marker (`_sandbox_marked`, which uses `lexists`
+  so a dangling marker link counts, failing safe). The status, `--on`/`--off` and `list` print
+  `_sandbox_override_note` while the override is set, or they would show the marker while
+  launches did something else; `list` and `_was_sandboxed` read the marker the same way the
+  launch does. `--on` replaces a linked marker rather than `touch` its target.
 
 ## Conventions
 

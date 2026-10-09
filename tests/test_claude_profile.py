@@ -65,6 +65,7 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     # Point the trust anchors at an absent dir so the developer's real host CAs (this
     # runs on machines that have them) never add a mount. Tests for that path set it.
     monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(tmp_path / "no-ca"))
+    monkeypatch.setattr(claude_profile, "SANDBOX_CA_EXTRACTED", str(tmp_path / "no-ca"))
     monkeypatch.setattr(claude_profile.settings, "sandbox", None)
     monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", False)
@@ -997,23 +998,38 @@ def test_sandbox_mounts_includes_ancestor_mcp_json(
 # ---------------------------------------------------------------------------
 
 
-def test_ca_trust_mounts_when_anchors_present(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def _host_trust(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
+    """A host trust store with one custom anchor and its extracted bundles."""
     anchors = tmp_path / "anchors"
     anchors.mkdir()
     (anchors / "internal-root.pem").write_text("-----BEGIN CERTIFICATE-----")
+    extracted = tmp_path / "extracted"
+    (extracted / "pem").mkdir(parents=True)
     monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(anchors))
+    monkeypatch.setattr(claude_profile, "SANDBOX_CA_EXTRACTED", str(extracted))
+    return anchors, extracted
+
+
+def test_ca_trust_mounts_the_hosts_extracted_bundles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The host has already merged its anchors into the bundles curl, git and openssl
+    # read; running update-ca-trust in the VM instead took about 7 s of every launch.
     # Read-only and deliberately unrelabelled: see _ca_trust_mounts.
-    assert claude_profile._ca_trust_mounts() == ["-v", f"{anchors}:{anchors}:ro"]
+    anchors, extracted = _host_trust(monkeypatch, tmp_path)
+    assert claude_profile._ca_trust_mounts() == [
+        "-v",
+        f"{anchors}:{anchors}:ro",
+        "-v",
+        f"{extracted}:{extracted}:ro",
+    ]
 
 
 def test_ca_trust_mounts_empty_when_no_anchors(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    anchors = tmp_path / "anchors"
-    anchors.mkdir()
-    monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(anchors))
+    anchors, _extracted = _host_trust(monkeypatch, tmp_path)
+    (anchors / "internal-root.pem").unlink()
     assert claude_profile._ca_trust_mounts() == []
 
 
@@ -1024,19 +1040,29 @@ def test_ca_trust_mounts_empty_when_dir_missing(
     assert claude_profile._ca_trust_mounts() == []
 
 
-def test_sandbox_mounts_includes_ca_anchors(
+def test_ca_trust_mounts_empty_without_extracted_bundles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Anchors nothing has extracted would trust nothing in the VM either; say so.
+    _anchors, extracted = _host_trust(monkeypatch, tmp_path)
+    (extracted / "pem").rmdir()
+    extracted.rmdir()
+    assert claude_profile._ca_trust_mounts() == []
+    assert "update-ca-trust" in capsys.readouterr().err
+
+
+def test_sandbox_mounts_includes_host_trust(
     fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    anchors = tmp_path / "anchors"
-    anchors.mkdir()
-    (anchors / "internal-root.pem").write_text("-----BEGIN CERTIFICATE-----")
-    monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(anchors))
+    anchors, extracted = _host_trust(monkeypatch, tmp_path)
     cwd = tmp_path / "repo"
     cwd.mkdir()
     profile = tmp_path / "prof"
     profile.mkdir()
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
-    assert f"{anchors}:{anchors}:ro" in _sandbox_mounts(profile, cwd)
+    mounts = _sandbox_mounts(profile, cwd)
+    assert f"{anchors}:{anchors}:ro" in mounts
+    assert f"{extracted}:{extracted}:ro" in mounts
 
 
 # ---------------------------------------------------------------------------
@@ -1094,6 +1120,34 @@ def test_sandbox_claude_binary_caches_copy(
     assert cached == tmp_path / "data" / "claude-profile" / "claude" / "2.1.220"
     assert cached.read_text() == binary.read_text()
     assert os.access(cached, os.X_OK)  # must still be executable in the VM
+
+
+def test_sandbox_claude_binary_clones_where_the_filesystem_can(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # On btrfs or XFS the copy shares the 256 MB binary's blocks instead of writing them.
+    # tmpfs can't, so the kernel's FICLONE is stood in for here; the copy above falls back.
+    binary = _native_install(tmp_path)
+    monkeypatch.setattr(claude_profile, "_host_claude_binary", lambda: binary)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    clones: list[int] = []
+
+    def ficlone(fd: int, request: int, source_fd: int) -> int:
+        assert request == claude_profile.FICLONE
+        os.write(fd, os.pread(source_fd, 1 << 20, 0))
+        clones.append(fd)
+        return 0
+
+    def no_copy(*args: object) -> None:
+        raise AssertionError("copied although the clone worked")
+
+    monkeypatch.setattr(claude_profile.fcntl, "ioctl", ficlone)
+    monkeypatch.setattr(claude_profile.shutil, "copyfile", no_copy)
+    cached = claude_profile._sandbox_claude_binary()
+    assert clones
+    assert cached is not None
+    assert cached.read_text() == binary.read_text()
+    assert os.access(cached, os.X_OK)
 
 
 def test_sandbox_claude_binary_reuses_existing_copy(
@@ -1400,6 +1454,17 @@ def _env_file_text(argv: list[str]) -> str:
     return Path(argv[argv.index("--env-file") + 1]).read_text()
 
 
+def test_argv_keeps_the_hosts_proxy_settings_out_of_the_vm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # podman passes the host's *_proxy variables into the container by default, a proxy
+    # URL's credentials included; the sandbox forwards only what it is told to.
+    monkeypatch.setenv("https_proxy", "http://user:hunter2@proxy.example:3128")
+    argv = _make_argv(monkeypatch, tmp_path, [])
+    assert "--http-proxy=false" in argv
+    assert not any("hunter2" in arg for arg in argv)
+
+
 def test_argv_passes_env_vars_off_the_command_line(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1608,6 +1673,30 @@ def test_list_shows_sandbox_indicator(profiles_base: Path) -> None:
     result = runner.invoke(app, ["list"])
     assert result.exit_code == 0
     assert "microVM" in result.output
+
+
+def test_list_notes_an_override(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    monkeypatch.setattr(claude_profile.settings, "sandbox", True)
+    out = " ".join(runner.invoke(app, ["list"]).output.split())
+    assert "CLAUDE_PROFILE_SANDBOX" in out
+
+
+def test_list_quiet_without_an_override(profiles_base: Path) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    assert "CLAUDE_PROFILE_SANDBOX" not in runner.invoke(app, ["list"]).output
+
+
+def test_list_counts_a_dangling_marker_link_as_sandboxed(
+    profiles_base: Path, tmp_path: Path
+) -> None:
+    # The launch counts it, failing safe, so the listing must agree.
+    boxed = profiles_base / "boxed"
+    boxed.mkdir(parents=True)
+    (boxed / SANDBOX_MARKER).symlink_to(tmp_path / "gone")
+    assert "microVM" in runner.invoke(app, ["list"]).output
 
 
 # ---------------------------------------------------------------------------
@@ -1863,6 +1952,57 @@ def test_sandbox_on_and_off_exits_1(profiles_base: Path) -> None:
     assert "mutually exclusive" in result.output
 
 
+def test_sandbox_status_names_an_override_that_wins(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # CLAUDE_PROFILE_SANDBOX decides the launch, so the status must say what will happen.
+    p = profiles_base / "work"
+    p.mkdir(parents=True)
+    (p / SANDBOX_MARKER).touch()
+    monkeypatch.setattr(claude_profile.settings, "sandbox", False)
+    out = " ".join(runner.invoke(app, ["sandbox", "work"]).output.split())
+    assert "launches on: host" in out
+    assert "CLAUDE_PROFILE_SANDBOX" in out
+    assert "microVM" in out  # the profile's own setting
+
+
+def test_sandbox_on_notes_an_override_that_keeps_launches_on_the_host(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile.settings, "sandbox", False)
+    result = runner.invoke(app, ["sandbox", "work", "--on"])
+    assert result.exit_code == 0
+    assert "CLAUDE_PROFILE_SANDBOX" in " ".join(result.output.split())
+
+
+def test_sandbox_on_quiet_about_an_override_that_agrees(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile.settings, "sandbox", True)
+    result = runner.invoke(app, ["sandbox", "work", "--on"])
+    assert "CLAUDE_PROFILE_SANDBOX" not in result.output
+
+
+def test_sandbox_on_replaces_a_linked_marker(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # touch() would follow the link and create its target instead.
+    p = profiles_base / "work"
+    p.mkdir(parents=True)
+    target = tmp_path / "elsewhere"
+    (p / SANDBOX_MARKER).symlink_to(target)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    result = runner.invoke(app, ["sandbox", "work", "--on"])
+    assert result.exit_code == 0
+    assert not target.exists()
+    assert (p / SANDBOX_MARKER).is_file()
+    assert not (p / SANDBOX_MARKER).is_symlink()
+
+
 # ---------------------------------------------------------------------------
 # CLAUDE_PROFILE_SANDBOX per-launch override
 # ---------------------------------------------------------------------------
@@ -2074,17 +2214,25 @@ def test_copied_statusline_not_mounted(
     assert _linked_specs(mounts) == []
 
 
-def test_sandbox_mounts_includes_gitconfig(
+def test_sandbox_mounts_a_copy_of_the_gitconfig(
     fake_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    # :z on the user's own file would relabel it for containers; the copy takes the label.
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
-    (fake_home / ".gitconfig").write_text("[user]\n  name = x\n")
+    gitconfig = fake_home / ".gitconfig"
+    gitconfig.write_text("[user]\n  name = x\n")
     profile = tmp_path / "prof"
     profile.mkdir()
     cwd = tmp_path / "work"
     cwd.mkdir()
+    in_vm = Path("/home/appuser/.gitconfig")
     mounts = _sandbox_mounts(profile, cwd)
-    assert f"{fake_home / '.gitconfig'}:/home/appuser/.gitconfig:ro,z" in mounts
+    assert _mount_source(mounts, in_vm, "ro,z").read_text() == "[user]\n  name = x\n"
+    assert not any(str(gitconfig) in spec for spec in mounts)
+    # Each launch copies it again, so host edits reach the next sandbox.
+    gitconfig.write_text("[user]\n  name = y\n")
+    copy = _mount_source(_sandbox_mounts(profile, cwd), in_vm, "ro,z")
+    assert copy.read_text() == "[user]\n  name = y\n"
 
 
 def test_sandbox_mounts_no_gitconfig(
@@ -3959,8 +4107,11 @@ def test_sandbox_mounts_known_hosts_global_ro_and_user_rw(
     cwd = tmp_path / "work"
     cwd.mkdir()
     mounts = _sandbox_mounts(profile, cwd)
-    # host file is the read-only global known_hosts (verification only)
-    assert f"{ssh / 'known_hosts'}:/etc/ssh/ssh_known_hosts:ro,z" in mounts
+    # A copy of the host file is the read-only global known_hosts (verification only); a
+    # copy so that :z relabels ours, not the user's ssh_home_t file.
+    copy = _mount_source(mounts, Path("/etc/ssh/ssh_known_hosts"), "ro,z")
+    assert copy.read_text() == "git.example.org ssh-ed25519 AAAA\n"
+    assert not any(str(ssh) in spec for spec in mounts)
     # per-profile writable user known_hosts persists newly accepted keys
     state = claude_profile._sandbox_state_dir(profile)
     assert f"{state / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z" in mounts
@@ -4048,6 +4199,38 @@ def test_launch_passes_shared_settings_with_the_profile_name(
     assert stop[0]["url"] == "http://127.0.0.1:8080/hook?profile=work"
     assert stop[1]["command"] == "echo work"
     assert argv[-1] == "--resume"
+
+
+SHARED_DENY = {
+    "permissions": {"deny": ["Bash(sudo *)", "Read(~/.ssh/**)", "Bash(rm -rf *)"]}
+}
+
+
+def test_sandbox_launch_strips_host_denies_from_shared_settings(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # deny wins even under --dangerously-skip-permissions, so a shared Bash(sudo *) blocked
+    # the VM's own scoped sudo though the profile's settings.json copy had it stripped.
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / SANDBOX_MARKER).touch()
+    _write_shared(profiles_base, SHARED_DENY)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.chdir(_project(tmp_path))
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    _bin, argv, _env = mock_exec.call_args[0]
+    assert _settings_arg(argv)["permissions"]["deny"] == ["Bash(rm -rf *)"]
+
+
+def test_host_launch_keeps_shared_denies(profiles_base: Path) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    _write_shared(profiles_base, SHARED_DENY)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    _bin, argv, _env = mock_exec.call_args[0]
+    assert _settings_arg(argv) == SHARED_DENY
 
 
 def test_launch_without_shared_settings_passes_none(profiles_base: Path) -> None:
@@ -4181,9 +4364,11 @@ def _repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _mount_source(mounts: list[str], target: Path) -> Path:
-    """The host path a read-write mount puts at target."""
-    [source] = [spec.split(":")[0] for spec in mounts if spec.endswith(f":{target}:z")]
+def _mount_source(mounts: list[str], target: Path, options: str = "z") -> Path:
+    """The host path a mount with these options (read-write by default) puts at target."""
+    [source] = [
+        spec.split(":")[0] for spec in mounts if spec.endswith(f":{target}:{options}")
+    ]
     return Path(source)
 
 
