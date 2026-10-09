@@ -186,6 +186,11 @@ hand.
   made in the VM would run on the host unnoticed. `_local_settings_mounts` gives the VM a copy of
   each one that exists, never read through a link. Where none exists, mounting one would create it
   on the host, so it is left out and the post-session report below flags one the VM creates.
+- **Statusline check:** the VM gets the global `statusline.sh` read-only but can replace the
+  profile's link to it, and claude runs the statusline on every host launch. On host launches of a
+  profile that is marked for the sandbox or has a sandbox state dir (`_was_sandboxed`; the state
+  dir also catches `CLAUDE_PROFILE_SANDBOX=1` launches), `_check_statusline_link` warns unless
+  `statusline.sh` is absent or the link to `~/.claude/statusline.sh`.
 - **Shared settings (`shared-settings.json`):** settings every profile should get (hooks, for
   example) live once in `<profiles_base>/shared-settings.json` instead of being copied into each
   profile's `settings.json`. `_shared_settings_args` loads it at every launch, replaces

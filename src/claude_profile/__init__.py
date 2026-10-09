@@ -1020,9 +1020,14 @@ def _sandbox_state_dir(profile_dir: Path) -> Path:
     in this dir are bind-mounted individually: the VM can change their contents but
     cannot replace them.
     """
-    state = _data_dir() / "profiles" / profile_dir.name
+    state = _sandbox_state_path(profile_dir)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     return state
+
+
+def _sandbox_state_path(profile_dir: Path) -> Path:
+    """Where _sandbox_state_dir keeps a profile's files; it exists once a launch has."""
+    return _data_dir() / "profiles" / profile_dir.name
 
 
 def _sandbox_settings_overlay(profile_dir: Path) -> Path:
@@ -2534,6 +2539,32 @@ def _sandbox_enabled(profile_dir: Path) -> bool:
     return os.path.lexists(profile_dir / SANDBOX_MARKER)
 
 
+def _was_sandboxed(profile_dir: Path) -> bool:
+    """True when the profile is marked for the sandbox or has been launched in one."""
+    marked = os.path.lexists(profile_dir / SANDBOX_MARKER)
+    return marked or _sandbox_state_path(profile_dir).is_dir()
+
+
+def _check_statusline_link(profile_dir: Path) -> None:
+    """Warn when a sandboxed profile's statusline.sh is not the global link `add` makes.
+
+    claude runs the statusline command on the host at every host launch of the profile.
+    The VM cannot change the global script, which it gets read-only, but it sees the
+    profile dir read-write, so it can swap the link for a script of its own.
+    """
+    link = profile_dir / STATUSLINE_FILE
+    if not os.path.lexists(link) or not _was_sandboxed(profile_dir):
+        return
+    expected = Path.home() / ".claude" / STATUSLINE_FILE
+    if link.is_symlink() and Path(os.readlink(link)) == expected:
+        return
+    err_console.print(
+        f"[yellow]Warning: {link} is not the link to {expected} that claude-profile "
+        f"creates. A sandboxed session can replace it, and claude runs it on the host. "
+        f"Check it, then relink it: ln -sfn {expected} {link}[/yellow]"
+    )
+
+
 def _launch_profile(name: str, claude_args: list[str]) -> None:
     d = settings.profiles_base / name
     if not d.exists():
@@ -2546,6 +2577,7 @@ def _launch_profile(name: str, claude_args: list[str]) -> None:
     if _sandbox_enabled(d):
         _launch_sandbox(d, claude_args, extra_env)
         return
+    _check_statusline_link(d)
     shared, _host_loopback = _shared_settings_args(name, claude_args, sandbox=False)
     env = os.environ.copy()
     env["CLAUDE_CONFIG_DIR"] = str(d)
