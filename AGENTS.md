@@ -37,8 +37,10 @@ cluster's default queue, whose agents hold no secrets. To run the hooks by hand:
 prek run --all-files
 ```
 
-ruff enforces the limits below (complexity 8, 100-character lines). Bump hook versions with
-`prek auto-update --cooldown-days 7`, and the dev tools in pyproject's `dev` extra by hand.
+ruff enforces the limits below (complexity 8, 100-character lines), and
+`test_functions_stay_within_the_line_limit` the 100-line function limit. Bump hook versions
+with `prek auto-update --cooldown-days 7`, and the dev tools in pyproject's `dev` extra by
+hand.
 
 ## Architecture
 
@@ -89,7 +91,8 @@ ruff enforces the limits below (complexity 8, 100-character lines). Bump hook ve
   common dir when it lives outside the CWD (so a worktree's `git`/`wt` work), and the
   profile dir at the in-VM config dir. VM sizing uses `krun.ram_mib`/`krun.cpus`
   annotations, not `--memory`/`--cpus`. `TERM`/`COLORTERM` are forwarded with `-e`; the
-  rest of the host environment is not. `.env` vars and forwarded tokens go through
+  rest of the host environment is not, and `--http-proxy=false` stops podman passing the
+  host's `*_proxy` variables (proxy credentials included) in behind the launcher's back. `.env` vars and forwarded tokens go through
   `_secret_env_file`: an unlinked file in the tmpfs `$XDG_RUNTIME_DIR` that podman reads
   as `--env-file /dev/fd/N`, so no value appears in podman's argv (world-readable in
   `/proc/<pid>/cmdline`) or in podman's own environment (where a `.env` written from inside
@@ -102,9 +105,12 @@ ruff enforces the limits below (complexity 8, 100-character lines). Bump hook ve
   image's claude stays in play). `_sandbox_claude_binary` copies it to
   `~/.local/share/claude-profile/claude/<version>` — the mount needs an SELinux `:z`
   relabel and relabelling the user's real install is not ours to do — pruning older
-  versions (a `.partial` copy only once the launch writing it has exited), and `_sandbox_mounts` mounts that copy read-only at `SANDBOX_HOST_CLAUDE`
-  (`/opt/claude-host/claude`). The entrypoint points `~/.local/bin/claude` at it before
-  dropping privileges. The copy happens only when the host updates (version dirs are
+  versions (a `.partial` copy only once the launch writing it has exited). The copy is a reflink
+  where the filesystem can (`_clone_or_copy`: `FICLONE`, falling back to a plain copy), so on
+  btrfs or XFS it shares the binary's blocks rather than writing 244 MiB per update; Python 3.13's
+  `shutil.copy` writes them all. `_sandbox_mounts` mounts that copy read-only at
+  `SANDBOX_HOST_CLAUDE` (`/opt/claude-host/claude`). The entrypoint points `~/.local/bin/claude`
+  at it before dropping privileges. The copy happens only when the host updates (version dirs are
   immutable). `_build_sandbox_argv` also sets `DISABLE_AUTOUPDATER=1` when the mount is
   present: the VM is ephemeral, so an in-VM update would download a release only to
   discard it, and would move the session off the host's version mid-run.
@@ -114,7 +120,8 @@ ruff enforces the limits below (complexity 8, 100-character lines). Bump hook ve
   without exposing the global target writable. Only a link whose target is exactly
   `~/.claude/<name>` is mounted: the profile dir is writable from inside the VM, so a link
   aimed anywhere else may have been planted there to get that host path mounted on the next
-  launch (it is skipped with a warning). `add` symlinks `statusline.sh` rather than
+  launch (it is skipped with a warning, its target passed through `_shown`). `add` symlinks
+  `statusline.sh` rather than
   copying it: settings run `~/.claude/statusline.sh`, which inside the VM is the *profile's*
   file (there `~/.claude` is the profile dir), so a copy silently drifted from the host's
   global script. Mounting the global script straight over that path instead would leave an
@@ -125,8 +132,8 @@ ruff enforces the limits below (complexity 8, 100-character lines). Bump hook ve
   `entrypoint.sh` drops to a host-UID user (`runuser`) before exec'ing claude. Sandbox
   mode adds that flag unless `sandbox_skip_permissions` is false, the user already passed
   it, or the user passed `--permission-mode` (claude ranks the skip flag above it). The
-  sandbox's own flags (this one, `--chrome`, the briefing) go *before* the user's args, so
-  a subcommand's `--` arguments (`mcp add NAME -- CMD`) never pick them up.
+  sandbox's own flags (this one, `--chrome`, the briefing; `_sandbox_claude_args`) go *before*
+  the user's args, so a subcommand's `--` arguments (`mcp add NAME -- CMD`) never pick them up.
 - **Sandbox settings:** `podman_bin`, `sandbox_image`, `sandbox_ram_mib`, `sandbox_cpus`,
   `sandbox_skip_permissions`, `sandbox_ssh_agent`, `sandbox_gpg_agent`, `sandbox_clipboard`,
   `sandbox_chrome`, `sandbox_gh`, `sandbox_infisical`, `sandbox_pulumi`, `sandbox_forward_env`
@@ -153,15 +160,54 @@ ruff enforces the limits below (complexity 8, 100-character lines). Bump hook ve
   guest netstack). Without it libkrun defaults to TSI socket impersonation, whose stubbed
   `setsockopt` reads `SO_REUSEADDR` back as 0 (aborting gRPC) and whose AF_INET interception breaks
   container DNS — see the passt-networking note on `_build_sandbox_argv`.
-- **Sandbox settings overlay:** the profile's `settings.json` is copied from the host and carries
-  host-oriented deny rules; `deny` wins even under `--dangerously-skip-permissions`, so a blanket
-  `Bash(sudo *)` deny blocks the sandbox's own scoped `sudo dnf`/`sudo podman`.
-  `_sandbox_settings_overlay` writes `settings.json` in the profile's state dir (the
-  profile settings with any deny matching `SANDBOX_STRIP_DENY_PREFIXES` — `Bash(sudo`,
-  `Read(~/.ssh`, `Edit(~/.ssh` and `Read(~/.aws` — removed) and `_sandbox_mounts`
-  bind-mounts it over `settings.json` **inside the VM only**, read-write so in-VM setting writes
-  hit the throwaway overlay (regenerated each launch), not the real profile settings. Host launches
-  are untouched and keep the sudo deny.
+- **Sandbox settings overlay:** claude on the host runs the hooks and statusline command in the
+  profile's `settings.json`, so the VM never writes the real file. `_sandbox_settings_overlay`
+  writes a copy to the profile's state dir every launch and `_sandbox_mounts` bind-mounts it over
+  `settings.json` **inside the VM only**, read-write so in-VM setting writes hit the throwaway
+  copy. The copy drops any deny matching `SANDBOX_STRIP_DENY_PREFIXES` (`Bash(sudo`,
+  `Read(~/.ssh`, `Edit(~/.ssh`, `Read(~/.aws`): the profile's rules are host-oriented, `deny`
+  wins even under `--dangerously-skip-permissions`, and a blanket `Bash(sudo *)` deny blocks the
+  sandbox's own scoped `sudo dnf`/`sudo podman`. Host launches keep the sudo deny. A missing
+  `settings.json` is created as `{}` so there is a file to mount over (podman would create an
+  empty one), and a symlinked one is never read through: the VM could have aimed it at another
+  profile's credentials, so the VM gets `{}` and a warning instead. claude's settings writer falls
+  back to an in-place write when its rename fails with EBUSY, as it does onto a file mount, so
+  in-VM settings changes work.
+- **Repo git state:** the work tree and its git dir are mounted read-write, and the host later
+  runs commands from git's config and hooks. `_git_state_mounts` covers the repo's git dir and
+  each submodule's (`_submodule_git_dirs`, nested ones and names with slashes included; links
+  under `modules/` are skipped so one cannot pass off another repo's git dir). Each `config` is
+  mounted read-only over itself, so the VM cannot set `core.fsmonitor`, `core.sshCommand`, an
+  alias or the like, which the host's next git command would run (a shell prompt's `git status`
+  is enough, even while the VM runs). A throwaway copy would not help: git writes config by
+  renaming a lock file over it, and krun refuses a rename onto any file mount with EBUSY, so
+  commands that save config (`push -u`, `branch -u`, `remote add`) cannot save it either way.
+  `push -u` and `branch -u` still exit 0 after printing "could not write config file"; `remote
+  add` fails. `SANDBOX_BRIEFING` tells the agent. `hooks/` becomes a throwaway copy
+  (`_sandbox_hooks_copy`, in the state dir, keyed by the hooks path): the host's hooks still run
+  in the VM and `prek install` works there, each launch starts again from the host's, and links
+  are copied as links so none is followed into the VM. A symlinked `config` or `hooks` is left
+  alone with a warning.
+- **Local project settings:** claude loads hooks from `.claude/settings.local.json` at the work
+  tree root and at the launch dir (`_local_settings_paths`), and git ignores the file, so a change
+  made in the VM would run on the host unnoticed. `_local_settings_mounts` gives the VM a copy of
+  each one that exists, never read through a link. Where none exists, mounting one would create it
+  on the host, so it is left out and the post-session report below flags one the VM creates.
+- **Statusline check:** the VM gets the global `statusline.sh` read-only but can replace the
+  profile's link to it, and claude runs the statusline on every host launch. On host launches of a
+  profile that is marked for the sandbox or has a sandbox state dir (`_was_sandboxed`; the state
+  dir also catches `CLAUDE_PROFILE_SANDBOX=1` launches), `_check_statusline_link` warns unless
+  `statusline.sh` is absent or the link to `~/.claude/statusline.sh`.
+- **Post-session report:** `.claude.json` stays writable from the VM (a copy would lose the
+  session's own state), so supervised launches snapshot what it makes the host run
+  (`_host_trust_state`: MCP server definitions at user and project scope, `enabledMcpjsonServers`
+  approvals, `enableAllProjectMcpServers`, and which `.claude/settings.local.json` files exist)
+  before the VM starts, and `_report_host_trust_changes` lists what was added or changed after it
+  exits. Only additions and changes count: claude writes empty approval lists itself, and
+  removing a server runs nothing. Names only, never command lines or env, which carry tokens; and
+  `_shown` replaces non-printable characters and escapes rich markup, since the names come from
+  the VM and printed raw could drive the terminal (OSC 52, for one, writes the clipboard). Exec
+  launches have no process left to report from.
 - **Shared settings (`shared-settings.json`):** settings every profile should get (hooks, for
   example) live once in `<profiles_base>/shared-settings.json` instead of being copied into each
   profile's `settings.json`. `_shared_settings_args` loads it at every launch, replaces
@@ -169,60 +215,81 @@ ruff enforces the limits below (complexity 8, 100-character lines). Bump hook ve
   `?profile={profile}`), and passes the result as `--settings <json>`; claude merges that over
   the profile's own settings, and hook entries from both run. A user-supplied `--settings`
   wins (the shared file is skipped with a warning), and an unreadable or non-object file fails
-  the launch. In the sandbox, `_rewrite_loopback_hooks` re-points HTTP hooks aimed at
+  the launch. In the sandbox, `_strip_sandbox_denies` drops the same host-oriented denies from it
+  as from the settings.json copy, and `_rewrite_loopback_hooks` re-points HTTP hooks aimed at
   `127.0.0.1`/`localhost` at `SANDBOX_HOST_LOOPBACK`, and `_build_sandbox_argv(host_loopback=…)`
   adds `--map-host-loopback` even when no agent bridge is active — inside the VM, 127.0.0.1 is
   the VM itself, so without both a local hook receiver would silently never
   hear from sandboxed sessions.
+- **Bridge server (`bridges.py`):** everything the VM reaches on the host — agent sockets, the
+  clipboard, the browser-open shim, the Chrome native host — goes through one
+  `bridges.BridgeServer` that `_run_sandbox_supervised` runs inside the launcher: a TCP listener
+  on `127.0.0.1` (ephemeral port), a daemon thread per connection, closed in `finally`. The VM
+  reaches it through `--network=pasta:--map-host-loopback,…`. Loopback is open to every local
+  user, every container on the host network and every other sandbox VM, so each connection must
+  open with `<token> <service>\n`: the token is 32 random bytes per launch, compared with
+  `hmac.compare_digest`, and a wrong token, an unknown service or a client silent for
+  `HANDSHAKE_TIMEOUT` is dropped without a reply. `_bridge_services` maps the launch's
+  `_Forwarding` to services (`ssh-N`/`gpg` → `unix_relay(host_socket)`, plus `clipboard`,
+  `chrome` and `open`), so a service the launch didn't enable doesn't exist. The VM gets the
+  port as `-e CLAUDE_SANDBOX_BRIDGE_PORT` and the token through the secret env file
+  (`_secret_env_file`), never on podman's argv, which every local user can read in `ps`. In the
+  VM, `entrypoint.sh` presents each `CLAUDE_SANDBOX_FORWARDS` socket (`guest_path=service`) with
+  `socat UNIX-LISTEN:…,perm=0600` → `EXEC:bridge-connect <service>`; `bridge-connect`
+  (`/usr/local/libexec/claude-sandbox/`) opens the connection with bash `/dev/tcp`, sends the
+  handshake and relays with `socat - FD:3`. The `wl-paste` and `google-chrome` shims send the
+  handshake themselves. The host needs no socat. Because the server lives in the launcher,
+  bridged launches supervise podman (`_run_sandbox_supervised`) instead of `execvpe`. While it
+  waits, SIGTERM and SIGHUP are passed on to podman (`_wait_forwarding_signals`) rather than
+  killing the launcher, which would leave the VM running without its bridges.
 - **SSH agent forwarding (`sandbox_ssh_agent`):** a microVM can't bind-mount the agent
   socket (separate kernel), so `_ssh_agent_sockets()` probes the candidates (the active
   `SSH_AUTH_SOCK` agent + 1Password) with `ssh-add -l`, drops dead ones (a stale socket
   whose agent doesn't answer would surface in-VM as "communication with agent failed") and
-  orders keyed agents first so the VM's `SSH_AUTH_SOCK` holds keys. `_start_host_bridge()`
-  runs a host `socat` (TCP on 127.0.0.1 → the agent socket), and
-  `--network=pasta:--map-host-loopback,…` lets the guest reach it; `entrypoint.sh` starts a
-  guest `socat` per forward and sets `SSH_AUTH_SOCK`. The guest sockets live in
-  `SANDBOX_AGENT_DIR` (`/run/claude-sandbox/ssh-agent-N.sock`), not at the host's path: the
-  entrypoint chowns each socket's parent dir, and when the host socket sits directly in
-  `/run/user/<uid>` that made gpg move its socket dir there and miss the GPG bridge. Because the bridges need teardown,
-  this path supervises podman (`_run_sandbox_supervised`) instead of `execvpe`. While it
-  waits, SIGTERM and SIGHUP are passed on to podman (`_wait_forwarding_signals`) rather than
-  killing the launcher, so the teardown still runs when the terminal window is closed.
-- **known_hosts persistence:** `_sandbox_mounts` mounts the host's `~/.ssh/known_hosts`
-  read-only as the VM's *global* known_hosts (`/etc/ssh/ssh_known_hosts`, for verification)
+  orders keyed agents first so the VM's `SSH_AUTH_SOCK` holds keys. Each live agent becomes a
+  bridge service (`ssh-0`, `ssh-1`, …) and the entrypoint sets `SSH_AUTH_SOCK` to the first.
+  The guest sockets live in `SANDBOX_AGENT_DIR` (`/run/claude-sandbox/ssh-agent-N.sock`), not
+  at the host's path: the entrypoint chowns each socket's parent dir, and when the host socket
+  sits directly in `/run/user/<uid>` that made gpg move its socket dir there and miss the GPG
+  bridge.
+- **known_hosts persistence:** `_sandbox_mounts` mounts a copy of the host's `~/.ssh/known_hosts`
+  (`_host_file_copy`, refreshed every launch: `:z` on the real file would relabel it from
+  `ssh_home_t` for containers) read-only as the VM's *global* known_hosts
+  (`/etc/ssh/ssh_known_hosts`, for verification)
   and a per-profile writable `known_hosts` (`_sandbox_known_hosts`, in the state dir) as the
   *user* file, so
   ssh records newly accepted host keys there and they persist across launches — the host's
   real file is never written by the sandbox.
-- **GPG agent forwarding (`sandbox_gpg_agent`):** same bridge, forwarding the host
-  gpg-agent restricted socket (`gpgconf --list-dirs agent-extra-socket`) to the in-VM
+- **GPG agent forwarding (`sandbox_gpg_agent`):** the bridge's `gpg` service, forwarding the
+  host gpg-agent restricted socket (`gpgconf --list-dirs agent-extra-socket`) to the in-VM
   `GNUPGHOME/S.gpg-agent` and seeding a fresh GNUPGHOME with the host's public keys
   (`gpg --export`, written to the data dir and mounted read-only at `SANDBOX_GPG_PUBKEYS` by
   `_gpg_pubkeys_mounts`, imported by `entrypoint.sh`; a file because a keyring easily
   outgrows the 128 KiB Linux allows one env string). Signing runs on the host,
-  so secret keys/smartcard never enter the VM. `_sandbox_mounts` also bind-mounts
-  `~/.gitconfig` read-only so signing config applies. Its `include`/`includeIf` files are not
+  so secret keys/smartcard never enter the VM. `_sandbox_mounts` also bind-mounts a copy of
+  `~/.gitconfig` (`_host_file_copy`, for the same relabelling reason) read-only so signing
+  config applies. Its `include`/`includeIf` files are not
   mounted, and a `gitdir:~/` condition could not match in the VM anyway (`~` is
   /home/appuser there), so `_git_identity_mounts` resolves `GIT_IDENTITY_KEYS` for the CWD on
   the host, writes them to a file in the data dir that first includes the mounted
   `~/.gitconfig`, mounts it and points `GIT_CONFIG_GLOBAL` at it, so the values act as global
   config and a repo's own config still wins. `GIT_SIGNING_KEYS` join only when GPG is
   forwarded (`_Forwarding.gpg()`) and `gpg.format` is openpgp. `_Forwarding` carries
-  `(host_socket, guest_path, port)` tuples shared by both SSH and GPG plus a
-  `clipboard_port` for the clipboard bridge; `active()` reports whether any host bridge is
-  needed. The in-VM env (`CLAUDE_SANDBOX_FORWARDS`, `SSH_AUTH_SOCK`, `GNUPGHOME`,
-  `CLAUDE_SANDBOX_GPG_PUBKEYS_FILE`, `CLAUDE_SANDBOX_CLIPBOARD_PORT`) is built by
-  `_forwarding_env`.
+  `(host_socket, guest_path, service)` tuples shared by both SSH and GPG plus `clipboard` and
+  `chrome` flags; `active()` reports whether the launch needs the bridge server. The in-VM env
+  (`CLAUDE_SANDBOX_FORWARDS`, `SSH_AUTH_SOCK`, `GNUPGHOME`, `CLAUDE_SANDBOX_GPG_PUBKEYS_FILE`)
+  is built by `_forwarding_env`.
   The seeded GNUPGHOME also gets a `gpg.conf` carrying **`no-autostart`**, without which the
   forward dies partway through long sessions: `S.gpg-agent` in the VM is the bridge socket, not
   an agent, so any moment the host end is unreachable (the host gpg-agent restarting is enough)
   makes a request over it return EOF, and gpg's default autostart answers EOF by launching a
-  local agent that unlinks the bridge socket and binds its own. socat keeps listening on the
-  orphaned inode, so every later gpg call silently reaches the local keyless agent and signing
-  stays broken even after the host recovers. `no-autostart` turns that into a plain transient
-  failure the next call recovers from — the host-side socat re-resolves the agent path per
-  connection, so it already picks up a restarted agent on its own. (`gpg-connect-agent` reads no
-  options file and still autostarts; pass it `--no-autostart` when poking at the agent by hand.)
+  local agent that unlinks the bridge socket and binds its own. The guest socat keeps listening
+  on the orphaned inode, so every later gpg call silently reaches the local keyless agent and
+  signing stays broken even after the host recovers. `no-autostart` turns that into a plain
+  transient failure the next call recovers from — the host side (`bridges.unix_relay`) opens the
+  agent socket afresh for each connection, so it already picks up a restarted agent on its own.
+  (`gpg-connect-agent` reads no options file and still autostarts; pass it `--no-autostart` when
+  poking at the agent by hand.)
   The other way the forward goes missing is at launch: gpgconf reports the extra-socket path
   whether or not an agent is running, but the socket only exists while one is, and nothing says
   the host has used gpg yet this login. `_gpg_extra_socket` therefore runs `gpgconf --launch
@@ -233,13 +300,13 @@ ruff enforces the limits below (complexity 8, 100-character lines). Bump hook ve
   shelling out to `wl-paste`/`xclip`, but the microVM has no display. Rather than forward the
   whole Wayland compositor (waypipe would also hand the sandbox screen capture and keystroke
   injection — a practical escape), a scoped bridge carries only clipboard bytes: an in-VM
-  `wl-paste` shim (`src/claude_profile/sandbox/wl-paste`) relays its args over pasta to a host
-  `socat` that execs `clipboard_host.sh`, which whitelists read-only `wl-paste` invocations and
-  streams the bytes back. `_build_forwarding` allocates the port, `_forwarding_env` exports it as
-  `CLAUDE_SANDBOX_CLIPBOARD_PORT`, and `_start_clipboard_host_bridge` (started/torn down by
-  `_run_sandbox_supervised`, which also verifies the host has `wl-paste`) serves it. Read-only:
-  the sandbox reads the clipboard but cannot write it or reach any other Wayland protocol. No
-  entrypoint or image-package changes — the shim is inert unless the port env is set.
+  `wl-paste` shim (`src/claude_profile/sandbox/wl-paste`) sends its args to the bridge's
+  `clipboard` service (`bridges.clipboard`), which runs only read-only `wl-paste` invocations
+  (`CLIPBOARD_FLAGS`, `CLIPBOARD_TYPE_PREFIXES`) and replies with a status line — `OK` then the
+  bytes, or `ERR …`, on which the shim exits non-zero as `wl-paste` would. `_run_sandbox_supervised`
+  checks the host has `wl-paste` first. Read-only: the sandbox reads the clipboard but cannot
+  write it or reach any other Wayland protocol. The shim is inert unless the launch enabled the
+  service.
 - **Claude in Chrome bridge (`sandbox_chrome`):** the `mcp__claude-in-chrome__*` tools drive a
   browser through a native host Chrome spawns on the host (`claude --chrome-native-host`, wired via
   the `com.anthropic.claude_code_browser_extension` native-messaging manifest). That native host
@@ -249,32 +316,30 @@ ruff enforces the limits below (complexity 8, 100-character lines). Bump hook ve
   throws "Insecure socket permissions (expected 0600)" and reports the extension as "Not detected"
   otherwise — which is why the real native host binds its socket `srw-------`). The microVM has its own
   kernel, so it can't reach the host socket directly. Discovery is inverted vs. the ssh/gpg bridges
-  (guest connects, not the host), so the entrypoint presents a guest-side socket: it creates
-  `/tmp/claude-mcp-browser-bridge-$(id -un)` (the VM user is `appuser`) at mode `0700` and
-  `socat UNIX-LISTEN … host.sock,perm=0600` → `TCP:host.containers.internal:$port`
-  over pasta, waiting for the socket to bind before exec'ing claude (claude scans at startup). On the
-  host, `_start_browser_host_bridge` runs `socat TCP-LISTEN:$port … EXEC:python3 browser_bridge_host.py`;
-  the proxy picks the **newest** live native-host socket per connection and relays the framed messages,
-  so the bridge follows Chrome across native-host restarts (its pid changes each spawn) and claude's
-  reconnect loop self-heals if Chrome starts after the VM. Like claude's own client, the proxy
-  uses the bridge dir only when it is a real directory owned by the user with no group/other
-  permissions, so another local user can't plant a socket there. `_build_forwarding` allocates the port
-  (warning if no native host is currently listening), `_forwarding_env` exports
-  `CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT`, and `_run_sandbox_supervised` starts/tears down the host bridge.
-  Nothing but the framed native-messaging relay crosses the boundary — the host filesystem and other
-  browser state stay out of the VM.
-- **Service-worker keepalive (`browser_bridge_host.py`):** Chrome's MV3 service worker goes idle after
+  (guest connects, not the host), so the guest presents the socket: `_forwarding_env` adds
+  `SANDBOX_CHROME_SOCKET` (`/tmp/claude-mcp-browser-bridge-appuser/host.sock`, the VM user being
+  `appuser`) to `CLAUDE_SANDBOX_FORWARDS` as the `chrome` service, and the entrypoint binds it at
+  mode `0600` in a `0700` dir before exec'ing claude (claude scans at startup). On the host, the
+  bridge's `chrome` service (`bridges.chrome_relay`) picks the **newest** live native-host socket
+  per connection and relays the framed messages, so the bridge follows Chrome across native-host
+  restarts (its pid changes each spawn) and claude's reconnect loop self-heals if Chrome starts
+  after the VM. Like claude's own client, it uses the socket dir only when it is a real directory
+  owned by the user with no group/other permissions, so another local user can't plant a socket
+  there. `_build_forwarding` warns if no native host is listening yet. Nothing but the framed
+  native-messaging relay crosses the boundary — the host filesystem and other browser state stay
+  out of the VM.
+- **Service-worker keepalive (`bridges._ChromeRelay`):** Chrome's MV3 service worker goes idle after
   ~30s, which closes the native-messaging port and kills the native host, so browser tools break after
   any idle gap (upstream anthropics/claude-code #16350, #61347 — the keepalive fix requests were
-  stale-closed unfixed). The bridge is a Python proxy rather than a dumb socat relay so it can work
-  around this: the native host is a transparent bridge to the extension service worker (reading the
-  extension's `service-worker.ts` shows every native message hits its `onMessage` handler — an
-  `execute_tool` runs a real browser tool, any other method round-trips as
+  stale-closed unfixed). The `chrome` service parses frames rather than copying bytes so it can
+  work around this: the native host is a transparent bridge to the extension service worker
+  (reading the extension's `service-worker.ts` shows every native message hits its `onMessage`
+  handler — an `execute_tool` runs a real browser tool, any other method round-trips as
   `{"result":{"content":"Unknown method: X"}}` **from the service worker**), and processing an event
-  resets the MV3 idle timer. So during idle gaps (>20s of no traffic) the proxy injects a keepalive
+  resets the MV3 idle timer. So during idle gaps (>20s of no traffic) the relay injects a keepalive
   whose method name is distinctive; the service worker echoes that name back in its "Unknown method"
-  reply, which lets the proxy swallow its own keepalive responses so the in-VM claude never sees them.
-  Verified end-to-end: the native host survives 100s+ of idle through the proxy (vs ~30s bare). This
+  reply, which lets the relay swallow its own keepalive responses so the in-VM claude never sees them.
+  Verified end-to-end: the native host survives 100s+ of idle through the relay (vs ~30s bare). This
   makes the sandbox's browser connection *more* reliable than a plain host session, which has no
   keepalive.
   The native host only exists while Chrome's extension holds its native-messaging port; that spawn is
@@ -285,15 +350,14 @@ ruff enforces the limits below (complexity 8, 100-character lines). Bump hook ve
   host native host, and the VM has no browser to open the connect/reconnect page that wakes the
   extension. Claude Code detects a browser with `which google-chrome` and opens URLs by running
   `google-chrome <url>`, so the image ships a `google-chrome` shim (+ `google-chrome-stable` symlink)
-  at `/usr/local/bin` (`src/claude_profile/sandbox/google-chrome`) that relays the URL over pasta
-  (bash `/dev/tcp`, no guest socat) to a second host bridge. `_start_browser_open_host_bridge` runs
-  `socat TCP-LISTEN:$port … EXEC:bash browser_open_host.sh`, which opens the URL in the host's real
-  Chrome **only** for Anthropic's `clau.de`/`claude.ai` `/chrome` URLs (so a misbehaving sandbox can't
-  open arbitrary pages in the host's logged-in browser), and acks `OK`/`NO`. `sandbox_chrome` allocates
-  both ports; `_forwarding_env` exports `CLAUDE_SANDBOX_BROWSER_OPEN_PORT` (the shim is inert without
-  it, so browser detection stays harmless when disabled). Net effect: `/chrome` → "Reconnect extension"
-  inside the sandbox opens the page in host Chrome, waking the extension so it spawns the native host
-  the socket bridge then relays to.
+  at `/usr/local/bin` (`src/claude_profile/sandbox/google-chrome`) that sends the URL (bash
+  `/dev/tcp`) to the bridge's `open` service (`bridges.browser_open`). It opens the URL in the
+  host's real Chrome **only** when `chrome_page_allowed` passes it — https, host `clau.de` or
+  `claude.ai`, path `/chrome` or below, no credentials or port — so a misbehaving sandbox can't
+  open arbitrary pages in the host's logged-in browser, and acks `OK`/`NO`. The server offers
+  `open` only with `sandbox_chrome`, so browser detection stays harmless when it is disabled. Net
+  effect: `/chrome` → "Reconnect extension" inside the sandbox opens the page in host Chrome,
+  waking the extension so it spawns the native host the `chrome` service then relays to.
 - **Chrome enablement gates (why it says "Disabled"):** claude gates Claude in Chrome behind
   several checks, in this order: an **OAuth scope** check (`KYn()` — the token must carry one of
   `user:profile`/`user:office`/`user:ccr_inference`), then the `--chrome` flag, then
@@ -376,18 +440,22 @@ ruff enforces the limits below (complexity 8, 100-character lines). Bump hook ve
   by every project under that directory. `_mcp_container_images` reads them too, so a container
   server declared there is cacheable by `sandbox-cache` rather than re-pulled every launch.
 - **Host CA trust (`_ca_trust_mounts`):** the image ships only public roots, so anything served by a
-  private CA (internal registries, git remotes, APIs) fails TLS in the VM. The host's custom anchors
-  (`SANDBOX_CA_ANCHORS`, `/etc/pki/ca-trust/source/anchors`) are bind-mounted at the same path — the
-  only place `update-ca-trust` reads, and empty in the image, so the mount masks nothing. Uniquely
-  among the mounts it uses plain `:ro` with **no `:z`**: relabelling is for paths the container
-  writes, SELinux already lets containers read `cert_t`, and `:z` would relabel a root-owned system
-  dir out from under the host's own TLS clients (and fail outright for a rootless podman that cannot
-  chcon it). Anchors are inert source material, so `entrypoint.sh` runs `update-ca-trust extract` as
-  root to regenerate the bundles curl/git/openssl consume. Node and Python ignore the system store
-  entirely, which would leave `npx` MCP servers still failing, so after dropping privileges the
-  entrypoint points `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` at the extracted
-  bundle (image roots plus the host's); an explicitly forwarded value wins. No-op when the host has
-  no custom anchors.
+  private CA (internal registries, git remotes, APIs) fails TLS in the VM. When the host has custom
+  anchors (`SANDBOX_CA_ANCHORS`, `/etc/pki/ca-trust/source/anchors`), the launcher mounts them and
+  the host's extracted bundles (`SANDBOX_CA_EXTRACTED`, `/etc/pki/ca-trust/extracted`: its system
+  roots merged with those anchors by its own `update-ca-trust`) at the same paths, so the bundles'
+  relative links and every path the image's tools use (`/etc/pki/tls/cert.pem`, `ca-bundle.crt`)
+  resolve to the host's trust store. Running `update-ca-trust extract` in the VM instead took
+  about 7 s of every launch (boot to exit fell from 13.7 s to 4.6 s on a host with six anchors).
+  Anchors with no extracted dir trust nothing, so that case warns and mounts neither. Uniquely
+  among the mounts these use plain `:ro` with **no `:z`**: relabelling is for paths the container
+  writes, SELinux already lets containers read `cert_t`, and `:z` would relabel root-owned system
+  dirs out from under the host's own TLS clients (and fail outright for a rootless podman that
+  cannot chcon them). Node and Python ignore the system store entirely, which would leave `npx` MCP
+  servers still failing, so after dropping privileges the entrypoint points
+  `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` at the extracted bundle when the
+  anchors are mounted; an explicitly forwarded value wins. No-op when the host has no custom
+  anchors.
 - **MCP image cache (`sandbox-cache`):** container MCP images would be re-pulled every launch (the
   VM is ephemeral). `claude-profile sandbox-cache <name>` discovers the podman/docker MCP images from
   the profile's `.claude.json` and any ancestor `.mcp.json` (`_mcp_container_images`), pulls them
@@ -407,7 +475,11 @@ ruff enforces the limits below (complexity 8, 100-character lines). Bump hook ve
 - **`sandbox` subcommand & override:** `sandbox <name> --on/--off` toggles the `.sandbox`
   marker on an existing profile (shows status when no flag). `_sandbox_enabled()` decides
   per launch: the `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state
-  `Optional[bool]`) wins when set, otherwise the marker.
+  `bool | None`) wins when set, otherwise the marker (`_sandbox_marked`, which uses `lexists`
+  so a dangling marker link counts, failing safe). The status, `--on`/`--off` and `list` print
+  `_sandbox_override_note` while the override is set, or they would show the marker while
+  launches did something else; `list` and `_was_sandboxed` read the marker the same way the
+  launch does. `--on` replaces a linked marker rather than `touch` its target.
 
 ## Conventions
 

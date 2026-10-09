@@ -1,8 +1,10 @@
 # Sandbox image for `claude-profile` microVM mode (podman + krun runtime).
 # Build with: claude-profile build
 # Extend this file for project-specific tooling, then rebuild.
-# Tool versions and the base image are pinned; bump them deliberately.
-FROM registry.fedoraproject.org/fedora:44@sha256:b0b2ac1c4a682dea428ae05a0065824178ad951c304c3ac15c29daa8335e0599
+# Tool versions and the base image are pinned; bump them deliberately (the tag and the
+# digest together).
+ARG FEDORA_DIGEST=sha256:b0b2ac1c4a682dea428ae05a0065824178ad951c304c3ac15c29daa8335e0599
+FROM registry.fedoraproject.org/fedora:44@${FEDORA_DIGEST}
 
 RUN dnf install -y \
       git gh ripgrep fd-find jq yq less ca-certificates openssh-clients socat \
@@ -50,7 +52,11 @@ RUN useradd -m -u 1000 -U appuser \
 # back a native overlay ("upper fs missing required features"), and vfs copies every
 # layer. fuse-overlayfs gives real layered storage on any backing filesystem.
 RUN mkdir -p /etc/containers \
-    && printf '[storage]\ndriver = "overlay"\n[storage.options.overlay]\nmount_program = "/usr/bin/fuse-overlayfs"\n' \
+    && printf '%s\n' \
+       '[storage]' \
+       'driver = "overlay"' \
+       '[storage.options.overlay]' \
+       'mount_program = "/usr/bin/fuse-overlayfs"' \
        > /etc/containers/storage.conf
 
 # Route `podman` through rootful sudo inside the VM (see the wrapper script header).
@@ -76,20 +82,23 @@ USER root
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Connects each client of a forwarded socket to the host's bridge server with this
+# launch's token (see entrypoint.sh and claude_profile.bridges).
+COPY bridge-connect /usr/local/libexec/claude-sandbox/bridge-connect
+RUN chmod +x /usr/local/libexec/claude-sandbox/bridge-connect
+
 # Clipboard shim: Claude Code reads pasted images by shelling out to `wl-paste`.
-# The VM has no display, so this shim relays the request to the host clipboard
-# bridge (see claude_profile._start_clipboard_host_bridge). It is inert unless
-# CLAUDE_SANDBOX_CLIPBOARD_PORT is set, so it is harmless when clipboard
-# forwarding is disabled.
+# The VM has no display, so this shim relays the request to the bridge server's
+# clipboard service (see claude_profile.bridges). It is inert unless the launch
+# enabled clipboard forwarding.
 COPY wl-paste /usr/local/bin/wl-paste
 RUN chmod +x /usr/local/bin/wl-paste
 
 # Browser-open shim: Claude Code's Chrome integration detects a browser via
 # `which google-chrome` and opens its extension connect/reconnect page by running
 # `google-chrome <url>`. The VM has no browser, so this shim relays the URL to the
-# host browser-open bridge (see claude_profile._start_browser_open_host_bridge),
-# which opens it in the real Chrome to wake the extension. Inert unless
-# CLAUDE_SANDBOX_BROWSER_OPEN_PORT is set.
+# bridge server's open service (see claude_profile.bridges), which opens it in the
+# real Chrome to wake the extension. Inert unless the launch enabled Chrome forwarding.
 COPY google-chrome /usr/local/bin/google-chrome
 RUN chmod +x /usr/local/bin/google-chrome \
     && ln -sf google-chrome /usr/local/bin/google-chrome-stable

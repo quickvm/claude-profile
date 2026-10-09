@@ -4,12 +4,13 @@
 # `which google-chrome` and opens its connect/reconnect page (e.g.
 # https://clau.de/chrome/reconnect) by running `google-chrome <url>` — that page wakes
 # the host extension so it spawns the native host the socket bridge relays to. The VM
-# has no browser, so this relays the URL to the host browser-open bridge
-# (claude_profile._start_browser_open_host_bridge) over pasta, and the host opens it in
-# the real Chrome. Inert (exits non-zero) when the bridge is not configured, so browser
-# detection still works but opening is a no-op.
-port="${CLAUDE_SANDBOX_BROWSER_OPEN_PORT:-}"
-[ -n "$port" ] || exit 1
+# has no browser, so this relays the URL over pasta to the bridge server's open service
+# (claude_profile.bridges), and the host opens it in the real Chrome. Inert (exits
+# non-zero) when there is no bridge or the launch did not enable Chrome forwarding, so
+# browser detection still works but opening is a no-op.
+port="${CLAUDE_SANDBOX_BRIDGE_PORT:-}"
+token="${CLAUDE_SANDBOX_BRIDGE_TOKEN:-}"
+[ -n "$port" ] && [ -n "$token" ] || exit 1
 
 url=""
 for arg in "$@"; do
@@ -22,9 +23,9 @@ for arg in "$@"; do
 done
 [ -n "$url" ] || exit 0
 
-# Use bash's /dev/tcp so no socat is needed in the guest. Send the URL, read the
-# host's ack, and exit success only when the host confirms it opened the page.
+# Send the token, the service and the URL, read the host's ack, and exit success
+# only when the host confirms it opened the page.
 exec 3<>"/dev/tcp/host.containers.internal/${port}" 2>/dev/null || exit 1
-printf '%s\n' "$url" >&3
+printf '%s open\n%s\n' "$token" "$url" >&3
 IFS= read -r ack <&3 2>/dev/null || true
 [ "$ack" = "OK" ]

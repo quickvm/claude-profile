@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Sandbox clipboard shim, installed as `wl-paste` inside the microVM. Claude Code
 # shells out to `wl-paste` to read the clipboard, but the VM has no display, so we
-# relay the requested arguments to the host clipboard bridge over the pasta network
-# and print whatever bytes come back. When the bridge is not configured (clipboard
-# forwarding disabled) this exits non-zero so Claude Code proceeds as if there were
-# no clipboard tool at all.
-port="${CLAUDE_SANDBOX_CLIPBOARD_PORT:-}"
-[ -n "$port" ] || exit 1
+# relay the requested arguments to the host's bridge server over the pasta network
+# and print the bytes that come back. It exits non-zero when wl-paste would: when the
+# host refuses or wl-paste fails there (an empty clipboard, say), and when there is no
+# bridge or the launch did not enable clipboard forwarding, so Claude Code proceeds as
+# if there were nothing to paste.
+port="${CLAUDE_SANDBOX_BRIDGE_PORT:-}"
+token="${CLAUDE_SANDBOX_BRIDGE_TOKEN:-}"
+[ -n "$port" ] && [ -n "$token" ] || exit 1
 
-# Use bash's /dev/tcp, not `printf | socat`: closing the write side right after the
-# request makes the host-side socat hit its short default timeout and truncate large
-# images mid-stream. Keeping fd 3 open until the host closes it streams the full
-# response regardless of size.
+# bash's /dev/tcp keeps the connection open until the host has sent everything, so
+# large images arrive whole. The reply is a status line, then (after OK) the bytes.
 exec 3<>"/dev/tcp/host.containers.internal/${port}" 2>/dev/null || exit 1
-printf '%s\n' "$*" >&3
+printf '%s clipboard\n%s\n' "$token" "$*" >&3
+IFS= read -r status <&3 || exit 1
+[ "$status" = OK ] || exit 1
 cat <&3

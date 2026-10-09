@@ -34,7 +34,10 @@ repos:
         types: [text]
         files: >
           (?x)^(
-            src/claude_profile/(.*\.sh|sandbox/(wl-paste|google-chrome|podman-wrapper))|
+            src/claude_profile/(
+              .*\.sh|
+              sandbox/(wl-paste|google-chrome|podman-wrapper|bridge-connect)
+            )|
             \.buildkite/run
           )$
   - repo: https://github.com/gitleaks/gitleaks

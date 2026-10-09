@@ -28,57 +28,43 @@ if [ "$(id -u)" = "0" ]; then
   if [ -x /opt/claude-host/claude ]; then
     ln -sf /opt/claude-host/claude /home/appuser/.local/bin/claude
   fi
-  # claude-profile bind-mounts the host's custom CA anchors over the image's (empty)
-  # anchor dir. Anchors are only source material: nothing reads them until
-  # update-ca-trust regenerates the extracted bundles that curl/git/openssl consume.
-  if [ -n "$(ls -A /etc/pki/ca-trust/source/anchors 2>/dev/null)" ]; then
-    update-ca-trust extract ||
-      echo "warning: update-ca-trust failed; the host's CAs are not trusted" >&2
-  fi
-  # Agent socket paths live under root-owned trees (e.g. /run/user/..., the in-VM
-  # GNUPGHOME); create and hand their parents to the host user before dropping.
+  # Forwarded sockets live under root-owned trees (/run/claude-sandbox, the in-VM
+  # GNUPGHOME, claude's /tmp scan dir); create their parents, private to the host user,
+  # before dropping. claude refuses its Chrome socket's dir unless it is mode 0700.
   if [ -n "$CLAUDE_SANDBOX_FORWARDS" ]; then
     IFS=',' read -ra _forwards <<<"$CLAUDE_SANDBOX_FORWARDS"
     for _fwd in "${_forwards[@]}"; do
       _dir="$(dirname "${_fwd%=*}")"
-      [ -n "$_dir" ] && mkdir -p "$_dir" && chown "$HOST_UID:$HOST_GID" "$_dir"
+      [ -n "$_dir" ] && mkdir -p "$_dir" && chown "$HOST_UID:$HOST_GID" "$_dir" &&
+        chmod 700 "$_dir"
     done
   fi
   # Re-exec self as the host user so the agent bridges below run as that user.
   exec runuser -u appuser -- "$0" "$@"
 fi
 
-# Bridge each forwarded agent: a guest socket that relays to the host's socat over
-# pasta (CLAUDE_SANDBOX_FORWARDS = "guest_path=port,guest_path=port").
+# Present each forwarded socket (CLAUDE_SANDBOX_FORWARDS = "guest_path=service,...":
+# an SSH or GPG agent, or claude's Chrome native host). Every client connection runs
+# bridge-connect, which reaches the host's bridge server over pasta with this launch's
+# token. Sockets are mode 0600, as claude requires of the Chrome one.
 if [ -n "$CLAUDE_SANDBOX_FORWARDS" ]; then
   IFS=',' read -ra _forwards <<<"$CLAUDE_SANDBOX_FORWARDS"
   for _fwd in "${_forwards[@]}"; do
     _path="${_fwd%=*}"
-    _port="${_fwd##*=}"
-    [ -n "$_path" ] && [ -n "$_port" ] || continue
-    socat "UNIX-LISTEN:${_path},fork,unlink-early" \
-      "TCP:host.containers.internal:${_port}" &
+    _service="${_fwd##*=}"
+    [ -n "$_path" ] && [ -n "$_service" ] || continue
+    socat "UNIX-LISTEN:${_path},fork,unlink-early,perm=0600" \
+      "EXEC:/usr/local/libexec/claude-sandbox/bridge-connect ${_service}" &
   done
-fi
-
-# Claude in Chrome bridge: claude scans /tmp/claude-mcp-browser-bridge-<user> for a
-# native-host socket and connects out to it. Present one there that relays over pasta
-# to the host bridge (claude_profile._start_browser_host_bridge). claude's
-# validateSocketSecurity requires the dir be mode 0700 owned by the user AND the socket
-# itself be mode 0600 (it rejects and reports "not detected" otherwise), so create the
-# dir 0700 and pass perm=0600 to socat. claude scans at startup, so bind before exec.
-if [ -n "$CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT" ]; then
-  _bdir="/tmp/claude-mcp-browser-bridge-$(id -un)"
-  mkdir -p "$_bdir"
-  chmod 700 "$_bdir"
-  socat "UNIX-LISTEN:${_bdir}/host.sock,fork,unlink-early,perm=0600" \
-    "TCP:host.containers.internal:${CLAUDE_SANDBOX_BROWSER_BRIDGE_PORT}" &
-  _tries=0
-  while [ ! -S "${_bdir}/host.sock" ] && [ "$_tries" -lt 50 ]; do
-    sleep 0.1
-    _tries=$((_tries + 1))
+  # claude scans for the Chrome socket at startup, and git may sign straight away, so
+  # wait for every socket to be bound before exec'ing.
+  for _fwd in "${_forwards[@]}"; do
+    _tries=0
+    while [ ! -S "${_fwd%=*}" ] && [ "$_tries" -lt 50 ]; do
+      sleep 0.1
+      _tries=$((_tries + 1))
+    done
   done
-
 fi
 
 # claude reports "Extension: Installed" by readdir'ing
@@ -92,10 +78,12 @@ if [ -n "$CLAUDE_SANDBOX_CHROME_EXT_PATH" ]; then
   mkdir -p "$CLAUDE_SANDBOX_CHROME_EXT_PATH"
 fi
 
-# Node and Python ship their own CA bundles and ignore the system trust store, so the
-# anchors extracted above would still leave `npx` MCP servers and agent scripts failing
-# TLS against internal hosts. Point each at the extracted bundle, which carries the
-# image's public CAs plus the host's. An explicitly forwarded value wins.
+# When the host has custom CA anchors, claude-profile mounts them and the host's
+# extracted bundles (its public roots plus those anchors) over the image's, so
+# curl/git/openssl trust internal hosts with no update-ca-trust here. Node and Python
+# ship their own CA bundles and ignore the system trust store, which would still leave
+# `npx` MCP servers and agent scripts failing TLS against internal hosts, so point each
+# at the extracted bundle. An explicitly forwarded value wins.
 _ca_bundle=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
 if [ -n "$(ls -A /etc/pki/ca-trust/source/anchors 2>/dev/null)" ] && [ -f "$_ca_bundle" ]; then
   export NODE_EXTRA_CA_CERTS="${NODE_EXTRA_CA_CERTS:-$_ca_bundle}"
