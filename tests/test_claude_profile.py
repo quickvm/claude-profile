@@ -11,15 +11,15 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Generator
 from pathlib import Path
-from typing import Any, Generator, Optional
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
 from typer.testing import CliRunner
 
 import claude_profile
-from claude_profile import browser_bridge_host
 from claude_profile import (
     SANDBOX_MARKER,
     SKIP_PERMISSIONS_FLAG,
@@ -30,6 +30,7 @@ from claude_profile import (
     _sandbox_image_user,
     _sandbox_mounts,
     app,
+    browser_bridge_host,
     main,
 )
 
@@ -78,6 +79,10 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     # A podman nobody can find, so a launch that a test forgot to stub fails fast
     # instead of booting a real microVM on the developer's machine.
     monkeypatch.setattr(claude_profile.settings, "podman_bin", "podman-stub-me")
+    # git exports GIT_INDEX_FILE and friends to hooks, and prek runs these tests from
+    # one; inherited, they would point the tests' own git calls at this repo.
+    for name in [name for name in os.environ if name.startswith("GIT_")]:
+        monkeypatch.delenv(name)
     # Keep launches away from the developer's real claude-profile data dir: its MCP
     # image store would add mounts, and launches write files there.
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
@@ -1379,7 +1384,9 @@ def test_argv_env_file_has_no_path_and_survives_exec(
     env_file = argv[argv.index("--env-file") + 1]
     assert os.readlink(env_file).endswith("(deleted)")
     # podman opens it after exec, so a child process must be able to read it too.
-    child = subprocess.run(["cat", env_file], close_fds=False, capture_output=True)
+    child = subprocess.run(
+        ["cat", env_file], close_fds=False, capture_output=True, check=True
+    )
     assert child.stdout == b"TOKEN=a b=c # d\n"
 
 
@@ -1409,7 +1416,7 @@ def git_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return global_config
 
 
-def _vm_git_config(argv: list[str]) -> Optional[Path]:
+def _vm_git_config(argv: list[str]) -> Path | None:
     """Host path of the file the VM's git reads as its global config, if any."""
     prefix = "GIT_CONFIG_GLOBAL="
     guest = next((a.removeprefix(prefix) for a in argv if a.startswith(prefix)), None)
@@ -1422,11 +1429,11 @@ def _vm_git_config(argv: list[str]) -> Optional[Path]:
     )
 
 
-def _git_get(key: str, config: Path, repo: Optional[Path] = None) -> Optional[str]:
+def _git_get(key: str, config: Path, repo: Path | None = None) -> str | None:
     """What the VM's git would resolve for key, given its global config file."""
     cmd = ["git", *(["-C", str(repo)] if repo else []), "config", "--get", key]
     env = {**os.environ, "GIT_CONFIG_GLOBAL": str(config)}
-    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
     return result.stdout.strip() if result.returncode == 0 else None
 
 
@@ -2309,7 +2316,7 @@ def test_build_forwarding_ssh_warns_when_no_agent_is_live(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", True)
-    monkeypatch.setattr(claude_profile, "_ssh_agent_sockets", lambda: [])
+    monkeypatch.setattr(claude_profile, "_ssh_agent_sockets", list)
     fwd = claude_profile._build_forwarding()
     assert fwd.forwards == []
     assert "ssh" in capsys.readouterr().err.lower()
@@ -2855,10 +2862,9 @@ def test_sandbox_mounts_masks_profile_chrome_dir(
     cwd = tmp_path / "work"
     cwd.mkdir()
     mounts = _sandbox_mounts(profile, cwd)
-    assert (
-        f"{claude_profile._sandbox_state_dir(profile) / 'chrome'}:{claude_profile.SANDBOX_CONFIG_DIR}/chrome:z"
-        in mounts
-    )
+    state = claude_profile._sandbox_state_dir(profile)
+    config = claude_profile.SANDBOX_CONFIG_DIR
+    assert f"{state / 'chrome'}:{config}/chrome:z" in mounts
     # the real wrapper is untouched on the host
     assert (profile / "chrome" / "chrome-native-host").read_text() == "host wrapper\n"
 
@@ -2934,6 +2940,7 @@ def _run_handler(handler: Path, request: str, bin_dir: Path) -> str:
         text=True,
         env=env,
         timeout=10,
+        check=True,
     )
     return result.stdout
 
@@ -4034,11 +4041,9 @@ def test_sandbox_mounts_known_hosts_global_ro_and_user_rw(
     # host file is the read-only global known_hosts (verification only)
     assert f"{ssh / 'known_hosts'}:/etc/ssh/ssh_known_hosts:ro,z" in mounts
     # per-profile writable user known_hosts persists newly accepted keys
-    assert (
-        f"{claude_profile._sandbox_state_dir(profile) / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z"
-        in mounts
-    )
-    assert (claude_profile._sandbox_state_dir(profile) / "known_hosts").exists()
+    state = claude_profile._sandbox_state_dir(profile)
+    assert f"{state / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z" in mounts
+    assert (state / "known_hosts").exists()
 
 
 def test_sandbox_mounts_user_known_hosts_without_host_file(
@@ -4052,10 +4057,8 @@ def test_sandbox_mounts_user_known_hosts_without_host_file(
     mounts = _sandbox_mounts(profile, cwd)
     # no host known_hosts -> no global mount, but the writable user file is still provided
     assert not any("/etc/ssh/ssh_known_hosts" in m for m in mounts)
-    assert (
-        f"{claude_profile._sandbox_state_dir(profile) / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z"
-        in mounts
-    )
+    state = claude_profile._sandbox_state_dir(profile)
+    assert f"{state / 'known_hosts'}:/home/appuser/.ssh/known_hosts:z" in mounts
 
 
 def test_sandbox_known_hosts_creates_empty(tmp_path: Path) -> None:

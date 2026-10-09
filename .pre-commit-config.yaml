@@ -1,0 +1,47 @@
+# prek hooks (https://github.com/j178/prek); CI runs the same set.
+# Install: prek install    Update: prek auto-update --cooldown-days 7
+repos:
+  - repo: local
+    hooks:
+      # Through uv so the versions pinned in pyproject's dev extra are the ones that run.
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --extra dev ruff check
+        language: system
+        types: [python]
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --extra dev ruff format --check
+        language: system
+        types: [python]
+      - id: ty
+        name: ty check
+        entry: uv run --extra dev ty check
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: pytest
+        name: pytest
+        entry: uv run --extra dev pytest -q
+        language: system
+        types: [python]
+        pass_filenames: false
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+        # The image's shims have no extension and are not executable in git.
+        types: [text]
+        files: ^src/claude_profile/(.*\.sh|sandbox/(wl-paste|google-chrome|podman-wrapper))$
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.30.1
+    hooks:
+      - id: zizmor
