@@ -1097,18 +1097,29 @@ def _sandbox_settings_content(src: Path) -> bytes:
         data = json.loads(raw)
     except ValueError:
         return raw
+    if not _strip_sandbox_denies(data):
+        return raw
+    return json.dumps(data, indent=2).encode()
+
+
+def _strip_sandbox_denies(data: object) -> bool:
+    """Drop the host-oriented denies in SANDBOX_STRIP_DENY_PREFIXES from a settings object.
+
+    deny wins even under --dangerously-skip-permissions, so a host's ``Bash(sudo *)``
+    would block the VM's own scoped sudo. Returns whether any rule was dropped.
+    """
     perms = data.get("permissions") if isinstance(data, dict) else None
     if not isinstance(perms, dict) or not isinstance(perms.get("deny"), list):
-        return raw
+        return False
     kept = [
         rule
         for rule in perms["deny"]
         if not (isinstance(rule, str) and rule.startswith(SANDBOX_STRIP_DENY_PREFIXES))
     ]
     if len(kept) == len(perms["deny"]):
-        return raw
+        return False
     perms["deny"] = kept
-    return json.dumps(data, indent=2).encode()
+    return True
 
 
 def _has_option(args: list[str], name: str) -> bool:
@@ -1123,8 +1134,9 @@ def _shared_settings_args(
 
     ``shared-settings.json`` in the profiles base holds settings every profile gets, such
     as hooks. claude merges ``--settings`` over the profile's own settings.json, and hook
-    entries from both run. ``{profile}`` in any string becomes the profile name; in the
-    sandbox, HTTP hooks aimed at the host's loopback are re-pointed so they still reach it.
+    entries from both run. ``{profile}`` in any string becomes the profile name. In the
+    sandbox, HTTP hooks aimed at the host's loopback are re-pointed so they still reach it,
+    and host-oriented denies are dropped as from the profile's settings.json.
     """
     path = settings.profiles_base / SHARED_SETTINGS
     if not path.exists():
@@ -1143,6 +1155,8 @@ def _shared_settings_args(
         err_console.print(f"[red]{path} must hold a JSON object.[/red]")
         sys.exit(1)
     host_loopback = sandbox and _rewrite_loopback_hooks(data)
+    if sandbox:
+        _strip_sandbox_denies(data)
     return ["--settings", json.dumps(data)], host_loopback
 
 

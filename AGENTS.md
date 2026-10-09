@@ -209,7 +209,8 @@ hand.
   `?profile={profile}`), and passes the result as `--settings <json>`; claude merges that over
   the profile's own settings, and hook entries from both run. A user-supplied `--settings`
   wins (the shared file is skipped with a warning), and an unreadable or non-object file fails
-  the launch. In the sandbox, `_rewrite_loopback_hooks` re-points HTTP hooks aimed at
+  the launch. In the sandbox, `_strip_sandbox_denies` drops the same host-oriented denies from it
+  as from the settings.json copy, and `_rewrite_loopback_hooks` re-points HTTP hooks aimed at
   `127.0.0.1`/`localhost` at `SANDBOX_HOST_LOOPBACK`, and `_build_sandbox_argv(host_loopback=…)`
   adds `--map-host-loopback` even when no agent bridge is active — inside the VM, 127.0.0.1 is
   the VM itself, so without both a local hook receiver would silently never

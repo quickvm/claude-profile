@@ -4125,6 +4125,38 @@ def test_launch_passes_shared_settings_with_the_profile_name(
     assert argv[-1] == "--resume"
 
 
+SHARED_DENY = {
+    "permissions": {"deny": ["Bash(sudo *)", "Read(~/.ssh/**)", "Bash(rm -rf *)"]}
+}
+
+
+def test_sandbox_launch_strips_host_denies_from_shared_settings(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # deny wins even under --dangerously-skip-permissions, so a shared Bash(sudo *) blocked
+    # the VM's own scoped sudo though the profile's settings.json copy had it stripped.
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    (profile / SANDBOX_MARKER).touch()
+    _write_shared(profiles_base, SHARED_DENY)
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.chdir(_project(tmp_path))
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    _bin, argv, _env = mock_exec.call_args[0]
+    assert _settings_arg(argv)["permissions"]["deny"] == ["Bash(rm -rf *)"]
+
+
+def test_host_launch_keeps_shared_denies(profiles_base: Path) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    _write_shared(profiles_base, SHARED_DENY)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    _bin, argv, _env = mock_exec.call_args[0]
+    assert _settings_arg(argv) == SHARED_DENY
+
+
 def test_launch_without_shared_settings_passes_none(profiles_base: Path) -> None:
     (profiles_base / "work").mkdir(parents=True)
     with patch("os.execvpe") as mock_exec:
