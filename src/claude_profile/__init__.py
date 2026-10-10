@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import ssl
@@ -2700,9 +2701,47 @@ def _agent_vault_ca_bundle(proxy_ca: Path) -> Path:
 
 
 def _agent_vault_host_env(session: dict[str, str]) -> dict[str, str]:
-    """A host launch's share of the session: all of it, with TLS on the combined bundle."""
+    """A host launch's share of the session: all of it, with TLS on the combined bundle.
+
+    PATH starts with a podman that runs without the proxy (see _write_podman_shim). The
+    shim's own dir is left out when looking for the real podman, so a launch started
+    from inside a session doesn't point the shim at itself.
+    """
     bundle = str(_agent_vault_ca_bundle(Path(session["SSL_CERT_FILE"])))
-    return {**session, **dict.fromkeys(AGENT_VAULT_CA_VARS, bundle)}
+    env = {**session, **dict.fromkeys(AGENT_VAULT_CA_VARS, bundle)}
+    shim_dir = _data_dir() / "agent-vault" / "bin"
+    path = [
+        entry
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if entry and Path(entry) != shim_dir
+    ]
+    podman = shutil.which(settings.podman_bin, path=os.pathsep.join(path))
+    if podman is not None:
+        _write_podman_shim(shim_dir, podman)
+        env["PATH"] = os.pathsep.join([str(shim_dir), *path])
+    return env
+
+
+def _write_podman_shim(shim_dir: Path, podman: str) -> None:
+    """Write shim_dir/podman, which runs podman without the session's proxy.
+
+    The proxy decrypts HTTPS with its own CA. podman passes it into containers and
+    build steps (MCP servers run with podman), which don't trust that CA, so their
+    HTTPS fails. Without it they go direct, as they do outside a session; the VM's
+    podman wrapper does the same.
+    """
+    content = (
+        "#!/bin/sh\n"
+        "# Written by claude-profile for Agent Vault sessions: podman runs without the\n"
+        "# session's proxy, so containers, builds and pulls go direct.\n"
+        "unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy\n"
+        f'exec {shlex.quote(podman)} "$@"\n'
+    )
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    partial = shim_dir / f".podman.{os.getpid()}.partial"
+    partial.write_text(content)
+    partial.chmod(0o755)
+    os.replace(partial, shim_dir / "podman")
 
 
 def _with_agent_vault(

@@ -11,6 +11,12 @@
 # environment because those servers pass tokens through as `-e VAR` (with the value
 # in the environment, not on the command line); a plain sudo would strip them. The
 # matching sudoers rule carries the SETENV tag to allow -E.
+#
+# In an Agent Vault session HTTPS_PROXY points at a proxy that decrypts HTTPS with its
+# own CA. podman would pass it into containers and build steps, which don't trust that
+# CA, so podman runs without it: containers, builds and pulls go direct, as they do
+# outside a session.
+unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
 if [ "$(id -u)" = 0 ]; then
 	exec /usr/bin/podman "$@"
 fi
