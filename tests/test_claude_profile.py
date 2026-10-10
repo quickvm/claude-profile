@@ -4910,6 +4910,95 @@ def test_agent_vault_host_launch_trusts_the_proxy_and_system_cas(
     assert claude_profile.AGENT_VAULT_RUN_ENV not in env
 
 
+def _env_probe(path: Path) -> Path:
+    """An executable that prints which proxy variables it got, then its arguments."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/bin/sh\n"
+        'echo "HTTPS_PROXY=${HTTPS_PROXY-unset} https_proxy=${https_proxy-unset}"\n'
+        'echo "HTTP_PROXY=${HTTP_PROXY-unset} http_proxy=${http_proxy-unset}"\n'
+        'echo "args: $*"\n'
+    )
+    path.chmod(0o755)
+    return path
+
+
+PROXY_UNSET = "HTTPS_PROXY=unset https_proxy=unset\nHTTP_PROXY=unset http_proxy=unset\n"
+
+
+def test_agent_vault_host_launch_runs_podman_without_the_proxy(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The proxy decrypts HTTPS, and containers and build steps don't trust its CA, so
+    # the podman claude starts (MCP servers, builds) runs without it.
+    real = _env_probe(tmp_path / "real" / "podman")
+    monkeypatch.setattr(claude_profile.settings, "podman_bin", str(real))
+    _inner_run_env(monkeypatch, tmp_path)
+    _vault_profile(profiles_base, "10.0.1.5:17323")
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    env = mock_exec.call_args[0][2]
+    shim = Path(env["PATH"].split(os.pathsep)[0]) / "podman"
+    proxies = dict.fromkeys(claude_profile.AGENT_VAULT_PROXY_URL_VARS, AV_PROXY_URL)
+    result = subprocess.run(
+        [str(shim), "run", "--rm", "image"],
+        env={**proxies, "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout == f"{PROXY_UNSET}args: run --rm image\n"
+
+
+def test_agent_vault_host_launch_without_podman_leaves_path_alone(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _inner_run_env(monkeypatch, tmp_path)
+    _vault_profile(profiles_base, "10.0.1.5:17323")
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    assert mock_exec.call_args[0][2]["PATH"] == os.environ["PATH"]
+
+
+def test_agent_vault_podman_shim_never_runs_itself(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A launch from inside a session finds the shim first on PATH; it must still exec
+    # the real podman, and PATH must name the shim's dir only once.
+    shim_dir = tmp_path / "xdg-data" / "claude-profile" / "agent-vault" / "bin"
+    _env_probe(shim_dir / "podman")
+    real = _env_probe(tmp_path / "real" / "podman")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(shim_dir), str(real.parent)]))
+    monkeypatch.setattr(claude_profile.settings, "podman_bin", "podman")
+    _inner_run_env(monkeypatch, tmp_path)
+    _vault_profile(profiles_base, "10.0.1.5:17323")
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    assert mock_exec.call_args[0][2]["PATH"].split(os.pathsep) == [
+        str(shim_dir),
+        str(real.parent),
+    ]
+    assert f"exec {real} " in (shim_dir / "podman").read_text()
+
+
+def test_podman_wrapper_runs_podman_without_the_proxy(tmp_path: Path) -> None:
+    # The VM's podman wrapper drops the proxy before sudo -E would carry it into podman.
+    wrapper = Path(claude_profile.__file__).parent / "sandbox" / "podman-wrapper"
+    bin_dir = tmp_path / "bin"
+    _env_probe(bin_dir / "sudo")
+    (bin_dir / "id").write_text("#!/bin/sh\necho 1000\n")
+    (bin_dir / "id").chmod(0o755)
+    proxies = dict.fromkeys(claude_profile.AGENT_VAULT_PROXY_URL_VARS, AV_PROXY_URL)
+    result = subprocess.run(
+        ["sh", str(wrapper), "build", "."],
+        env={**proxies, "PATH": f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout == f"{PROXY_UNSET}args: -E /usr/bin/podman build .\n"
+
+
 def test_agent_vault_sandbox_launch_keeps_the_session_out_of_podman(
     profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -451,7 +451,14 @@ hand.
   (`OPENCLAW_PROXY_URL` stays out), add the host loopback to `NO_PROXY`, set
   `NODE_USE_ENV_PROXY=1`, point the CA variables at `SANDBOX_VM_CA_BUNDLE`, and mount the bundle
   there read-only after `_ca_trust_mounts`, so every default path in the image trusts the proxy's
-  CA without an entrypoint change. Placeholder tokens are ordinary `.env` values.
+  CA without an entrypoint change. Placeholder tokens are ordinary `.env` values. podman runs
+  without the proxy, because the proxy decrypts every host and containers and build steps
+  don't trust its CA: host launches put `_write_podman_shim`'s `podman` first on claude's PATH
+  (the real podman is looked up with the shim's dir left out, so a launch from inside a
+  session doesn't point the shim at itself), and in the VM `podman-wrapper` unsets the four
+  proxy variables. A containers.conf can't do this: its `[containers]` settings don't reach
+  build steps, and `[engine] env` doesn't change podman's own environment, which `-e NAME`
+  and build steps copy from.
 - **`sandbox` subcommand & override:** `sandbox <name> --on/--off` toggles the `.sandbox`
   marker on an existing profile (shows status when no flag). `_sandbox_enabled()` decides
   per launch: the `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state
