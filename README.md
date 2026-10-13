@@ -578,10 +578,19 @@ with claude.
 podman runs without the proxy. The proxy decrypts all HTTPS with its own CA, and containers
 and image build steps don't trust it, so a host launch puts a small `podman` shim first on
 claude's `PATH`, and in the VM the image's podman wrapper does the same. Containers, builds and
-pulls go direct, as they do without Agent Vault. An MCP server you run with podman
-(`podman run … -e GITHUB_PERSONAL_ACCESS_TOKEN …`) therefore still needs its real token; to
-broker one, use its remote HTTP endpoint instead, which claude calls itself, through the proxy.
-The VM side needs an image built from this version (`claude-profile build`).
+pulls go direct, as they do without Agent Vault, so an MCP server you run with podman needs its
+real token, unless its command includes `--http-proxy=true`. Then podman passes the proxy in, and
+the server can hold a placeholder like any other tool:
+
+```json
+"args": ["run", "-i", "--rm", "--http-proxy=true", "--env", "VL_INSTANCE_BEARER_TOKEN", "…"],
+"env": {"VL_INSTANCE_BEARER_TOKEN": "__VLOGS_TOKEN__"}
+```
+
+That works as is for an API over plain HTTP. Over HTTPS the container must also trust the
+proxy's CA, so for a server with a remote HTTP endpoint, using that endpoint is simpler: claude
+calls it itself, through the proxy. A host the server reaches must not be in `NO_PROXY`. The VM
+side needs an image built from this version (`claude-profile build`).
 
 ## Configuration
 
