@@ -4924,13 +4924,27 @@ def _env_probe(path: Path) -> Path:
 
 
 PROXY_UNSET = "HTTPS_PROXY=unset https_proxy=unset\nHTTP_PROXY=unset http_proxy=unset\n"
+PROXY_KEPT = (
+    f"HTTPS_PROXY={AV_PROXY_URL} https_proxy={AV_PROXY_URL}\n"
+    f"HTTP_PROXY={AV_PROXY_URL} http_proxy={AV_PROXY_URL}\n"
+)
+# The proxy decrypts HTTPS, and containers and build steps don't trust its CA, so podman
+# runs without it, unless the command asks for it (an MCP server with a placeholder token).
+PODMAN_PROXY_CASES = [
+    (["run", "--rm", "image"], PROXY_UNSET),
+    (["build", "."], PROXY_UNSET),
+    (["run", "-i", "--rm", "--http-proxy=true", "image"], PROXY_KEPT),
+]
 
 
-def test_agent_vault_host_launch_runs_podman_without_the_proxy(
-    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(("args", "proxies_seen"), PODMAN_PROXY_CASES)
+def test_agent_vault_host_launch_runs_podman_without_the_proxy_unless_asked(
+    profiles_base: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    args: list[str],
+    proxies_seen: str,
 ) -> None:
-    # The proxy decrypts HTTPS, and containers and build steps don't trust its CA, so
-    # the podman claude starts (MCP servers, builds) runs without it.
     real = _env_probe(tmp_path / "real" / "podman")
     monkeypatch.setattr(claude_profile.settings, "podman_bin", str(real))
     _inner_run_env(monkeypatch, tmp_path)
@@ -4941,13 +4955,13 @@ def test_agent_vault_host_launch_runs_podman_without_the_proxy(
     shim = Path(env["PATH"].split(os.pathsep)[0]) / "podman"
     proxies = dict.fromkeys(claude_profile.AGENT_VAULT_PROXY_URL_VARS, AV_PROXY_URL)
     result = subprocess.run(
-        [str(shim), "run", "--rm", "image"],
+        [str(shim), *args],
         env={**proxies, "PATH": "/usr/bin:/bin"},
         capture_output=True,
         text=True,
         check=True,
     )
-    assert result.stdout == f"{PROXY_UNSET}args: run --rm image\n"
+    assert result.stdout == f"{proxies_seen}args: {' '.join(args)}\n"
 
 
 def test_agent_vault_host_launch_without_podman_leaves_path_alone(
@@ -4981,8 +4995,11 @@ def test_agent_vault_podman_shim_never_runs_itself(
     assert f"exec {real} " in (shim_dir / "podman").read_text()
 
 
-def test_podman_wrapper_runs_podman_without_the_proxy(tmp_path: Path) -> None:
-    # The VM's podman wrapper drops the proxy before sudo -E would carry it into podman.
+@pytest.mark.parametrize(("args", "proxies_seen"), PODMAN_PROXY_CASES)
+def test_podman_wrapper_runs_podman_without_the_proxy_unless_asked(
+    tmp_path: Path, args: list[str], proxies_seen: str
+) -> None:
+    # The VM's podman wrapper decides before sudo -E would carry the proxy into podman.
     wrapper = Path(claude_profile.__file__).parent / "sandbox" / "podman-wrapper"
     bin_dir = tmp_path / "bin"
     _env_probe(bin_dir / "sudo")
@@ -4990,13 +5007,13 @@ def test_podman_wrapper_runs_podman_without_the_proxy(tmp_path: Path) -> None:
     (bin_dir / "id").chmod(0o755)
     proxies = dict.fromkeys(claude_profile.AGENT_VAULT_PROXY_URL_VARS, AV_PROXY_URL)
     result = subprocess.run(
-        ["sh", str(wrapper), "build", "."],
+        ["sh", str(wrapper), *args],
         env={**proxies, "PATH": f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin"},
         capture_output=True,
         text=True,
         check=True,
     )
-    assert result.stdout == f"{PROXY_UNSET}args: -E /usr/bin/podman build .\n"
+    assert result.stdout == f"{proxies_seen}args: -E /usr/bin/podman {' '.join(args)}\n"
 
 
 def test_agent_vault_sandbox_launch_keeps_the_session_out_of_podman(

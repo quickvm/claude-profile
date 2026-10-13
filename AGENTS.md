@@ -456,9 +456,11 @@ hand.
   don't trust its CA: host launches put `_write_podman_shim`'s `podman` first on claude's PATH
   (the real podman is looked up with the shim's dir left out, so a launch from inside a
   session doesn't point the shim at itself), and in the VM `podman-wrapper` unsets the four
-  proxy variables. A containers.conf can't do this: its `[containers]` settings don't reach
-  build steps, and `[engine] env` doesn't change podman's own environment, which `-e NAME`
-  and build steps copy from.
+  proxy variables. Both keep them when the command has `--http-proxy=true`, podman's own flag
+  for passing the proxy in, which is how an MCP server holding a placeholder asks to be
+  brokered. A containers.conf can't do this: its `[containers]` settings don't reach build
+  steps, and `[engine] env` doesn't change podman's own environment, which `-e NAME` and build
+  steps copy from.
 - **`sandbox` subcommand & override:** `sandbox <name> --on/--off` toggles the `.sandbox`
   marker on an existing profile (shows status when no flag). `_sandbox_enabled()` decides
   per launch: the `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state

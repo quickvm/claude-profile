@@ -2728,13 +2728,19 @@ def _write_podman_shim(shim_dir: Path, podman: str) -> None:
     The proxy decrypts HTTPS with its own CA. podman passes it into containers and
     build steps (MCP servers run with podman), which don't trust that CA, so their
     HTTPS fails. Without it they go direct, as they do outside a session; the VM's
-    podman wrapper does the same.
+    podman wrapper does the same. A command with --http-proxy=true keeps the proxy:
+    that is how an MCP server holding a placeholder token asks to be brokered.
     """
     content = (
         "#!/bin/sh\n"
         "# Written by claude-profile for Agent Vault sessions: podman runs without the\n"
-        "# session's proxy, so containers, builds and pulls go direct.\n"
-        "unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy\n"
+        "# session's proxy, so containers, builds and pulls go direct, unless the\n"
+        "# command asks for it with --http-proxy=true.\n"
+        "keep_proxy=\n"
+        "for arg do\n"
+        '\t[ "$arg" = --http-proxy=true ] && keep_proxy=1\n'
+        "done\n"
+        '[ -n "$keep_proxy" ] || unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy\n'
         f'exec {shlex.quote(podman)} "$@"\n'
     )
     shim_dir.mkdir(parents=True, exist_ok=True)

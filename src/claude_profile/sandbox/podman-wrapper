@@ -15,8 +15,13 @@
 # In an Agent Vault session HTTPS_PROXY points at a proxy that decrypts HTTPS with its
 # own CA. podman would pass it into containers and build steps, which don't trust that
 # CA, so podman runs without it: containers, builds and pulls go direct, as they do
-# outside a session.
-unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
+# outside a session. A command with --http-proxy=true keeps it: that is how an MCP
+# server holding a placeholder token asks to be brokered.
+keep_proxy=
+for arg do
+	[ "$arg" = --http-proxy=true ] && keep_proxy=1
+done
+[ -n "$keep_proxy" ] || unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
 if [ "$(id -u)" = 0 ]; then
 	exec /usr/bin/podman "$@"
 fi
