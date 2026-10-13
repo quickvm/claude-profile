@@ -587,10 +587,13 @@ the server can hold a placeholder like any other tool:
 "env": {"VL_INSTANCE_BEARER_TOKEN": "__VLOGS_TOKEN__"}
 ```
 
-That works as is for an API over plain HTTP. Over HTTPS the container must also trust the
-proxy's CA, so for a server with a remote HTTP endpoint, using that endpoint is simpler: claude
-calls it itself, through the proxy. A host the server reaches must not be in `NO_PROXY`. The VM
-side needs an image built from this version (`claude-profile build`).
+For HTTPS, a `podman run` or `podman create` with the flag also gets the session's CA bundle at
+`/run/agent-vault/ca-bundle.pem`, and the CA variables that `infisical agent-vault run` sets
+(`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
+`GIT_SSL_CAINFO`, `DENO_CERT`) point there, so the container trusts the proxy. This needs `run`
+or `create` as podman's first argument. A host the server reaches must not be in `NO_PROXY`. A
+server with a remote HTTP endpoint needs none of this: claude calls the endpoint itself, through
+the proxy. The VM side needs an image built from this version (`claude-profile build`).
 
 ## Configuration
 

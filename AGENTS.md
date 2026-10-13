@@ -458,9 +458,13 @@ hand.
   session doesn't point the shim at itself), and in the VM `podman-wrapper` unsets the four
   proxy variables. Both keep them when the command has `--http-proxy=true`, podman's own flag
   for passing the proxy in, which is how an MCP server holding a placeholder asks to be
-  brokered. A containers.conf can't do this: its `[containers]` settings don't reach build
-  steps, and `[engine] env` doesn't change podman's own environment, which `-e NAME` and build
-  steps copy from.
+  brokered. When podman's first argument is `run` or `create`, such a command also gets, right
+  after it, `--volume $SSL_CERT_FILE:AGENT_VAULT_CONTAINER_CA:ro,z` and an `--env` per CA
+  variable pointing there, so the container trusts the proxy. The wrapper spells out that path
+  and those variables itself; `PODMAN_PROXY_CASES` checks both scripts against the constants.
+  A containers.conf can't do this: its `[containers]` settings don't reach build steps, its env
+  loses to an image's own `ENV` (github-mcp-server sets `SSL_CERT_FILE`), and `[engine] env`
+  doesn't change podman's own environment, which `-e NAME` and build steps copy from.
 - **`sandbox` subcommand & override:** `sandbox <name> --on/--off` toggles the `.sandbox`
   marker on an existing profile (shows status when no flag). `_sandbox_enabled()` decides
   per launch: the `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state
