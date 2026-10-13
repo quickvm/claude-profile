@@ -16,12 +16,34 @@
 # own CA. podman would pass it into containers and build steps, which don't trust that
 # CA, so podman runs without it: containers, builds and pulls go direct, as they do
 # outside a session. A command with --http-proxy=true keeps it: that is how an MCP
-# server holding a placeholder token asks to be brokered.
+# server holding a placeholder token asks to be brokered. A `run` or `create` that asks
+# also gets the session's CA bundle (SSL_CERT_FILE) at /run/agent-vault/ca-bundle.pem,
+# with the CA variables pointing there, so its HTTPS trusts the proxy. They go on the
+# command line because an image's own ENV (SSL_CERT_FILE, say) beats containers.conf.
+# The host launch's podman shim does the same (claude_profile._write_podman_shim).
 keep_proxy=
 for arg do
 	[ "$arg" = --http-proxy=true ] && keep_proxy=1
 done
-[ -n "$keep_proxy" ] || unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
+if [ -z "$keep_proxy" ]; then
+	unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
+elif [ -n "$SSL_CERT_FILE" ]; then
+	case $1 in
+	run | create)
+		subcommand=$1
+		shift
+		ca=/run/agent-vault/ca-bundle.pem
+		set -- "$subcommand" --volume "$SSL_CERT_FILE:$ca:ro,z" \
+			--env "SSL_CERT_FILE=$ca" \
+			--env "NODE_EXTRA_CA_CERTS=$ca" \
+			--env "REQUESTS_CA_BUNDLE=$ca" \
+			--env "CURL_CA_BUNDLE=$ca" \
+			--env "GIT_SSL_CAINFO=$ca" \
+			--env "DENO_CERT=$ca" \
+			"$@"
+		;;
+	esac
+fi
 if [ "$(id -u)" = 0 ]; then
 	exec /usr/bin/podman "$@"
 fi

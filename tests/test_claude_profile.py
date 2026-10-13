@@ -19,7 +19,7 @@ import threading
 import time
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from unittest.mock import Mock, patch
 
 import pytest
@@ -4928,22 +4928,72 @@ PROXY_KEPT = (
     f"HTTPS_PROXY={AV_PROXY_URL} https_proxy={AV_PROXY_URL}\n"
     f"HTTP_PROXY={AV_PROXY_URL} http_proxy={AV_PROXY_URL}\n"
 )
+SESSION_CA = "/session/ca-bundle.pem"
+CONTAINER_CA_ARGS = " ".join(
+    [
+        f"--volume {SESSION_CA}:{claude_profile.AGENT_VAULT_CONTAINER_CA}:ro,z",
+        *(
+            f"--env {name}={claude_profile.AGENT_VAULT_CONTAINER_CA}"
+            for name in claude_profile.AGENT_VAULT_CA_VARS
+        ),
+    ]
+)
+
+
+class PodmanCase(NamedTuple):
+    """A podman command in a session, and what the real podman gets from the shim."""
+
+    args: str
+    session_ca: str | None
+    proxies_seen: str
+    args_seen: str
+
+
 # The proxy decrypts HTTPS, and containers and build steps don't trust its CA, so podman
 # runs without it, unless the command asks for it (an MCP server with a placeholder token).
+# A container that asks also gets the session's CA bundle, named by SSL_CERT_FILE.
 PODMAN_PROXY_CASES = [
-    (["run", "--rm", "image"], PROXY_UNSET),
-    (["build", "."], PROXY_UNSET),
-    (["run", "-i", "--rm", "--http-proxy=true", "image"], PROXY_KEPT),
+    PodmanCase("run --rm image", SESSION_CA, PROXY_UNSET, "run --rm image"),
+    PodmanCase("build .", SESSION_CA, PROXY_UNSET, "build ."),
+    PodmanCase(
+        "run -i --rm --http-proxy=true image",
+        SESSION_CA,
+        PROXY_KEPT,
+        f"run {CONTAINER_CA_ARGS} -i --rm --http-proxy=true image",
+    ),
+    PodmanCase(
+        "create --http-proxy=true image",
+        SESSION_CA,
+        PROXY_KEPT,
+        f"create {CONTAINER_CA_ARGS} --http-proxy=true image",
+    ),
+    PodmanCase(
+        "build --http-proxy=true .", SESSION_CA, PROXY_KEPT, "build --http-proxy=true ."
+    ),
+    PodmanCase(
+        "run --http-proxy=true image", None, PROXY_KEPT, "run --http-proxy=true image"
+    ),
 ]
 
 
-@pytest.mark.parametrize(("args", "proxies_seen"), PODMAN_PROXY_CASES)
+def _podman_case_id(case: PodmanCase) -> str:
+    return case.args if case.session_ca else f"{case.args} without SSL_CERT_FILE"
+
+
+def _podman_env(case: PodmanCase, path: str) -> dict[str, str]:
+    """The environment claude gives podman in a session."""
+    env = dict.fromkeys(claude_profile.AGENT_VAULT_PROXY_URL_VARS, AV_PROXY_URL)
+    if case.session_ca:
+        env["SSL_CERT_FILE"] = case.session_ca
+    return {**env, "PATH": path}
+
+
+@pytest.mark.parametrize("case", PODMAN_PROXY_CASES, ids=_podman_case_id)
 def test_agent_vault_host_launch_runs_podman_without_the_proxy_unless_asked(
     profiles_base: Path,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    args: list[str],
-    proxies_seen: str,
+    case: PodmanCase,
 ) -> None:
     real = _env_probe(tmp_path / "real" / "podman")
     monkeypatch.setattr(claude_profile.settings, "podman_bin", str(real))
@@ -4953,15 +5003,14 @@ def test_agent_vault_host_launch_runs_podman_without_the_proxy_unless_asked(
         _launch_profile("work", [])
     env = mock_exec.call_args[0][2]
     shim = Path(env["PATH"].split(os.pathsep)[0]) / "podman"
-    proxies = dict.fromkeys(claude_profile.AGENT_VAULT_PROXY_URL_VARS, AV_PROXY_URL)
     result = subprocess.run(
-        [str(shim), *args],
-        env={**proxies, "PATH": "/usr/bin:/bin"},
+        [str(shim), *case.args.split()],
+        env=_podman_env(case, "/usr/bin:/bin"),
         capture_output=True,
         text=True,
         check=True,
     )
-    assert result.stdout == f"{proxies_seen}args: {' '.join(args)}\n"
+    assert result.stdout == f"{case.proxies_seen}args: {case.args_seen}\n"
 
 
 def test_agent_vault_host_launch_without_podman_leaves_path_alone(
@@ -4995,9 +5044,9 @@ def test_agent_vault_podman_shim_never_runs_itself(
     assert f"exec {real} " in (shim_dir / "podman").read_text()
 
 
-@pytest.mark.parametrize(("args", "proxies_seen"), PODMAN_PROXY_CASES)
+@pytest.mark.parametrize("case", PODMAN_PROXY_CASES, ids=_podman_case_id)
 def test_podman_wrapper_runs_podman_without_the_proxy_unless_asked(
-    tmp_path: Path, args: list[str], proxies_seen: str
+    tmp_path: Path, case: PodmanCase
 ) -> None:
     # The VM's podman wrapper decides before sudo -E would carry the proxy into podman.
     wrapper = Path(claude_profile.__file__).parent / "sandbox" / "podman-wrapper"
@@ -5005,15 +5054,17 @@ def test_podman_wrapper_runs_podman_without_the_proxy_unless_asked(
     _env_probe(bin_dir / "sudo")
     (bin_dir / "id").write_text("#!/bin/sh\necho 1000\n")
     (bin_dir / "id").chmod(0o755)
-    proxies = dict.fromkeys(claude_profile.AGENT_VAULT_PROXY_URL_VARS, AV_PROXY_URL)
     result = subprocess.run(
-        ["sh", str(wrapper), *args],
-        env={**proxies, "PATH": f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin"},
+        ["sh", str(wrapper), *case.args.split()],
+        env=_podman_env(case, f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin"),
         capture_output=True,
         text=True,
         check=True,
     )
-    assert result.stdout == f"{proxies_seen}args: -E /usr/bin/podman {' '.join(args)}\n"
+    assert (
+        result.stdout
+        == f"{case.proxies_seen}args: -E /usr/bin/podman {case.args_seen}\n"
+    )
 
 
 def test_agent_vault_sandbox_launch_keeps_the_session_out_of_podman(

@@ -176,6 +176,9 @@ AGENT_VAULT_CA_VARS: tuple[str, ...] = (
 # The VM's system bundle, which /etc/ssl/cert.pem and the image's other default paths
 # link to. A vault launch mounts the combined bundle over it.
 SANDBOX_VM_CA_BUNDLE = "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+# Where a container brokered with --http-proxy=true finds the combined bundle. The VM's
+# podman-wrapper names the same path and CA variables.
+AGENT_VAULT_CONTAINER_CA = "/run/agent-vault/ca-bundle.pem"
 AGENT_VAULT_BRIEFING = (
     " Credentials are brokered: your HTTP(S) traffic goes through an Infisical Agent Vault "
     "proxy, which attaches the real credential to requests for the services in this "
@@ -2729,18 +2732,39 @@ def _write_podman_shim(shim_dir: Path, podman: str) -> None:
     build steps (MCP servers run with podman), which don't trust that CA, so their
     HTTPS fails. Without it they go direct, as they do outside a session; the VM's
     podman wrapper does the same. A command with --http-proxy=true keeps the proxy:
-    that is how an MCP server holding a placeholder token asks to be brokered.
+    that is how an MCP server holding a placeholder token asks to be brokered. A `run`
+    or `create` that asks also gets SSL_CERT_FILE's bundle at AGENT_VAULT_CONTAINER_CA,
+    with the CA variables pointing there, so its HTTPS trusts the proxy. They go on the
+    command line because an image's own ENV (SSL_CERT_FILE, say) beats containers.conf.
     """
+    ca = AGENT_VAULT_CONTAINER_CA
+    ca_env = "".join(
+        f"\t\t\t--env {shlex.quote(f'{name}={ca}')} \\\n"
+        for name in AGENT_VAULT_CA_VARS
+    )
     content = (
         "#!/bin/sh\n"
         "# Written by claude-profile for Agent Vault sessions: podman runs without the\n"
         "# session's proxy, so containers, builds and pulls go direct, unless the\n"
-        "# command asks for it with --http-proxy=true.\n"
+        "# command asks for it with --http-proxy=true. A container run that way also\n"
+        "# gets the session's CA bundle, so it trusts the proxy.\n"
         "keep_proxy=\n"
         "for arg do\n"
         '\t[ "$arg" = --http-proxy=true ] && keep_proxy=1\n'
         "done\n"
-        '[ -n "$keep_proxy" ] || unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy\n'
+        'if [ -z "$keep_proxy" ]; then\n'
+        "\tunset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy\n"
+        'elif [ -n "$SSL_CERT_FILE" ]; then\n'
+        "\tcase $1 in\n"
+        "\trun | create)\n"
+        "\t\tsubcommand=$1\n"
+        "\t\tshift\n"
+        f'\t\tset -- "$subcommand" --volume "$SSL_CERT_FILE:{ca}:ro,z" \\\n'
+        f"{ca_env}"
+        '\t\t\t"$@"\n'
+        "\t\t;;\n"
+        "\tesac\n"
+        "fi\n"
         f'exec {shlex.quote(podman)} "$@"\n'
     )
     shim_dir.mkdir(parents=True, exist_ok=True)
