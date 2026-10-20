@@ -8,7 +8,7 @@ FROM registry.fedoraproject.org/fedora:44@${FEDORA_DIGEST}
 
 RUN dnf install -y \
       git gh ripgrep fd-find jq yq less ca-certificates openssh-clients socat \
-      sudo openssl make patch diffutils ShellCheck trash-cli butane \
+      sudo openssl make patch diffutils ShellCheck trash-cli \
       podman fuse-overlayfs passt \
       nodejs22 nodejs22-npm python3-pyyaml python3-jinja2 \
     && dnf clean all

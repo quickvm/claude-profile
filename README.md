@@ -163,18 +163,27 @@ Installs are per-session (the VM is ephemeral). For a tool you need every time, 
 the `Containerfile` and rebuild, or build a derived image:
 
 ```dockerfile
-# ~/qvm-sandbox/Containerfile
+# ~/my-sandbox/Containerfile
 FROM claude-profile-sandbox:latest
 USER root
-RUN dnf install -y butane && dnf clean all
+RUN dnf install -y <your-package> && dnf clean all
 USER appuser
 RUN uv tool install <your-tool>
 USER root   # MUST end as root: the entrypoint starts as root to map your UID and set
             # up agent-socket dirs. A non-root final USER silently breaks SSH/GPG forwarding.
 ```
 ```sh
-podman build -t qvm-sandbox ~/qvm-sandbox
-export CLAUDE_PROFILE_SANDBOX_IMAGE=qvm-sandbox   # claude-profile uses it automatically
+podman build -t my-sandbox ~/my-sandbox
+export CLAUDE_PROFILE_SANDBOX_IMAGE=my-sandbox   # claude-profile uses it automatically
+```
+
+`claude-profile build` builds the image `CLAUDE_PROFILE_SANDBOX_IMAGE` names, so with that export
+it would replace `my-sandbox` with the plain image. Rebuild the base under its own name, then
+yours:
+
+```sh
+CLAUDE_PROFILE_SANDBOX_IMAGE=claude-profile-sandbox:latest claude-profile build
+podman build -t my-sandbox ~/my-sandbox
 ```
 
 The skill's "already installed" list is generated from the image — after changing the
@@ -350,7 +359,7 @@ infisical logins to forward — by exact email, or by domain (which also covers 
 subdomains), comma-separated:
 
 ```sh
-export CLAUDE_PROFILE_SANDBOX_INFISICAL="corp.example,quickvm.com"
+export CLAUDE_PROFILE_SANDBOX_INFISICAL="corp.example,me@example.org"
 claude-profile personal
 ```
 

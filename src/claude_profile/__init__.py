@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     sandbox_chrome: bool = Field(default=False)
     sandbox_gh: bool = Field(default=False)
     # Allowlist of infisical logins to forward into the sandbox: comma-separated
-    # emails or domains (e.g. "corp.example,quickvm.com"). Empty = disabled.
+    # emails or domains (e.g. "corp.example,me@example.org"). Empty = disabled.
     sandbox_infisical: str = Field(default="")
     sandbox_pulumi: bool = Field(default=False)
     # Comma-separated names of host env vars to copy into the sandbox (e.g. tokens that
@@ -252,7 +252,6 @@ SANDBOX_SKILL_TOOLS: dict[str, str] = {
     "podman": "Podman — run nested containers (runs rootful automatically)",
     "node": "Node.js",
     "npm": "npm",
-    "butane": "Butane (Ignition config compiler)",
 }
 
 app = typer.Typer(

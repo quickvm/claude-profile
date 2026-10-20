@@ -3108,7 +3108,7 @@ def _keyring_blob(jwt: str) -> str:
 
 
 INFISICAL_USERS = [
-    {"email": "joe@quickvm.com", "domain": "https://infisical.quickvm.example/api"},
+    {"email": "joe@example.org", "domain": "https://infisical.example.net/api"},
     {"email": "alice@corp.example", "domain": "https://secrets.corp.example/api"},
     {"email": "alice@home.example", "domain": "https://infisical.home.example/api"},
 ]
@@ -3195,12 +3195,12 @@ def test_infisical_token_none_when_secret_tool_missing(
 
 def test_infisical_login_matches() -> None:
     user = {
-        "email": "joe@quickvm.com",
-        "domain": "https://infisical.quickvm.example/api",
+        "email": "joe@example.org",
+        "domain": "https://infisical.example.net/api",
     }
-    assert claude_profile._infisical_login_matches("joe@quickvm.com", user) is True
-    assert claude_profile._infisical_login_matches("quickvm.com", user) is True
-    assert claude_profile._infisical_login_matches("quickvm.example", user) is True
+    assert claude_profile._infisical_login_matches("joe@example.org", user) is True
+    assert claude_profile._infisical_login_matches("example.org", user) is True
+    assert claude_profile._infisical_login_matches("example.net", user) is True
     assert claude_profile._infisical_login_matches("corp.example", user) is False
 
 
@@ -3217,21 +3217,21 @@ def test_infisical_login_matches_no_partial_names(entry: str) -> None:
 def test_infisical_logins_allowlist_and_active(monkeypatch: pytest.MonkeyPatch) -> None:
     _setup_infisical(
         monkeypatch,
-        "corp.example,quickvm.com",
-        {"alice@corp.example": "tok-corp", "joe@quickvm.com": "tok-qvm"},
+        "corp.example,example.org",
+        {"alice@corp.example": "tok-corp", "joe@example.org": "tok-joe"},
     )
     by_email = {login.email: login for login in claude_profile._infisical_logins()}
-    assert set(by_email) == {"alice@corp.example", "joe@quickvm.com"}
+    assert set(by_email) == {"alice@corp.example", "joe@example.org"}
     assert by_email["alice@corp.example"].active is True
-    assert by_email["joe@quickvm.com"].active is False
+    assert by_email["joe@example.org"].active is False
     assert by_email["alice@corp.example"].token == "tok-corp"
 
 
 def test_infisical_logins_skips_expired(monkeypatch: pytest.MonkeyPatch) -> None:
     _setup_infisical(
         monkeypatch,
-        "corp.example,quickvm.com",
-        {"alice@corp.example": "tok-corp", "joe@quickvm.com": None},
+        "corp.example,example.org",
+        {"alice@corp.example": "tok-corp", "joe@example.org": None},
     )
     logins = claude_profile._infisical_logins()
     assert [login.email for login in logins] == ["alice@corp.example"]
@@ -3265,17 +3265,17 @@ def test_with_infisical_env_forwards_primary_and_json(
 ) -> None:
     _setup_infisical(
         monkeypatch,
-        "quickvm.com,corp.example",
-        {"joe@quickvm.com": "tok-qvm", "alice@corp.example": "tok-corp"},
+        "example.org,corp.example",
+        {"joe@example.org": "tok-joe", "alice@corp.example": "tok-corp"},
     )
     env = claude_profile._with_infisical_env({"A": "1"})
     assert env["A"] == "1"
-    # active login (corp.example) is primary even though quickvm is listed first
+    # active login (corp.example) is primary even though example.org is listed first
     assert env["INFISICAL_TOKEN"] == "tok-corp"
     assert env["INFISICAL_API_URL"] == "https://secrets.corp.example/api"
     assert env["INFISICAL_DOMAIN"] == "https://secrets.corp.example/api"
     profiles = json.loads(env["CLAUDE_SANDBOX_INFISICAL"])
-    assert {p["email"] for p in profiles} == {"joe@quickvm.com", "alice@corp.example"}
+    assert {p["email"] for p in profiles} == {"joe@example.org", "alice@corp.example"}
     assert all({"email", "domain", "token"} <= set(p) for p in profiles)
 
 
@@ -3285,12 +3285,12 @@ def test_with_infisical_env_primary_falls_back_to_first(
     # allowlist excludes the active login; primary falls back to the first match
     _setup_infisical(
         monkeypatch,
-        "quickvm.com,home.example",
-        {"joe@quickvm.com": "tok-qvm", "alice@home.example": "tok-home"},
+        "example.org,home.example",
+        {"joe@example.org": "tok-joe", "alice@home.example": "tok-home"},
     )
     env = claude_profile._with_infisical_env({})
-    assert env["INFISICAL_TOKEN"] == "tok-qvm"
-    assert env["INFISICAL_DOMAIN"] == "https://infisical.quickvm.example/api"
+    assert env["INFISICAL_TOKEN"] == "tok-joe"
+    assert env["INFISICAL_DOMAIN"] == "https://infisical.example.net/api"
 
 
 def test_with_infisical_env_all_expired_unchanged(
