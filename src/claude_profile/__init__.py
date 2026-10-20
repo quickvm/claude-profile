@@ -252,6 +252,7 @@ SANDBOX_SKILL_TOOLS: dict[str, str] = {
     "podman": "Podman — run nested containers (runs rootful automatically)",
     "node": "Node.js",
     "npm": "npm",
+    "butane": "Butane (Ignition config compiler)",
 }
 
 app = typer.Typer(
