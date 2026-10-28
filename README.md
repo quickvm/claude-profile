@@ -485,7 +485,8 @@ Credentials the agent in the VM can read or use:
   read-only), and your logged-in browser through the Claude extension (see below).
 - **When the profile uses [Agent Vault](#agent-vault-infisical):** a session token, in
   `HTTPS_PROXY` and `HTTP_PROXY`, instead of the credentials themselves. It works only through
-  the proxy, only for the bundle's services, and only until the launch ends or 24 hours pass.
+  the proxy, only for the bundle's services, and only until the launch ends or the session expires
+  (after 7 days, unless the profile sets `CLAUDE_PROFILE_AGENT_VAULT_TTL`).
 
 Not mounted: `~/.ssh` (only a copy of `known_hosts`), your keyring, and other profiles'
 directories.
@@ -554,6 +555,7 @@ claude-profile env work \
 | `CLAUDE_PROFILE_AGENT_VAULT_CA_FINGERPRINT` | with `BUNDLE` | The proxy CA's fingerprint, as the Proxies page shows it (`SHA256:...`) |
 | `CLAUDE_PROFILE_AGENT_VAULT_INFISICAL_PROFILE` | no | The `infisical` login profile to mint sessions with (see `infisical profile list`), when the CLI would otherwise pick another |
 | `CLAUDE_PROFILE_AGENT_VAULT_NO_PROXY` | no | Comma-separated hosts that skip the proxy, in addition to the ones listed below |
+| `CLAUDE_PROFILE_AGENT_VAULT_TTL` | no | How long each session lasts: a whole number and `m`, `h` or `d` (`30m`, `8h`, `14d`), or `never`. `7d` when unset |
 
 claude-profile reads these keys and claude never sees them. Every other variable in the profile's
 environment reaches claude as usual, which is where placeholders go: a Bearer service replaces the
@@ -567,10 +569,16 @@ What a launch does:
    proxy doesn't answer, serves another CA, or the `infisical` CLI is missing, the launch goes
    ahead without Agent Vault and says so in red. In the sandbox the agent is told as well, and
    `CLAUDE_SANDBOX_AGENT_VAULT` is `unavailable` (`active` otherwise).
-2. **Session.** It starts itself again under `infisical agent-vault run`, which mints a 24-hour
-   session over the bundle with your Infisical login and revokes it when the launch exits,
-   including on SIGHUP and SIGTERM. If minting fails, the launch stops with the CLI's error; unset
-   `CLAUDE_PROFILE_AGENT_VAULT_BUNDLE` to launch without it.
+2. **Session.** It starts itself again under `infisical agent-vault run`, which mints a session over
+   the bundle with your Infisical login and revokes it when the launch exits, including on SIGHUP
+   and SIGTERM. If minting fails, the launch stops with the CLI's error; unset
+   `CLAUDE_PROFILE_AGENT_VAULT_BUNDLE` to launch without it. The session lasts 7 days unless
+   `CLAUDE_PROFILE_AGENT_VAULT_TTL` sets another lifetime, and Infisical can't extend it: a launch
+   that runs longer gets 403s from the proxy until you start it again
+   (`claude-profile <name> --continue` picks the conversation back up). Revoking uses your Infisical
+   login too, which the CLI never renews (it lasts 10 days by default): if it has expired by the
+   time claude exits, the CLI warns that it couldn't revoke the session, which then stays active
+   until its TTL runs out (with `never`, until you revoke it on the Sessions page).
 3. **Environment.** claude gets `HTTPS_PROXY` and `HTTP_PROXY`, which carry the session token, and
    a CA bundle with your system's roots plus the proxy's CA, so proxied and direct HTTPS both
    verify. The Claude API (`.anthropic.com`), the login and token hosts (`claude.ai`,
