@@ -4771,6 +4771,45 @@ def test_agent_vault_fingerprint_case_does_not_matter(
     assert argv[argv.index("--ca-fingerprint") + 1] == AV_PIN
 
 
+@pytest.mark.parametrize(
+    ("value", "ttl"),
+    [("30d", "30d"), ("90m", "90m"), ("12h", "12h"), ("never", "never"), ("", "7d")],
+)
+def test_agent_vault_ttl_key_sets_the_session_lifetime(
+    profiles_base: Path, infisical_cli: Path, value: str, ttl: str
+) -> None:
+    with _ca_server() as proxy:
+        _vault_profile(
+            profiles_base, proxy, extra=f"CLAUDE_PROFILE_AGENT_VAULT_TTL={value}\n"
+        )
+        with patch("os.execvpe") as mock_exec:
+            _launch_profile("work", [])
+    argv = mock_exec.call_args[0][1]
+    assert argv[argv.index("--ttl") + 1] == ttl
+
+
+# Values Infisical rejects too: the check only moves the failure ahead of the CLI, where the
+# message can name the profile's key.
+@pytest.mark.parametrize("value", ["2h30m", "0d", "-1d", "7", "forever", "Never"])
+def test_agent_vault_malformed_ttl_fails_the_launch(
+    profiles_base: Path,
+    infisical_cli: Path,
+    capsys: pytest.CaptureFixture[str],
+    value: str,
+) -> None:
+    with _ca_server() as proxy:
+        _vault_profile(
+            profiles_base, proxy, extra=f"CLAUDE_PROFILE_AGENT_VAULT_TTL={value}\n"
+        )
+        with patch("os.execvpe") as mock_exec, pytest.raises(SystemExit) as exc_info:
+            _launch_profile("work", [])
+    assert exc_info.value.code == 1
+    mock_exec.assert_not_called()
+    assert f"CLAUDE_PROFILE_AGENT_VAULT_TTLis'{value}',not" in _unwrapped(
+        capsys.readouterr().err
+    )
+
+
 def test_agent_vault_preflight_never_goes_through_a_proxy(
     profiles_base: Path, infisical_cli: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

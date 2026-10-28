@@ -129,17 +129,22 @@ SANDBOX_HOST_LOOPBACK = "169.254.1.2"
 # .env, which the VM can't change; claude-profile reads them and claude never sees them.
 AGENT_VAULT_PREFIX = "CLAUDE_PROFILE_AGENT_VAULT_"
 AGENT_VAULT_REQUIRED: tuple[str, ...] = ("BUNDLE", "PROXY", "CA_FINGERPRINT")
-AGENT_VAULT_OPTIONAL: tuple[str, ...] = ("INFISICAL_PROFILE", "NO_PROXY")
+AGENT_VAULT_OPTIONAL: tuple[str, ...] = ("INFISICAL_PROFILE", "NO_PROXY", "TTL")
 AGENT_VAULT_FINGERPRINT = re.compile(r"SHA256(:[0-9A-F]{2}){32}")
+# A session lifetime in the form the CLI documents: a whole number and m, h or d, or never.
+# Infisical's parser takes more forms, but it takes each of these, and none is under its
+# one-minute minimum.
+AGENT_VAULT_TTL = re.compile(r"[1-9][0-9]*[mhd]|never")
 # Set when a launch execs `infisical agent-vault run`, to the profile's name: the launch
 # the CLI starts finds it and goes on to claude instead of wrapping itself again.
 AGENT_VAULT_RUN_ENV = "CLAUDE_PROFILE_AGENT_VAULT_RUN"
 # Tells the VM whether its credentials are brokered: "active" or "unavailable".
 AGENT_VAULT_STATE_ENV = "CLAUDE_SANDBOX_AGENT_VAULT"
-# Infisical can't extend a session, so this has to outlast long launches. It also bounds the
-# sessions the CLI can't revoke at exit: one whose CLI was killed, or one still open when the
-# Infisical login that revokes it lapsed (the CLI never renews a login).
-AGENT_VAULT_SESSION_TTL = "7d"
+# The session lifetime unless the profile's TTL key sets one. Infisical can't extend a session,
+# so it has to outlast long launches. It also bounds the sessions the CLI can't revoke at exit:
+# one whose CLI was killed, or one still open when the Infisical login that revokes it lapsed
+# (the CLI never renews a login), which is why it isn't the CLI's own default, never.
+AGENT_VAULT_DEFAULT_TTL = "7d"
 AGENT_VAULT_PREFLIGHT_TIMEOUT = 5.0
 # claude's own traffic skips the proxy: the Claude API, the OAuth hosts (claude 2.1.296
 # refreshes its token at platform.claude.com) and the Claude in Chrome bridge. Through it,
@@ -2489,6 +2494,7 @@ class _AgentVault:
     ca_fingerprint: str
     infisical_profile: str = ""
     no_proxy: tuple[str, ...] = ()
+    ttl: str = AGENT_VAULT_DEFAULT_TTL
 
 
 @dataclass
@@ -2537,6 +2543,7 @@ def _split_agent_vault(
         ca_fingerprint=keys["CA_FINGERPRINT"].upper(),
         infisical_profile=keys.get("INFISICAL_PROFILE", ""),
         no_proxy=tuple(host.strip() for host in hosts if host.strip()),
+        ttl=keys.get("TTL") or AGENT_VAULT_DEFAULT_TTL,
     )
     return vault, rest
 
@@ -2560,6 +2567,12 @@ def _agent_vault_problems(keys: dict[str, str]) -> list[str]:
         problems.append(
             f"{AGENT_VAULT_PREFIX}CA_FINGERPRINT is not a fingerprint like SHA256:9F:2C:... "
             f"(32 bytes), as the Proxies page shows it"
+        )
+    ttl = keys.get("TTL", "")
+    if ttl and not AGENT_VAULT_TTL.fullmatch(ttl):
+        problems.append(
+            f"{AGENT_VAULT_PREFIX}TTL is {ttl!r}, not a session lifetime like 30m, 8h or 7d "
+            f"(a whole number and m, h or d) or never"
         )
     return problems
 
@@ -2623,7 +2636,7 @@ def _exec_agent_vault_run(
         "--ca-fingerprint",
         vault.ca_fingerprint,
         "--ttl",
-        AGENT_VAULT_SESSION_TTL,
+        vault.ttl,
         "--no-proxy",
         ",".join((*AGENT_VAULT_NO_PROXY, *vault.no_proxy)),
         "--",
