@@ -485,7 +485,7 @@ Credentials the agent in the VM can read or use:
   read-only), and your logged-in browser through the Claude extension (see below).
 - **When the profile uses [Agent Vault](#agent-vault-infisical):** a session token, in
   `HTTPS_PROXY` and `HTTP_PROXY`, instead of the credentials themselves. It works only through
-  the proxy, only for the bundle's services, and only until the launch ends or 24 hours pass.
+  the proxy, only for the bundle's services, and only until the launch ends or 7 days pass.
 
 Not mounted: `~/.ssh` (only a copy of `known_hosts`), your keyring, and other profiles'
 directories.
@@ -567,10 +567,15 @@ What a launch does:
    proxy doesn't answer, serves another CA, or the `infisical` CLI is missing, the launch goes
    ahead without Agent Vault and says so in red. In the sandbox the agent is told as well, and
    `CLAUDE_SANDBOX_AGENT_VAULT` is `unavailable` (`active` otherwise).
-2. **Session.** It starts itself again under `infisical agent-vault run`, which mints a 24-hour
+2. **Session.** It starts itself again under `infisical agent-vault run`, which mints a 7-day
    session over the bundle with your Infisical login and revokes it when the launch exits,
    including on SIGHUP and SIGTERM. If minting fails, the launch stops with the CLI's error; unset
-   `CLAUDE_PROFILE_AGENT_VAULT_BUNDLE` to launch without it.
+   `CLAUDE_PROFILE_AGENT_VAULT_BUNDLE` to launch without it. Infisical can't extend a session, so
+   a launch that runs past 7 days gets 403s from the proxy until you start it again
+   (`claude-profile <name> --continue` picks the conversation back up). Revoking uses your
+   Infisical login too, which the CLI never renews (it lasts 10 days by default): if it has
+   expired by the time claude exits, the CLI warns that it couldn't revoke the session, which then
+   stays active until its 7 days are up.
 3. **Environment.** claude gets `HTTPS_PROXY` and `HTTP_PROXY`, which carry the session token, and
    a CA bundle with your system's roots plus the proxy's CA, so proxied and direct HTTPS both
    verify. The Claude API (`.anthropic.com`), the login and token hosts (`claude.ai`,

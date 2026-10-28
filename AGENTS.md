@@ -435,10 +435,15 @@ hand.
   switch the vault off) or a missing required one. `_route_agent_vault` runs a pre-flight
   (`_agent_vault_preflight`: the CLI is installed, and the proxy's `/_agent-vault/ca`, fetched with
   no proxy, matches the pin). If it passes, `_exec_agent_vault_run` execs `infisical agent-vault
-  run --access-bundle … --ttl 24h --no-proxy <AGENT_VAULT_NO_PROXY plus the NO_PROXY key> --
+  run --access-bundle … --ttl 7d --no-proxy <AGENT_VAULT_NO_PROXY plus the NO_PROXY key> --
   claude-profile <name> <args>` with `AGENT_VAULT_RUN_ENV=<name>`. The CLI mints the session with
   the user's Infisical login, checks the pin again, and revokes the session when its child exits,
-  SIGHUP and SIGTERM included (checked with CLI 0.43.140). If the pre-flight fails, the launch
+  SIGHUP and SIGTERM included (checked with CLI 0.43.140). Infisical can't extend a session (its
+  `PATCH` sets only the label), and a new session is a new token, which the proxy URLs claude and
+  its children copied at start can't pick up, so `--ttl` has to outlast the launch. It is `7d`, not
+  the CLI's default `never`, because the revoke at exit uses the same login, which the CLI never
+  renews (`JWT_AUTH_LIFETIME`, 10d by default): a launch still running when it lapses, or a killed
+  CLI, leaves the session active until the TTL (CLI 0.44.6). If the pre-flight fails, the launch
   goes ahead without the vault: a red banner, and in the VM `CLAUDE_SANDBOX_AGENT_VAULT=unavailable`
   plus `AGENT_VAULT_UNAVAILABLE_BRIEFING`. The child launch matches its own name in
   `AGENT_VAULT_RUN_ENV` (another profile's doesn't count, so a launch from inside a session mints

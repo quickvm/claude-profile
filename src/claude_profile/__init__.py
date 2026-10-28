@@ -136,7 +136,10 @@ AGENT_VAULT_FINGERPRINT = re.compile(r"SHA256(:[0-9A-F]{2}){32}")
 AGENT_VAULT_RUN_ENV = "CLAUDE_PROFILE_AGENT_VAULT_RUN"
 # Tells the VM whether its credentials are brokered: "active" or "unavailable".
 AGENT_VAULT_STATE_ENV = "CLAUDE_SANDBOX_AGENT_VAULT"
-AGENT_VAULT_SESSION_TTL = "24h"
+# Infisical can't extend a session, so this has to outlast long launches. It also bounds the
+# sessions the CLI can't revoke at exit: one whose CLI was killed, or one still open when the
+# Infisical login that revokes it lapsed (the CLI never renews a login).
+AGENT_VAULT_SESSION_TTL = "7d"
 AGENT_VAULT_PREFLIGHT_TIMEOUT = 5.0
 # claude's own traffic skips the proxy: the Claude API, the OAuth hosts (claude 2.1.296
 # refreshes its token at platform.claude.com) and the Claude in Chrome bridge. Through it,

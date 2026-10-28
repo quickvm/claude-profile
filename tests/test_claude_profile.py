@@ -4743,7 +4743,7 @@ def test_agent_vault_launch_reruns_itself_under_the_cli(
         "--ca-fingerprint",
         AV_PIN,
         "--ttl",
-        "24h",
+        "7d",
         "--no-proxy",
         (
             ".anthropic.com,claude.ai,.claude.ai,claude.com,.claude.com,"
