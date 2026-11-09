@@ -1516,6 +1516,11 @@ def git_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     global_config = tmp_path / "gitconfig"
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    # The identity file includes the VM's ~/.gitconfig by its in-VM path, which inside a
+    # sandbox session is the real one, signing key and all.
+    monkeypatch.setattr(
+        claude_profile, "SANDBOX_GITCONFIG", str(tmp_path / "vm-gitconfig")
+    )
     return global_config
 
 
