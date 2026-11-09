@@ -7,6 +7,7 @@ import base64
 import contextlib
 import hashlib
 import http.server
+import io
 import json
 import os
 import signal
@@ -70,6 +71,9 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     monkeypatch.setattr(claude_profile, "SANDBOX_CA_ANCHORS", str(tmp_path / "no-ca"))
     monkeypatch.setattr(claude_profile, "SANDBOX_CA_EXTRACTED", str(tmp_path / "no-ca"))
     monkeypatch.setattr(claude_profile.settings, "sandbox", None)
+    # No terminal unless a test types into one (see _answer), so no launch stops to ask
+    # where to run, even under `pytest -s` in a terminal.
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_ssh_agent", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_gpg_agent", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_clipboard", False)
@@ -1958,6 +1962,16 @@ def test_sandbox_on_and_off_exits_1(profiles_base: Path) -> None:
     assert "mutually exclusive" in result.output
 
 
+@pytest.mark.parametrize("marked", [True, False])
+def test_sandbox_status_names_the_default_a_launch_asks_with(
+    profiles_base: Path, marked: bool
+) -> None:
+    _marked_profile(profiles_base, marked=marked)
+    out = " ".join(runner.invoke(app, ["sandbox", "work"]).output.split())
+    assert f"defaults to: {'microVM' if marked else 'host'}" in out
+    assert "asks first" in out
+
+
 def test_sandbox_status_names_an_override_that_wins(
     profiles_base: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2010,32 +2024,143 @@ def test_sandbox_on_replaces_a_linked_marker(
 
 
 # ---------------------------------------------------------------------------
-# CLAUDE_PROFILE_SANDBOX per-launch override
+# Where a launch runs: the question, the .sandbox marker, CLAUDE_PROFILE_SANDBOX
 # ---------------------------------------------------------------------------
 
 
-def test_sandbox_enabled_uses_marker_when_no_override(
-    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    p = profiles_base / "work"
-    p.mkdir(parents=True)
-    monkeypatch.setattr(claude_profile.settings, "sandbox", None)
-    assert claude_profile._sandbox_enabled(p) is False
-    (p / SANDBOX_MARKER).touch()
-    assert claude_profile._sandbox_enabled(p) is True
+class _Terminal(io.StringIO):
+    """A terminal's stdin, holding what the user types."""
+
+    def isatty(self) -> bool:
+        return True
 
 
-def test_sandbox_enabled_override_wins(
-    profiles_base: Path, monkeypatch: pytest.MonkeyPatch
+class _Interrupted(_Terminal):
+    """A terminal where the user presses Ctrl-C instead of answering."""
+
+    def readline(self, size: int | None = -1) -> str:
+        raise KeyboardInterrupt
+
+
+def _answer(
+    monkeypatch: pytest.MonkeyPatch, typed: str, terminal: type[_Terminal] = _Terminal
+) -> _Terminal:
+    """Launch from a terminal where the user types `typed`; return its stdin."""
+    stdin = terminal(typed)
+    monkeypatch.setattr(sys, "stdin", stdin)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    return stdin
+
+
+def _marked_profile(profiles_base: Path, *, marked: bool) -> Path:
+    profile = profiles_base / "work"
+    profile.mkdir(parents=True)
+    if marked:
+        (profile / SANDBOX_MARKER).touch()
+    return profile
+
+
+@pytest.fixture()
+def sandbox_launchable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Let a sandbox launch get as far as podman: the image exists, the CWD is no repo."""
+    monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.chdir(_project(tmp_path))
+
+
+def _launched(mock_exec: Mock) -> str:
+    """Where the exec'd launch runs: the microVM when it is podman, else the host."""
+    binary = mock_exec.call_args[0][0]
+    if binary == claude_profile.settings.podman_bin:
+        return "microVM"
+    assert binary == claude_profile.settings.claude_bin
+    return "host"
+
+
+@pytest.mark.parametrize(
+    ("marked", "typed", "where"),
+    [
+        (True, "\n", "microVM"),
+        (True, "n\n", "host"),
+        (False, "\n", "host"),
+        (False, "y\n", "microVM"),
+    ],
+)
+def test_launch_from_a_terminal_asks_where_to_run(
+    profiles_base: Path,
+    sandbox_launchable: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    marked: bool,
+    typed: str,
+    where: str,
 ) -> None:
-    p = profiles_base / "work"
-    p.mkdir(parents=True)
-    (p / SANDBOX_MARKER).touch()
-    monkeypatch.setattr(claude_profile.settings, "sandbox", False)
-    assert claude_profile._sandbox_enabled(p) is False
-    (p / SANDBOX_MARKER).unlink()
-    monkeypatch.setattr(claude_profile.settings, "sandbox", True)
-    assert claude_profile._sandbox_enabled(p) is True
+    # One command for both: Enter takes the profile's marker, an answer overrides it.
+    _marked_profile(profiles_base, marked=marked)
+    _answer(monkeypatch, typed)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    assert _launched(mock_exec) == where
+    default = "[Y/n]" if marked else "[y/N]"
+    assert f"Run 'work' in the sandbox? {default}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("piped", ["stdin", "stdout"])
+def test_launch_without_a_terminal_takes_the_marker_without_asking(
+    profiles_base: Path,
+    sandbox_launchable: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    piped: str,
+) -> None:
+    # `git diff | claude-profile work -p review`: stdin is claude's input, not an answer.
+    _marked_profile(profiles_base, marked=True)
+    stdin = _answer(monkeypatch, "n\n")
+    if piped == "stdin":
+        monkeypatch.setattr(stdin, "isatty", lambda: False)
+    else:
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    assert _launched(mock_exec) == "microVM"
+    assert stdin.tell() == 0
+    assert "sandbox?" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("override", [True, False])
+def test_override_decides_without_asking(
+    profiles_base: Path,
+    sandbox_launchable: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    override: bool,
+) -> None:
+    # The marker and the answer typed both disagree with the override.
+    _marked_profile(profiles_base, marked=not override)
+    monkeypatch.setattr(claude_profile.settings, "sandbox", override)
+    stdin = _answer(monkeypatch, "n\n" if override else "y\n")
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    assert _launched(mock_exec) == ("microVM" if override else "host")
+    assert stdin.tell() == 0
+    assert "sandbox?" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("terminal", [_Terminal, _Interrupted])
+def test_abandoning_the_question_launches_nothing(
+    profiles_base: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    terminal: type[_Terminal],
+) -> None:
+    # Ctrl-D (end of input) or Ctrl-C ends the launch without a traceback.
+    _marked_profile(profiles_base, marked=True)
+    _answer(monkeypatch, "", terminal)
+    with patch("os.execvpe") as mock_exec, pytest.raises(SystemExit) as exc_info:
+        _launch_profile("work", [])
+    assert exc_info.value.code == 1
+    mock_exec.assert_not_called()
+    assert "Aborted!" in capsys.readouterr().err
 
 
 def test_override_forces_host_despite_marker(
@@ -3941,7 +4066,7 @@ def test_sandbox_marker_planted_as_dangling_link_still_sandboxes(
     profile = tmp_path / "prof"
     profile.mkdir()
     (profile / SANDBOX_MARKER).symlink_to(tmp_path / "gone")
-    assert claude_profile._sandbox_enabled(profile) is True
+    assert claude_profile._choose_sandbox("prof", profile) is True
 
 
 def test_sandbox_mounts_known_hosts_global_ro_and_user_rw(
@@ -4756,6 +4881,42 @@ def test_agent_vault_launch_reruns_itself_under_the_cli(
         "hi",
     ]
     assert env[claude_profile.AGENT_VAULT_RUN_ENV] == "work"
+
+
+@pytest.mark.parametrize(("typed", "where"), [("n\n", "host"), ("\n", "microVM")])
+def test_agent_vault_launch_asks_once(
+    profiles_base: Path,
+    infisical_cli: Path,
+    sandbox_launchable: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    typed: str,
+    where: str,
+) -> None:
+    # Asked before the CLI mints a session; the launch the CLI starts takes the answer.
+    _answer(monkeypatch, typed)
+    with _ca_server() as proxy:
+        _vault_profile(profiles_base, proxy, sandbox=True)
+        with patch("os.execvpe") as mock_exec:
+            _launch_profile("work", [])
+    binary, _argv, env = mock_exec.call_args[0]
+    assert binary == str(infisical_cli)
+
+    # The launch the CLI starts, which reads the setting at import.
+    _inner_run_env(monkeypatch, tmp_path)
+    override = claude_profile.SANDBOX_OVERRIDE_ENV
+    monkeypatch.setenv(override, env[override])
+    monkeypatch.setattr(
+        claude_profile.settings, "sandbox", claude_profile.Settings().sandbox
+    )
+    _answer(monkeypatch, "y\n" if where == "host" else "n\n")
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    assert _launched(mock_exec) == where
+    assert capsys.readouterr().out.count("in the sandbox?") == 1
+    # A launch started from this claude decides where to run for itself.
+    assert override not in mock_exec.call_args[0][2]
 
 
 def test_agent_vault_fingerprint_case_does_not_matter(

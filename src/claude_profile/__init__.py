@@ -78,6 +78,8 @@ LINKABLE_DIRS: tuple[str, ...] = ("commands", "skills", "hooks")
 # profile dir, and a copy goes stale the moment the global script changes.
 STATUSLINE_FILE = "statusline.sh"
 SANDBOX_MARKER = ".sandbox"
+# Settings reads it as `sandbox`. Set, it decides where every launch runs, without asking.
+SANDBOX_OVERRIDE_ENV = "CLAUDE_PROFILE_SANDBOX"
 SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 SANDBOX_CONFIG_DIR = "/home/appuser/.claude"
 SANDBOX_GNUPGHOME = "/home/appuser/.gnupg"
@@ -349,7 +351,7 @@ def _setup_dir_link(profile_dir: Path, dir_name: str, link: bool) -> None:
 def add_profile(
     name: str = typer.Argument(..., help="Profile name to create"),
     sandbox: bool = typer.Option(
-        False, "--sandbox", help="Run this profile in a microVM (podman + krun)."
+        False, "--sandbox", help="Default this profile to a microVM (podman + krun)."
     ),
 ) -> None:
     """Create a new profile."""
@@ -372,7 +374,7 @@ def add_profile(
 
     console.print(f"[green]Created profile '{name}'[/green] at {d}")
     if sandbox:
-        console.print("[cyan]Sandbox mode: launches run in a microVM.[/cyan]")
+        console.print("[cyan]Sandbox mode: launches default to a microVM.[/cyan]")
         if not _sandbox_image_exists():
             console.print(
                 f"Build the sandbox image first: claude-profile build "
@@ -743,12 +745,10 @@ def sandbox_cache(
 @app.command("sandbox")
 def manage_sandbox(
     name: str = typer.Argument(..., help="Profile name"),
-    on: bool = typer.Option(False, "--on", help="Enable sandbox (microVM) mode."),
-    off: bool = typer.Option(
-        False, "--off", help="Disable sandbox mode (run on host)."
-    ),
+    on: bool = typer.Option(False, "--on", help="Default to the microVM sandbox."),
+    off: bool = typer.Option(False, "--off", help="Default to the host."),
 ) -> None:
-    """Enable, disable, or show microVM sandbox mode for a profile."""
+    """Set or show where a profile launches by default: microVM sandbox or host."""
     if on and off:
         err_console.print("[red]Error: --on and --off are mutually exclusive.[/red]")
         raise typer.Exit(code=1)
@@ -768,12 +768,12 @@ def manage_sandbox(
         if marker.is_symlink():
             marker.unlink()
         marker.touch()
-        console.print(f"[green]Sandbox enabled for '{name}'.[/green]")
+        console.print(f"[green]'{name}' now defaults to the microVM sandbox.[/green]")
         if not _sandbox_image_exists():
             console.print("Build the image first: claude-profile build")
     else:
         marker.unlink(missing_ok=True)
-        console.print(f"[green]Sandbox disabled for '{name}' (runs on host).[/green]")
+        console.print(f"[green]'{name}' now defaults to the host.[/green]")
     note = _sandbox_override_note()
     if note is not None and settings.sandbox != on:
         console.print(f"[yellow]{note}[/yellow]")
@@ -781,12 +781,16 @@ def manage_sandbox(
 
 def _print_sandbox_status(name: str, profile_dir: Path) -> None:
     """Say where the profile launches, and why when CLAUDE_PROFILE_SANDBOX decides it."""
-    state = "microVM" if _sandbox_enabled(profile_dir) else "host"
-    console.print(f"Profile '{name}' launches on: {state}")
+    own = "microVM" if _sandbox_marked(profile_dir) else "host"
     note = _sandbox_override_note()
-    if note is not None:
-        own = "microVM" if _sandbox_marked(profile_dir) else "host"
-        console.print(f"{note} Its own setting is {own}.")
+    if note is None:
+        console.print(
+            f"Profile '{name}' defaults to: {own} (a launch from a terminal asks first)"
+        )
+        return
+    state = "microVM" if settings.sandbox else "host"
+    console.print(f"Profile '{name}' launches on: {state}")
+    console.print(f"{note} Its own default is {own}.")
 
 
 @app.command("remove")
@@ -2614,7 +2618,7 @@ def _agent_vault_preflight(vault: _AgentVault) -> str | None:
 
 
 def _exec_agent_vault_run(
-    name: str, vault: _AgentVault, claude_args: list[str]
+    name: str, vault: _AgentVault, claude_args: list[str], *, sandbox: bool
 ) -> None:
     """Replace this process with `infisical agent-vault run` around this same launch.
 
@@ -2622,8 +2626,9 @@ def _exec_agent_vault_run(
     checks the proxy's CA against the pin and starts the launch again as its child, with
     the proxy and CA variables set. When the child exits, on SIGHUP or SIGTERM too, it
     revokes the session. The child finds its profile's name in AGENT_VAULT_RUN_ENV and
-    goes on to claude. Unlike every other launch, this one leaves a process between the
-    terminal and claude: the CLI has to outlive claude to revoke the session.
+    where to run in CLAUDE_PROFILE_SANDBOX, so it goes on to claude without asking
+    again. Unlike every other launch, this one leaves a process between the terminal and
+    claude: the CLI has to outlive claude to revoke the session.
     """
     argv = [settings.infisical_bin, "agent-vault", "run", "--silent"]
     if vault.infisical_profile:
@@ -2644,11 +2649,16 @@ def _exec_agent_vault_run(
         name,
         *claude_args,
     ]
-    os.execvpe(settings.infisical_bin, argv, {**os.environ, AGENT_VAULT_RUN_ENV: name})
+    env = {
+        **os.environ,
+        AGENT_VAULT_RUN_ENV: name,
+        SANDBOX_OVERRIDE_ENV: "1" if sandbox else "0",
+    }
+    os.execvpe(settings.infisical_bin, argv, env)
 
 
 def _route_agent_vault(
-    name: str, vault: _AgentVault, claude_args: list[str]
+    name: str, vault: _AgentVault, claude_args: list[str], *, sandbox: bool
 ) -> _VaultRun | None:
     """Send a launch that opted in through the vault; None once it has exec'd the CLI.
 
@@ -2660,7 +2670,7 @@ def _route_agent_vault(
         return _VaultRun(_take_agent_vault_session())
     reason = _agent_vault_preflight(vault)
     if reason is None:
-        _exec_agent_vault_run(name, vault, claude_args)
+        _exec_agent_vault_run(name, vault, claude_args, sandbox=sandbox)
         return None
     err_console.print(
         f"[bold red]Agent Vault is unavailable: {escape(reason)}. Launching {name} without "
@@ -2674,9 +2684,13 @@ def _take_agent_vault_session() -> dict[str, str]:
 
     What the launch runs on the host from here on (podman, git, gh) gets the host's own
     environment back, not a proxy and a CA file holding only the proxy's root. Each
-    launch path then gives claude its share.
+    launch path then gives claude its share. AGENT_VAULT_RUN_ENV and
+    CLAUDE_PROFILE_SANDBOX, which the launch that ran the CLI set, go too: a launch
+    started from this claude gets a session of its own and decides where to run for
+    itself.
     """
     os.environ.pop(AGENT_VAULT_RUN_ENV, None)
+    os.environ.pop(SANDBOX_OVERRIDE_ENV, None)
     names = (*AGENT_VAULT_SESSION_VARS, *AGENT_VAULT_PROXY_VARS, *AGENT_VAULT_CA_VARS)
     session = {name: os.environ.pop(name) for name in names if name in os.environ}
     if "HTTPS_PROXY" not in session or "SSL_CERT_FILE" not in session:
@@ -3044,15 +3058,23 @@ def _wait_forwarding_signals(proc: subprocess.Popen[bytes]) -> int:
             signal.signal(sig, handler)
 
 
-def _sandbox_enabled(profile_dir: Path) -> bool:
-    """Decide whether to launch in a sandbox.
+def _choose_sandbox(name: str, profile_dir: Path) -> bool:
+    """Decide whether this launch runs in the microVM, asking when a terminal can answer.
 
-    The ``CLAUDE_PROFILE_SANDBOX`` env override wins when set; otherwise the
-    profile's ``.sandbox`` marker decides.
+    CLAUDE_PROFILE_SANDBOX decides without asking. Otherwise a launch from a terminal
+    asks, with the profile's .sandbox marker as the default answer. A launch without one
+    (a script, a pipe) takes the marker: its stdin is claude's input, not an answer.
     """
     if settings.sandbox is not None:
         return settings.sandbox
-    return _sandbox_marked(profile_dir)
+    marked = _sandbox_marked(profile_dir)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return marked
+    try:
+        return typer.confirm(f"Run '{name}' in the sandbox?", default=marked)
+    except typer.Abort:
+        err_console.print("\nAborted!")
+        sys.exit(1)
 
 
 def _sandbox_marked(profile_dir: Path) -> bool:
@@ -3068,7 +3090,10 @@ def _sandbox_override_note() -> str | None:
     if settings.sandbox is None:
         return None
     where = "in a microVM" if settings.sandbox else "on the host"
-    return f"CLAUDE_PROFILE_SANDBOX is set, so every profile launches {where} until it is unset."
+    return (
+        f"{SANDBOX_OVERRIDE_ENV} is set, so every profile launches {where} without asking "
+        f"until it is unset."
+    )
 
 
 def _was_sandboxed(profile_dir: Path) -> bool:
@@ -3105,12 +3130,13 @@ def _launch_profile(name: str, claude_args: list[str]) -> None:
         )
         sys.exit(1)
     vault, extra_env = _split_agent_vault(d, _load_profile_env(d))
+    sandbox = _choose_sandbox(name, d)
     vault_run = None
     if vault is not None:
-        vault_run = _route_agent_vault(name, vault, claude_args)
+        vault_run = _route_agent_vault(name, vault, claude_args, sandbox=sandbox)
         if vault_run is None:
             return  # exec'd `infisical agent-vault run`, which starts this launch again
-    if _sandbox_enabled(d):
+    if sandbox:
         _launch_sandbox(d, claude_args, extra_env, vault_run=vault_run)
         return
     _check_statusline_link(d)

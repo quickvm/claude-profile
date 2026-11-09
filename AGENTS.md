@@ -74,9 +74,13 @@ hand.
   `_launch_profile()` loads `.env` into the environment before `execvpe`. `_write_env_file`
   keeps `.env` at mode 0600: it holds tokens, and profile dirs are world-readable like
   `~/.claude`.
-- **Sandbox mode (microVM):** a profile marked with a `.sandbox` file (created by
-  `add --sandbox`) launches inside a podman + `krun` microVM instead of on the host.
-  `_launch_profile()` checks the marker and routes to `_launch_sandbox()`, which
+- **Sandbox mode (microVM):** a launch can run inside a podman + `krun` microVM instead of on
+  the host. `_launch_profile()` asks `_choose_sandbox()` where to run: `CLAUDE_PROFILE_SANDBOX`
+  decides when set; otherwise a launch from a terminal (stdin and stdout both TTYs, the same test
+  that gives podman `-t`) asks `Run '<name>' in the sandbox?`, defaulting to the profile's
+  `.sandbox` marker (created by `add --sandbox`), and a launch without one takes the marker
+  without asking, since its stdin is claude's input. Ctrl-C or end of input at the question exits
+  1 with "Aborted!", like typer's own prompts. A microVM launch goes to `_launch_sandbox()`, which
   `os.execvpe`s `podman run --annotation run.oci.handler=krun …` in place of `claude`.
 - **`build` command:** builds the sandbox image (`settings.sandbox_image`) from the
   packaged build context `src/claude_profile/sandbox/` (`Containerfile` +
@@ -197,7 +201,7 @@ hand.
 - **Statusline check:** the VM gets the global `statusline.sh` read-only but can replace the
   profile's link to it, and claude runs the statusline on every host launch. On host launches of a
   profile that is marked for the sandbox or has a sandbox state dir (`_was_sandboxed`; the state
-  dir also catches `CLAUDE_PROFILE_SANDBOX=1` launches), `_check_statusline_link` warns unless
+  dir also catches microVM launches of an unmarked profile), `_check_statusline_link` warns unless
   `statusline.sh` is absent or the link to `~/.claude/statusline.sh`.
 - **Post-session report:** `.claude.json` stays writable from the VM (a copy would lose the
   session's own state), so supervised launches snapshot what it makes the host run
@@ -421,10 +425,11 @@ hand.
   parallel worktree sandboxes can't corrupt it.
 - **Pinned launch files:** `_launch_state_mounts` mounts the profile's `.sandbox` marker and
   `.env` read-only over themselves (creating an empty 0600 `.env` if missing). Otherwise an
-  agent could delete the marker, so the next plain launch silently ran on the host, or
-  plant `LD_PRELOAD` and the like in `.env` for that launch. `_load_profile_env` refuses a
-  `.env` that is a symlink (its target's KEY=VALUE lines would reach the VM, and `env --set`
-  would overwrite the target), and `_sandbox_enabled` counts even a dangling marker link.
+  agent could delete the marker, so the next launch defaulted to the host (and one without a
+  terminal silently ran there), or plant `LD_PRELOAD` and the like in `.env` for that launch.
+  `_load_profile_env` refuses a `.env` that is a symlink (its target's KEY=VALUE lines would
+  reach the VM, and `env --set` would overwrite the target), and `_sandbox_marked` counts even a
+  dangling marker link.
 - **Agent Vault (`_split_agent_vault`, `_route_agent_vault`):** a profile opts in with
   `CLAUDE_PROFILE_AGENT_VAULT_*` keys in its `.env`: `BUNDLE` switches it on and then needs `PROXY`
   and `CA_FINGERPRINT`; `INFISICAL_PROFILE`, `NO_PROXY` and `TTL` are optional. They are there, not
@@ -438,7 +443,9 @@ hand.
   runs a pre-flight (`_agent_vault_preflight`: the CLI is installed, and the proxy's
   `/_agent-vault/ca`, fetched with no proxy, matches the pin). If it passes, `_exec_agent_vault_run`
   execs `infisical agent-vault run --access-bundle … --ttl <TTL> --no-proxy <AGENT_VAULT_NO_PROXY
-  plus the NO_PROXY key> -- claude-profile <name> <args>` with `AGENT_VAULT_RUN_ENV=<name>`. The CLI
+  plus the NO_PROXY key> -- claude-profile <name> <args>` with `AGENT_VAULT_RUN_ENV=<name>`, and
+  with `CLAUDE_PROFILE_SANDBOX` set to where the launch chose to run (it asks before the
+  pre-flight), so the child runs there without asking again. The CLI
   mints the session with the user's Infisical login, checks the pin again, and revokes the session
   when its child exits, SIGHUP and SIGTERM included (checked with CLI 0.43.140). Infisical can't
   extend a session (its `PATCH` sets only the label), and a new session is a new token, which the
@@ -451,12 +458,13 @@ hand.
   plus `AGENT_VAULT_UNAVAILABLE_BRIEFING`. The child launch matches its own name in
   `AGENT_VAULT_RUN_ENV` (another profile's doesn't count, so a launch from inside a session mints
   its own), and `_take_agent_vault_session` pops the CLI's variables from `os.environ`, so podman,
-  git and gh run with the host's own environment. The CLI's CA file holds only the proxy's root,
-  which breaks direct HTTPS in curl, git and Python, so `_agent_vault_ca_bundle` writes the system
-  bundle (`_system_ca_bundle`) plus that root to the data dir, named by content. Host launches give
-  claude the CLI's variables with every CA variable on that bundle (`_agent_vault_host_env`).
-  Sandbox launches (`_with_agent_vault`) put the proxy URLs in the secret env file
-  (`OPENCLAW_PROXY_URL` stays out), add the host loopback to `NO_PROXY`, set
+  git and gh run with the host's own environment. It pops `CLAUDE_PROFILE_SANDBOX` too: inherited,
+  it would decide where every launch started from that claude runs. The CLI's CA file holds only
+  the proxy's root, which breaks direct HTTPS in curl, git and Python, so `_agent_vault_ca_bundle`
+  writes the system bundle (`_system_ca_bundle`) plus that root to the data dir, named by content.
+  Host launches give claude the CLI's variables with every CA variable on that bundle
+  (`_agent_vault_host_env`). Sandbox launches (`_with_agent_vault`) put the proxy URLs in the
+  secret env file (`OPENCLAW_PROXY_URL` stays out), add the host loopback to `NO_PROXY`, set
   `NODE_USE_ENV_PROXY=1`, point the CA variables at `SANDBOX_VM_CA_BUNDLE`, and mount the bundle
   there read-only after `_ca_trust_mounts`, so every default path in the image trusts the proxy's
   CA without an entrypoint change. Placeholder tokens are ordinary `.env` values. podman runs
@@ -474,10 +482,11 @@ hand.
   loses to an image's own `ENV` (github-mcp-server sets `SSL_CERT_FILE`), and `[engine] env`
   doesn't change podman's own environment, which `-e NAME` and build steps copy from.
 - **`sandbox` subcommand & override:** `sandbox <name> --on/--off` toggles the `.sandbox`
-  marker on an existing profile (shows status when no flag). `_sandbox_enabled()` decides
-  per launch: the `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state
-  `bool | None`) wins when set, otherwise the marker (`_sandbox_marked`, which uses `lexists`
-  so a dangling marker link counts, failing safe). The status, `--on`/`--off` and `list` print
+  marker on an existing profile, which is the launch question's default (shows that default
+  when no flag). The `CLAUDE_PROFILE_SANDBOX` override (`settings.sandbox`, a tri-state
+  `bool | None`, named by `SANDBOX_OVERRIDE_ENV`) decides without asking when set; otherwise
+  `_choose_sandbox` asks or takes the marker (`_sandbox_marked`, which uses `lexists` so a
+  dangling marker link counts, failing safe). The status, `--on`/`--off` and `list` print
   `_sandbox_override_note` while the override is set, or they would show the marker while
   launches did something else; `list` and `_was_sandboxed` read the marker the same way the
   launch does. `--on` replaces a linked marker rather than `touch` its target.
