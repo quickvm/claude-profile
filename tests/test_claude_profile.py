@@ -1604,6 +1604,22 @@ def test_git_identity_skips_signing_that_cannot_work_in_the_vm(
     assert _git_get("gpg.format", config) is None
 
 
+def test_git_identity_includes_the_mounted_gitconfig_first(
+    git_identity: Path, tmp_path: Path
+) -> None:
+    # GIT_CONFIG_GLOBAL takes the place of ~/.gitconfig in the VM: without the include,
+    # the VM's git loses every other global setting, and with the include after the
+    # resolved values, the default identity in ~/.gitconfig wins again.
+    repo = _repo_with_work_identity(git_identity, tmp_path)
+    Path(claude_profile.SANDBOX_GITCONFIG).write_text(
+        "[user]\n\temail = alice@home.example\n[alias]\n\tst = status\n"
+    )
+    config = _vm_git_config(claude_profile._git_identity_mounts(repo, signing=False))
+    assert config is not None
+    assert _git_get("alias.st", config) == "status"
+    assert _git_get("user.email", config) == "alice@corp.example"
+
+
 def test_git_identity_lets_repo_config_override_it(
     git_identity: Path, tmp_path: Path
 ) -> None:
