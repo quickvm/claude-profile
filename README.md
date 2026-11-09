@@ -30,14 +30,14 @@ uv tool install .
 
 ```sh
 claude-profile add <name>            # create a new profile
-claude-profile add <name> --sandbox  # create a profile that runs in a microVM
+claude-profile add <name> --sandbox  # create a profile that defaults to a microVM
 claude-profile list                  # list all profiles, auth status, and sandbox mode
 claude-profile remove <name>         # delete a profile
 claude-profile links <name>          # inspect or change directory symlinks
-claude-profile sandbox <name>        # turn microVM mode on/off for a profile
+claude-profile sandbox <name>        # set a profile's default: microVM or host
 claude-profile build                 # build the microVM sandbox image
 claude-profile sandbox-skill         # (re)generate the in-sandbox tools skill
-claude-profile <name> [args...]      # launch claude with the given profile
+claude-profile <name> [args...]      # launch claude with the given profile, asking where
 ```
 
 ### Creating a profile
@@ -191,12 +191,18 @@ Containerfile, run `claude-profile sandbox-skill` (or `--check` to catch drift).
 
 ### Launching
 
-A sandboxed profile launches in a microVM on every run — same command as always:
+Every launch from a terminal asks where to run, so one command covers both:
 
-```sh
-cd ~/src/myproject
-claude-profile work                # boots a microVM, mounts this directory, runs claude
+```console
+$ cd ~/src/myproject
+$ claude-profile work
+Run 'work' in the sandbox? [Y/n]:
 ```
+
+Enter takes the profile's default (see
+[Turning sandbox mode on or off](#turning-sandbox-mode-on-or-off)): here, a microVM that mounts
+this directory and runs claude. `n` runs claude on the host instead. A launch with no terminal
+to ask on (a script, or claude's input or output piped) takes the default without asking.
 
 Each launch is its own throwaway microVM, so you can run many at once. This fits a
 per-worktree workflow — one terminal per worktree:
@@ -221,26 +227,22 @@ mounted **read-only** into the VM so the links resolve there too, as is your `~/
 
 ### Turning sandbox mode on or off
 
-Flip an existing profile between host and microVM (its credentials carry over either way):
+A profile's default is what Enter answers at the launch question, and where launches without
+a terminal run. Flip it between host and microVM (the profile's credentials carry over either
+way):
 
 ```sh
-claude-profile sandbox personal --on    # personal now launches in a microVM
-claude-profile sandbox personal --off   # back to running on the host
-claude-profile sandbox personal         # show current mode
+claude-profile sandbox personal --on    # personal now defaults to a microVM
+claude-profile sandbox personal --off   # back to defaulting to the host
+claude-profile sandbox personal         # show the current default
 ```
 
-Override per launch without changing the profile's default, via `CLAUDE_PROFILE_SANDBOX`:
+`CLAUDE_PROFILE_SANDBOX` decides without asking, for one launch or, exported, for all of them
+(`export CLAUDE_PROFILE_SANDBOX=0` if you never use the sandbox):
 
 ```sh
 CLAUDE_PROFILE_SANDBOX=0 claude-profile personal   # this run on the host
 CLAUDE_PROFILE_SANDBOX=1 claude-profile personal   # this run in a microVM
-```
-
-Aliases make both modes one word:
-
-```sh
-alias claude-personal='claude-profile personal'                        # profile default
-alias claude-personal-host='CLAUDE_PROFILE_SANDBOX=0 claude-profile personal'
 ```
 
 ### Credentials
@@ -503,8 +505,8 @@ What else the VM can reach:
   - `.git/hooks/`, the profile's `settings.json` and the project's
     `.claude/settings.local.json` are copies in the VM, thrown away when it exits. Hooks you
     have on the host still run in the VM.
-  - The `.sandbox` marker and `.env` are read-only, so the agent can't switch the next launch
-    to the host or plant variables in it.
+  - The `.sandbox` marker and `.env` are read-only, so the agent can't make the host the
+    profile's default or plant variables in the next launch.
   - On a host launch of a sandboxed profile you're warned if `statusline.sh` is no longer the
     link to `~/.claude/statusline.sh`.
   - When a session that forwards anything (SSH, GPG, clipboard) ends, you're told
@@ -632,7 +634,7 @@ the proxy. The VM side needs an image built from this version (`claude-profile b
 | `CLAUDE_PROFILE_SANDBOX_INFISICAL` | _(empty)_ | Allowlist (comma-separated emails/domains) of infisical logins to forward into the VM as `INFISICAL_TOKEN`/`--token` |
 | `CLAUDE_PROFILE_SANDBOX_PULUMI` | `false` | Forward your Pulumi Cloud token into the VM as `PULUMI_ACCESS_TOKEN` so `pulumi` acts as you |
 | `CLAUDE_PROFILE_SANDBOX_FORWARD_ENV` | _(empty)_ | Comma-separated host env var names to copy into the VM (e.g. tokens MCP servers pass through as `-e VAR`, or `HTTPS_PROXY`: the host's proxy settings aren't passed in otherwise) |
-| `CLAUDE_PROFILE_SANDBOX` | _(unset)_ | Per-launch override: `1` forces microVM, `0` forces host; unset uses the profile's setting |
+| `CLAUDE_PROFILE_SANDBOX` | _(unset)_ | `1` launches in a microVM and `0` on the host, without asking; unset asks from a terminal, defaulting to the profile's setting, and otherwise uses that setting |
 
 ## License
 
