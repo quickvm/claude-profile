@@ -123,6 +123,32 @@ def test_unix_relay_closes_when_the_agent_is_gone(tmp_path: Path) -> None:
         server.close()
 
 
+def test_stdio_program_reads_and_answers_on_the_connection() -> None:
+    program = bridges.stdio_program(
+        ["sh", "-c", 'read -r line; echo "got $line $MARK"'],
+        {"PATH": os.environ["PATH"], "MARK": "from-env"},
+    )
+    server = bridges.BridgeServer({"mcp": program})
+    server.start()
+    try:
+        with _connect(server, f"{server.token} mcp") as client:
+            client.sendall(b"hello\n")
+            assert _read_all(client) == b"got hello from-env\n"
+    finally:
+        server.close()
+
+
+def test_stdio_program_closes_when_the_program_cannot_start(tmp_path: Path) -> None:
+    program = bridges.stdio_program([str(tmp_path / "missing")], {})
+    server = bridges.BridgeServer({"mcp": program})
+    server.start()
+    try:
+        with _connect(server, f"{server.token} mcp") as client:
+            assert _read_all(client) == b""
+    finally:
+        server.close()
+
+
 def _fake_tool(bin_dir: Path, name: str, record: Path, exit_code: int = 0) -> None:
     """A stand-in for a host tool that records its arguments and prints 'ran'."""
     bin_dir.mkdir(exist_ok=True)

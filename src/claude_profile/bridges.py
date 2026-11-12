@@ -16,7 +16,7 @@ import secrets
 import socket
 import subprocess
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 # A service gets the connection right after the handshake line and owns it from there.
@@ -106,6 +106,31 @@ def unix_relay(path: Path) -> Service:
             except OSError:
                 return
             pump(conn, agent)
+
+    return serve
+
+
+def stdio_program(argv: Sequence[str], env: Mapping[str, str]) -> Service:
+    """A service running argv with the connection as its stdin and stdout (an MCP server).
+
+    The program reads the client's bytes from the socket and writes its replies to it, so
+    nothing relays them, and a stdio MCP server ends at the end of its input, when the client
+    closes. Its stderr is dropped: the launcher's terminal is claude's TUI. A program that
+    can't start closes the connection, which claude reports as a failed MCP server.
+    """
+
+    def serve(conn: socket.socket) -> None:
+        try:
+            process = subprocess.Popen(
+                list(argv),
+                stdin=conn.fileno(),
+                stdout=conn.fileno(),
+                stderr=subprocess.DEVNULL,
+                env=dict(env),
+            )
+        except OSError:
+            return
+        process.wait()
 
     return serve
 

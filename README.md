@@ -463,6 +463,23 @@ sandbox then mounts that store read-only (a podman `additionalimagestore`) whene
 so those images are found locally instead of pulled — no launch-time pull. It's read-only and
 shared, so your parallel worktree sandboxes can't corrupt it. Re-run to update; `--clear` empties it.
 
+### atuin
+
+[atuin](https://atuin.sh)'s MCP server (`atuin mcp`) searches your shell history and, with
+atuin's threads, your coding agents' past sessions. It reads atuin's databases on the host, so it
+can't run in the VM, and host and VM launches share the profile's `.claude.json`, so a server
+registered there fails in one of them. Have claude-profile add it to every launch instead:
+
+```sh
+export CLAUDE_PROFILE_ATUIN_MCP=1
+```
+
+A host launch runs `atuin mcp` itself. A microVM launch runs `bridge-connect atuin-mcp` in the VM,
+and the launcher hands that connection to an `atuin mcp` it starts on the host with
+`CLAUDE_CONFIG_DIR` set to the profile directory, so atuin's databases and sync key never enter
+the VM. Both get the server through `--mcp-config=`, so don't also register an `atuin` server in
+`.claude.json`.
+
 ### Security
 
 A microVM raises the bar considerably but is not a perfect boundary. Networking stays open
@@ -484,7 +501,9 @@ Credentials the agent in the VM can read or use:
   (`CLAUDE_PROFILE_SANDBOX_INFISICAL`), your Pulumi Cloud token
   (`CLAUDE_PROFILE_SANDBOX_PULUMI`), the variables named in
   `CLAUDE_PROFILE_SANDBOX_FORWARD_ENV`, your clipboard (`CLAUDE_PROFILE_SANDBOX_CLIPBOARD`,
-  read-only), and your logged-in browser through the Claude extension (see below).
+  read-only), atuin's MCP server (`CLAUDE_PROFILE_ATUIN_MCP`: it can search your shell history
+  and captured agent threads, not change them), and your logged-in browser through the Claude
+  extension (see below).
 - **When the profile uses [Agent Vault](#agent-vault-infisical):** a session token, in
   `HTTPS_PROXY` and `HTTP_PROXY`, instead of the credentials themselves. It works only through
   the proxy, only for the bundle's services, and only until the launch ends or the session expires
@@ -634,6 +653,7 @@ the proxy. The VM side needs an image built from this version (`claude-profile b
 | `CLAUDE_PROFILE_SANDBOX_INFISICAL` | _(empty)_ | Allowlist (comma-separated emails/domains) of infisical logins to forward into the VM as `INFISICAL_TOKEN`/`--token` |
 | `CLAUDE_PROFILE_SANDBOX_PULUMI` | `false` | Forward your Pulumi Cloud token into the VM as `PULUMI_ACCESS_TOKEN` so `pulumi` acts as you |
 | `CLAUDE_PROFILE_SANDBOX_FORWARD_ENV` | _(empty)_ | Comma-separated host env var names to copy into the VM (e.g. tokens MCP servers pass through as `-e VAR`, or `HTTPS_PROXY`: the host's proxy settings aren't passed in otherwise) |
+| `CLAUDE_PROFILE_ATUIN_MCP` | `false` | Give claude atuin's MCP server: `atuin mcp` on a host launch, and through the bridge on a microVM launch; needs `atuin` on the host's PATH |
 | `CLAUDE_PROFILE_SANDBOX` | _(unset)_ | `1` launches in a microVM and `0` on the host, without asking; unset asks from a terminal, defaulting to the profile's setting, and otherwise uses that setting |
 
 ## License

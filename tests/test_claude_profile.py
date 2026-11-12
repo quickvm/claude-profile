@@ -82,6 +82,7 @@ def _reset_sandbox_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     monkeypatch.setattr(claude_profile.settings, "sandbox_infisical", "")
     monkeypatch.setattr(claude_profile.settings, "sandbox_pulumi", False)
     monkeypatch.setattr(claude_profile.settings, "sandbox_forward_env", "")
+    monkeypatch.setattr(claude_profile.settings, "atuin_mcp", False)
     # Default the image-user check to root so launch tests skip the real podman call.
     monkeypatch.setattr(claude_profile, "_sandbox_image_user", lambda: "")
     # Default the host-claude probe to "not a native install" so tests never read (or
@@ -2753,12 +2754,13 @@ def test_launch_supervised_when_forwarding(
 def test_bridge_services_match_the_forwarding(tmp_path: Path) -> None:
     sock = tmp_path / "agent.sock"
     fwd = claude_profile._Forwarding(
-        [(sock, sock, "ssh-0"), (sock, sock, "gpg")], clipboard=True
+        [(sock, sock, "ssh-0"), (sock, sock, "gpg")], clipboard=True, atuin_mcp=True
     )
-    services = claude_profile._bridge_services(fwd)
-    assert set(services) == {"ssh-0", "gpg", "clipboard"}
+    services = claude_profile._bridge_services(fwd, tmp_path / "prof")
+    assert set(services) == {"ssh-0", "gpg", "clipboard", "atuin-mcp"}
     assert services["clipboard"] is bridges.clipboard
-    assert set(claude_profile._bridge_services(claude_profile._Forwarding([]))) == set()
+    nothing = claude_profile._Forwarding([])
+    assert set(claude_profile._bridge_services(nothing, tmp_path / "prof")) == set()
 
 
 SUPERVISOR_HARNESS = textwrap.dedent(
@@ -2960,6 +2962,104 @@ def test_launch_no_forwards_uses_exec(
     binname, argv, _env = mock_exec.call_args[0]
     assert binname == claude_profile.settings.podman_bin
     assert not any(arg.startswith("--network=pasta") for arg in argv)
+
+
+# ---------------------------------------------------------------------------
+# atuin MCP
+# ---------------------------------------------------------------------------
+
+ATUIN_BRIDGE_CONFIG = (
+    '--mcp-config={"mcpServers": {"atuin": {"command": '
+    '"/usr/local/libexec/claude-sandbox/bridge-connect", "args": ["atuin-mcp"]}}}'
+)
+ATUIN_HOST_CONFIG = (
+    '--mcp-config={"mcpServers": {"atuin": {"command": "atuin", "args": ["mcp"]}}}'
+)
+
+
+@pytest.fixture()
+def atuin_on_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """CLAUDE_PROFILE_ATUIN_MCP on, and a stand-in atuin first on PATH.
+
+    It prints its CLAUDE_CONFIG_DIR and arguments, then echoes its input, the way a stdio
+    MCP server answers on the stream it reads.
+    """
+    bin_dir = tmp_path / "atuin-bin"
+    bin_dir.mkdir()
+    atuin = bin_dir / "atuin"
+    atuin.write_text(
+        '#!/bin/sh\nprintf "%s %s\\n" "$CLAUDE_CONFIG_DIR" "$*"\nexec cat\n'
+    )
+    atuin.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(claude_profile.settings, "atuin_mcp", True)
+    return atuin
+
+
+def test_atuin_mcp_service_runs_atuin_mcp_on_the_connection(
+    atuin_on_path: Path, tmp_path: Path
+) -> None:
+    profile = tmp_path / "prof"
+    fwd = claude_profile._Forwarding([], atuin_mcp=True)
+    server = bridges.BridgeServer(claude_profile._bridge_services(fwd, profile))
+    server.start()
+    try:
+        with socket.create_connection(("127.0.0.1", server.port), timeout=5) as client:
+            # The request right behind the handshake reaches atuin, and atuin's end of
+            # input (the client closing) ends it and the connection.
+            client.sendall(f"{server.token} atuin-mcp\n".encode() + b'{"id":1}\n')
+            client.shutdown(socket.SHUT_WR)
+            reply = b"".join(iter(lambda: client.recv(4096), b""))
+    finally:
+        server.close()
+    assert reply == f"{profile} mcp\n".encode() + b'{"id":1}\n'
+
+
+def test_sandbox_launch_gives_claude_atuin_through_the_bridge(
+    atuin_on_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    fwd = claude_profile._build_forwarding()
+    assert fwd.atuin_mcp is True
+    assert fwd.active() is True
+    argv = _build_sandbox_argv(
+        profile, cwd, ["fix it"], {}, fwd, bridge=(4321, "t0ken")
+    )
+    # One argument, so the prompt after it stays a prompt.
+    assert argv[argv.index("claude") + 1] == ATUIN_BRIDGE_CONFIG
+    assert argv[-1] == "fix it"
+    assert not any("t0ken" in arg for arg in argv)
+
+
+def test_host_launch_gives_claude_atuin_mcp(
+    atuin_on_path: Path, profiles_base: Path
+) -> None:
+    (profiles_base / "work").mkdir(parents=True)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", ["fix it"])
+    _bin, argv, _env = mock_exec.call_args[0]
+    assert argv[1:] == [ATUIN_HOST_CONFIG, "fix it"]
+
+
+def test_atuin_mcp_is_skipped_with_a_warning_without_atuin(
+    monkeypatch: pytest.MonkeyPatch,
+    profiles_base: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(claude_profile.settings, "atuin_mcp", True)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    (profiles_base / "work").mkdir(parents=True)
+    with patch("os.execvpe") as mock_exec:
+        _launch_profile("work", [])
+    _bin, argv, _env = mock_exec.call_args[0]
+    assert not any(arg.startswith("--mcp-config") for arg in argv)
+    assert "'atuin'isnotonPATH" in _unwrapped(capsys.readouterr().err)
+    assert claude_profile._build_forwarding().atuin_mcp is False
 
 
 # ---------------------------------------------------------------------------
