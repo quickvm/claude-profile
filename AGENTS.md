@@ -141,8 +141,8 @@ hand.
   the user's args, so a subcommand's `--` arguments (`mcp add NAME -- CMD`) never pick them up.
 - **Sandbox settings:** `podman_bin`, `sandbox_image`, `sandbox_ram_mib`, `sandbox_cpus`,
   `sandbox_skip_permissions`, `sandbox_ssh_agent`, `sandbox_gpg_agent`, `sandbox_clipboard`,
-  `sandbox_chrome`, `sandbox_gh`, `sandbox_infisical`, `sandbox_pulumi`, `sandbox_forward_env`
-  (all read from `CLAUDE_PROFILE_*`).
+  `sandbox_chrome`, `sandbox_gh`, `sandbox_infisical`, `sandbox_pulumi`, `sandbox_forward_env`,
+  and `atuin_mcp`, which host launches use too (all read from `CLAUDE_PROFILE_*`).
 - **Agent self-provisioning:** the image bakes common dev tools (`uv`, jq/yq,
   python+pyyaml/jinja2, make/openssl/trash) plus `dnf`-scoped passwordless sudo, so the
   agent installs missing tools ad-hoc (`sudo dnf install`, `uv tool install`; ephemeral).
@@ -234,7 +234,8 @@ hand.
   each connection must open with `<token> <service>\n`: the token is 32 random bytes per launch,
   compared with `hmac.compare_digest`, and a wrong token, an unknown service or a client silent
   for `HANDSHAKE_TIMEOUT` is dropped without a reply. `_bridge_services` maps the launch's
-  `_Forwarding` to services (`ssh-N`/`gpg` → `unix_relay(host_socket)`, plus `clipboard`), so a
+  `_Forwarding` to services (`ssh-N`/`gpg` → `unix_relay(host_socket)`, plus `clipboard` and
+  `atuin-mcp`), so a
   service the launch didn't enable doesn't exist. The VM gets the port as
   `-e CLAUDE_SANDBOX_BRIDGE_PORT` and the token through the secret env file (`_secret_env_file`),
   never on podman's argv, which every local user can read in `ps`. In the VM, `entrypoint.sh`
@@ -246,6 +247,18 @@ hand.
   (`_run_sandbox_supervised`) instead of `execvpe`. While it waits, SIGTERM and SIGHUP are passed
   on to podman (`_wait_forwarding_signals`) rather than killing the launcher, which would leave
   the VM running without its bridges.
+- **atuin's MCP server (`atuin_mcp`):** atuin's MCP server reads atuin's databases on the
+  host, and host and VM launches share `.claude.json`, so claude-profile adds the server itself,
+  as `--mcp-config=<json>` (`_atuin_mcp_config`). The `=` form matters: `--mcp-config` takes
+  several values, and with a space claude reads a following prompt or subcommand as one more
+  config file. A host launch runs `atuin mcp` directly. A microVM launch runs `bridge-connect
+  atuin-mcp` in the VM (`SANDBOX_BRIDGE_CONNECT`; claude passes its environment, the bridge port
+  and token included, to MCP servers), and the bridge's `atuin-mcp` service
+  (`bridges.stdio_program`) starts `atuin mcp` on the host with the connection as its stdin and
+  stdout, after the handshake, which `read_line` reads without consuming more, and with
+  `CLAUDE_CONFIG_DIR` set to the profile dir. The VM gets the MCP tools; atuin's databases and
+  sync key stay on the host. With the setting on and no `atuin` on PATH, `_atuin_mcp_enabled`
+  warns and the launch goes on without it.
 - **SSH agent forwarding (`sandbox_ssh_agent`):** a microVM can't bind-mount the agent
   socket (separate kernel), so `_ssh_agent_sockets()` probes the candidates (the active
   `SSH_AUTH_SOCK` agent + 1Password) with `ssh-add -l`, drops dead ones (a stale socket

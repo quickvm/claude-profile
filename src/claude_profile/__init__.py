@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     # Comma-separated names of host env vars to copy into the sandbox (e.g. tokens that
     # host-oriented MCP servers pass through as `-e VAR`). Empty = none forwarded.
     sandbox_forward_env: str = Field(default="")
+    # Give claude atuin's MCP server (`atuin mcp`): run directly on a host launch, and on the
+    # host through the bridge for a microVM launch, so atuin's databases and key stay there.
+    atuin_mcp: bool = Field(default=False)
     # Per-launch override of the .sandbox marker (CLAUDE_PROFILE_SANDBOX). None = use marker.
     sandbox: bool | None = Field(default=None)
 
@@ -106,6 +109,11 @@ SANDBOX_CA_EXTRACTED = "/etc/pki/ca-trust/extracted"
 # token travels in the secret env file (see _secret_env_file), never on podman's argv.
 SANDBOX_BRIDGE_PORT_ENV = "CLAUDE_SANDBOX_BRIDGE_PORT"
 SANDBOX_BRIDGE_TOKEN_ENV = "CLAUDE_SANDBOX_BRIDGE_TOKEN"
+# The in-VM end of a bridge connection: it sends the handshake for the service named by its
+# argument, then relays its stdin and stdout over the connection (see entrypoint.sh).
+SANDBOX_BRIDGE_CONNECT = "/usr/local/libexec/claude-sandbox/bridge-connect"
+# The bridge service that runs atuin's MCP server on the host (CLAUDE_PROFILE_ATUIN_MCP).
+ATUIN_MCP_SERVICE = "atuin-mcp"
 # OAuth scopes claude accepts for Claude in Chrome. It gates the integration on the token
 # carrying one of these *before* every other enable condition, so a profile authenticated
 # with a setup-token (which grants user:inference only) silently reports "Disabled".
@@ -1767,6 +1775,7 @@ class _Forwarding:
     ssh_auth_sock: Path | None = None
     gpg_pubkeys: bytes | None = None  # host public keyring (gpg --export)
     clipboard: bool = False  # read-only host clipboard (the in-VM wl-paste shim)
+    atuin_mcp: bool = False  # atuin's MCP server, run on the host per connection
 
     def gpg(self) -> bool:
         """True when the host gpg-agent is bridged into the VM."""
@@ -1774,7 +1783,7 @@ class _Forwarding:
 
     def active(self) -> bool:
         """True when the launch needs the bridge server at all."""
-        return bool(self.forwards) or self.clipboard
+        return bool(self.forwards) or self.clipboard or self.atuin_mcp
 
 
 def _build_sandbox_argv(
@@ -1861,6 +1870,8 @@ def _build_sandbox_argv(
         argv += ["-v", f"{vault_ca}:{SANDBOX_VM_CA_BUNDLE}:ro,z"]
     argv += _gpg_pubkeys_mounts(forwarding)
     argv += ["-w", str(cwd), settings.sandbox_image, "claude"]
+    if forwarding is not None and forwarding.atuin_mcp:
+        argv.append(_atuin_mcp_config(SANDBOX_BRIDGE_CONNECT, ATUIN_MCP_SERVICE))
     return argv + _sandbox_claude_args(claude_args, extra_env)
 
 
@@ -2150,10 +2161,36 @@ def _build_forwarding() -> _Forwarding:
         ssh_auth_sock=ssh_auth,
         gpg_pubkeys=pubkeys,
         clipboard=settings.sandbox_clipboard,
+        atuin_mcp=_atuin_mcp_enabled(),
     )
 
 
-def _bridge_services(forwarding: _Forwarding) -> dict[str, bridges.Service]:
+def _atuin_mcp_enabled() -> bool:
+    """True when CLAUDE_PROFILE_ATUIN_MCP is set and atuin is on PATH, warning when it isn't."""
+    if not settings.atuin_mcp:
+        return False
+    if shutil.which("atuin") is None:
+        err_console.print(
+            "[yellow]Warning: CLAUDE_PROFILE_ATUIN_MCP is set but 'atuin' is not on PATH, so "
+            "claude gets no atuin MCP server.[/yellow]"
+        )
+        return False
+    return True
+
+
+def _atuin_mcp_config(command: str, *args: str) -> str:
+    """claude's --mcp-config argument for an MCP server named atuin that runs command args.
+
+    In the `=` form, because --mcp-config takes several values: a prompt or subcommand
+    after `--mcp-config <json>` would be read as one more config file.
+    """
+    server = {"command": command, "args": list(args)}
+    return f"--mcp-config={json.dumps({'mcpServers': {'atuin': server}})}"
+
+
+def _bridge_services(
+    forwarding: _Forwarding, profile_dir: Path
+) -> dict[str, bridges.Service]:
     """The bridge server's services for a launch, by the names the VM asks for."""
     services = {
         service: bridges.unix_relay(host)
@@ -2161,6 +2198,11 @@ def _bridge_services(forwarding: _Forwarding) -> dict[str, bridges.Service]:
     }
     if forwarding.clipboard:
         services["clipboard"] = bridges.clipboard
+    if forwarding.atuin_mcp:
+        # atuin finds Claude Code's sessions through CLAUDE_CONFIG_DIR: the profile dir,
+        # where the VM's claude writes them.
+        env = {**os.environ, "CLAUDE_CONFIG_DIR": str(profile_dir)}
+        services[ATUIN_MCP_SERVICE] = bridges.stdio_program(["atuin", "mcp"], env)
     return services
 
 
@@ -2939,7 +2981,7 @@ def _run_sandbox_supervised(
             "dnf install wl-clipboard) or unset CLAUDE_PROFILE_SANDBOX_CLIPBOARD."
         )
         sys.exit(1)
-    server = bridges.BridgeServer(_bridge_services(forwarding))
+    server = bridges.BridgeServer(_bridge_services(forwarding, profile_dir))
     try:
         argv = _build_sandbox_argv(
             profile_dir,
@@ -3141,6 +3183,8 @@ def _launch_profile(name: str, claude_args: list[str]) -> None:
         return
     _check_statusline_link(d)
     shared, _host_loopback = _shared_settings_args(name, claude_args, sandbox=False)
+    if _atuin_mcp_enabled():
+        shared = [_atuin_mcp_config("atuin", "mcp"), *shared]
     env = os.environ.copy()
     env["CLAUDE_CONFIG_DIR"] = str(d)
     env.update(extra_env)
