@@ -564,6 +564,7 @@ Opt a profile in through its environment:
 ```sh
 claude-profile env work \
   --set CLAUDE_PROFILE_AGENT_VAULT_BUNDLE=coding \
+  --set CLAUDE_PROFILE_AGENT_VAULT_PROJECT_ID=<project id> \
   --set CLAUDE_PROFILE_AGENT_VAULT_PROXY=10.0.1.5:17323 \
   --set CLAUDE_PROFILE_AGENT_VAULT_CA_FINGERPRINT=SHA256:9F:2C:... \
   --set GH_TOKEN=agent-vault
@@ -572,6 +573,7 @@ claude-profile env work \
 | Key | Required | Description |
 |-----|----------|-------------|
 | `CLAUDE_PROFILE_AGENT_VAULT_BUNDLE` | yes | The access bundle the session covers. Setting it turns Agent Vault on for the profile; unsetting it turns it off and keeps the other keys |
+| `CLAUDE_PROFILE_AGENT_VAULT_PROJECT_ID` | with `BUNDLE` | The ID of the Agent Vault project that holds the bundle |
 | `CLAUDE_PROFILE_AGENT_VAULT_PROXY` | with `BUNDLE` | The proxy's `host:port` |
 | `CLAUDE_PROFILE_AGENT_VAULT_CA_FINGERPRINT` | with `BUNDLE` | The proxy CA's fingerprint, as the Proxies page shows it (`SHA256:...`) |
 | `CLAUDE_PROFILE_AGENT_VAULT_INFISICAL_PROFILE` | no | The `infisical` login profile to mint sessions with (see `infisical profile list`), when the CLI would otherwise pick another |

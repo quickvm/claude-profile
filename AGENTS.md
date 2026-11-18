@@ -444,8 +444,9 @@ hand.
   reach the VM, and `env --set` would overwrite the target), and `_sandbox_marked` counts even a
   dangling marker link.
 - **Agent Vault (`_split_agent_vault`, `_route_agent_vault`):** a profile opts in with
-  `CLAUDE_PROFILE_AGENT_VAULT_*` keys in its `.env`: `BUNDLE` switches it on and then needs `PROXY`
-  and `CA_FINGERPRINT`; `INFISICAL_PROFILE`, `NO_PROXY` and `TTL` are optional. They are there, not
+  `CLAUDE_PROFILE_AGENT_VAULT_*` keys in its `.env`: `BUNDLE` switches it on and then needs
+  `PROJECT_ID` (CLI 0.45 looks the bundle up in that project), `PROXY` and `CA_FINGERPRINT`;
+  `INFISICAL_PROFILE`, `NO_PROXY` and `TTL` are optional. They are there, not
   in `CLAUDE_PROFILE_*` env vars, because they differ per profile, and because `.env` is pinned
   read-only in the VM: a config the VM could plant would send the next launch, and the real session
   it mints, to a proxy and CA of its choosing. `_split_agent_vault` strips them from claude's env
@@ -455,10 +456,10 @@ hand.
   forms, but it takes each of these, and none is under its one-minute minimum). `_route_agent_vault`
   runs a pre-flight (`_agent_vault_preflight`: the CLI is installed, and the proxy's
   `/_agent-vault/ca`, fetched with no proxy, matches the pin). If it passes, `_exec_agent_vault_run`
-  execs `infisical agent-vault run --access-bundle … --ttl <TTL> --no-proxy <AGENT_VAULT_NO_PROXY
-  plus the NO_PROXY key> -- claude-profile <name> <args>` with `AGENT_VAULT_RUN_ENV=<name>`, and
-  with `CLAUDE_PROFILE_SANDBOX` set to where the launch chose to run (it asks before the
-  pre-flight), so the child runs there without asking again. The CLI
+  execs `infisical agent-vault run --project-id … --access-bundle … --ttl <TTL> --no-proxy
+  <AGENT_VAULT_NO_PROXY plus the NO_PROXY key> -- claude-profile <name> <args>` with
+  `AGENT_VAULT_RUN_ENV=<name>`, and with `CLAUDE_PROFILE_SANDBOX` set to where the launch chose
+  to run (it asks before the pre-flight), so the child runs there without asking again. The CLI
   mints the session with the user's Infisical login, checks the pin again, and revokes the session
   when its child exits, SIGHUP and SIGTERM included (checked with CLI 0.43.140). Infisical can't
   extend a session (its `PATCH` sets only the label), and a new session is a new token, which the

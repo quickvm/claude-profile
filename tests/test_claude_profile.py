@@ -4915,6 +4915,7 @@ def _vault_profile(
         (profile / SANDBOX_MARKER).touch()
     (profile / ".env").write_text(
         "CLAUDE_PROFILE_AGENT_VAULT_BUNDLE=personal\n"
+        "CLAUDE_PROFILE_AGENT_VAULT_PROJECT_ID=av-project\n"
         f"CLAUDE_PROFILE_AGENT_VAULT_PROXY={proxy}\n"
         f"CLAUDE_PROFILE_AGENT_VAULT_CA_FINGERPRINT={AV_PIN}\n"
         f"GH_TOKEN=agent-vault\n{extra}"
@@ -4982,6 +4983,8 @@ def test_agent_vault_launch_reruns_itself_under_the_cli(
         "--silent",
         "--profile",
         "ops",
+        "--project-id",
+        "av-project",
         "--access-bundle",
         "personal",
         "--proxy",
@@ -5158,6 +5161,14 @@ def test_agent_vault_missing_cli_launches_without_the_vault(
             "CLAUDE_PROFILE_AGENT_VAULT_PROXYisnotset",
         ),
         (
+            (
+                "CLAUDE_PROFILE_AGENT_VAULT_BUNDLE=personal\n"
+                "CLAUDE_PROFILE_AGENT_VAULT_PROXY=proxy:17323\n"
+                f"CLAUDE_PROFILE_AGENT_VAULT_CA_FINGERPRINT={AV_PIN}\n"
+            ),
+            "CLAUDE_PROFILE_AGENT_VAULT_PROJECT_IDisnotset",
+        ),
+        (
             # A typo is caught even with BUNDLE unset, so it can't switch the vault off.
             "CLAUDE_PROFILE_AGENT_VAULT_BUNDEL=personal\n",
             "CLAUDE_PROFILE_AGENT_VAULT_BUNDELisnotasetting",
@@ -5165,6 +5176,7 @@ def test_agent_vault_missing_cli_launches_without_the_vault(
         (
             (
                 "CLAUDE_PROFILE_AGENT_VAULT_BUNDLE=personal\n"
+                "CLAUDE_PROFILE_AGENT_VAULT_PROJECT_ID=av-project\n"
                 "CLAUDE_PROFILE_AGENT_VAULT_PROXY=proxy:17323\n"
                 f"CLAUDE_PROFILE_AGENT_VAULT_CA_FINGERPRINT={AV_PIN}\n"
                 "CLAUDE_PROFILE_AGENT_VAULT_BUNDEL=personal\n"
@@ -5174,6 +5186,7 @@ def test_agent_vault_missing_cli_launches_without_the_vault(
         (
             (
                 "CLAUDE_PROFILE_AGENT_VAULT_BUNDLE=personal\n"
+                "CLAUDE_PROFILE_AGENT_VAULT_PROJECT_ID=av-project\n"
                 "CLAUDE_PROFILE_AGENT_VAULT_PROXY=proxy:17323\n"
                 "CLAUDE_PROFILE_AGENT_VAULT_CA_FINGERPRINT=SHA256:9F:2C\n"
             ),
