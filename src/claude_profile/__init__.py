@@ -1827,6 +1827,10 @@ def _build_sandbox_argv(
         "--annotation",
         "krun.use_passt=1",
         "--userns=keep-id",
+        # keep-id also makes the host UID the container's user, and crun 1.31 with libkrun
+        # 1.19 boots the VM as that user. entrypoint.sh has to start as root (it creates the
+        # agent socket dirs and remaps appuser) before it drops to appuser itself.
+        "--user=0:0",
         # podman otherwise passes the host's *_proxy variables in, a proxy URL's
         # credentials included; the VM gets only what the launcher forwards.
         "--http-proxy=false",
