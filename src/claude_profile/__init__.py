@@ -138,7 +138,12 @@ SANDBOX_HOST_LOOPBACK = "169.254.1.2"
 # Infisical Agent Vault (see _route_agent_vault). A profile opts in with these keys in its
 # .env, which the VM can't change; claude-profile reads them and claude never sees them.
 AGENT_VAULT_PREFIX = "CLAUDE_PROFILE_AGENT_VAULT_"
-AGENT_VAULT_REQUIRED: tuple[str, ...] = ("BUNDLE", "PROXY", "CA_FINGERPRINT")
+AGENT_VAULT_REQUIRED: tuple[str, ...] = (
+    "BUNDLE",
+    "PROJECT_ID",
+    "PROXY",
+    "CA_FINGERPRINT",
+)
 AGENT_VAULT_OPTIONAL: tuple[str, ...] = ("INFISICAL_PROFILE", "NO_PROXY", "TTL")
 AGENT_VAULT_FINGERPRINT = re.compile(r"SHA256(:[0-9A-F]{2}){32}")
 # A session lifetime in the form the CLI documents: a whole number and m, h or d, or never.
@@ -2536,6 +2541,7 @@ class _AgentVault:
     """A profile's Agent Vault settings: the CLAUDE_PROFILE_AGENT_VAULT_* keys in its .env."""
 
     bundle: str
+    project_id: str
     proxy: str
     ca_fingerprint: str
     infisical_profile: str = ""
@@ -2585,6 +2591,7 @@ def _split_agent_vault(
     hosts = keys.get("NO_PROXY", "").split(",")
     vault = _AgentVault(
         bundle=keys["BUNDLE"],
+        project_id=keys["PROJECT_ID"],
         proxy=keys["PROXY"],
         ca_fingerprint=keys["CA_FINGERPRINT"].upper(),
         infisical_profile=keys.get("INFISICAL_PROFILE", ""),
@@ -2664,7 +2671,8 @@ def _exec_agent_vault_run(
 ) -> None:
     """Replace this process with `infisical agent-vault run` around this same launch.
 
-    The CLI mints a session over the profile's access bundle with your Infisical login,
+    The CLI mints a session over the profile's access bundle, looked up in the Agent Vault
+    project PROJECT_ID names, with your Infisical login,
     checks the proxy's CA against the pin and starts the launch again as its child, with
     the proxy and CA variables set. When the child exits, on SIGHUP or SIGTERM too, it
     revokes the session. The child finds its profile's name in AGENT_VAULT_RUN_ENV and
@@ -2676,6 +2684,8 @@ def _exec_agent_vault_run(
     if vault.infisical_profile:
         argv += ["--profile", vault.infisical_profile]
     argv += [
+        "--project-id",
+        vault.project_id,
         "--access-bundle",
         vault.bundle,
         "--proxy",
