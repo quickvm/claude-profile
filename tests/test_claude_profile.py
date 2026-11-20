@@ -1406,6 +1406,7 @@ def test_argv_has_krun_runtime_and_image(
     assert "run" in argv
     assert "run.oci.handler=krun" in argv
     assert "krun.use_passt=1" in argv  # real guest netstack (not TSI)
+    assert "--user=0:0" in argv  # entrypoint.sh starts as root, then drops privileges
     assert claude_profile.settings.sandbox_image in argv
     assert "claude" in argv
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# krun boots the microVM as root and ignores the image USER. Drop to a non-root
+# claude-profile boots the microVM as root (--user=0:0). Drop to a non-root
 # user before exec'ing the command: claude refuses --dangerously-skip-permissions
 # as root, and this keeps files on the bind mounts owned by the host user.
 set -e

@@ -132,8 +132,9 @@ hand.
   global script. Mounting the global script straight over that path instead would leave an
   empty `statusline.sh` in the host profile dir whenever none exists there, because podman
   creates a missing bind-mount target.
-- **Non-root entrypoint is mandatory:** krun boots the VM as root and ignores the
-  image `USER`; claude refuses `--dangerously-skip-permissions` as root, so
+- **Non-root entrypoint is mandatory:** the VM boots as root (`--user=0:0`: `--userns=keep-id`
+  would otherwise make it the host UID, which crun 1.31 / libkrun 1.19 honour, skipping the
+  entrypoint's root setup); claude refuses `--dangerously-skip-permissions` as root, so
   `entrypoint.sh` drops to a host-UID user (`runuser`) before exec'ing claude. Sandbox
   mode adds that flag unless `sandbox_skip_permissions` is false, the user already passed
   it, or the user passed `--permission-mode` (claude ranks the skip flag above it). The
