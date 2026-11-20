@@ -110,9 +110,11 @@ name, so a hook can tell profiles apart:
 }
 ```
 
-In the sandbox, HTTP hooks aimed at `127.0.0.1` or `localhost` are re-pointed at the host
-(inside the VM, 127.0.0.1 is the VM itself), so local hook receivers hear from sandboxed
-sessions too. Passing your own `--settings` skips the shared file for that launch.
+Inside the sandbox, 127.0.0.1 is the VM itself, and claude refuses HTTP hooks aimed at the VM's
+route to the host, a link-local address. So HTTP hooks aimed at `127.0.0.1` or `localhost`
+stay on the VM's `127.0.0.1` (`localhost` becomes `127.0.0.1`), and the VM forwards each of
+their ports to the same port on the host's loopback, so local hook receivers hear from
+sandboxed sessions too. Passing your own `--settings` skips the shared file for that launch.
 
 ## Sandbox (microVM)
 

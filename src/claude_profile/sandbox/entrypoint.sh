@@ -38,6 +38,19 @@ if [ "$(id -u)" = "0" ]; then
         chmod 700 "$_dir"
     done
   fi
+  # claude refuses HTTP hooks aimed at a link-local address such as host.containers.internal,
+  # the VM's route to the host's loopback, so claude-profile leaves hooks aimed at the host's
+  # loopback on 127.0.0.1 and lists their ports in CLAUDE_SANDBOX_LOOPBACK_PORTS. Forward each
+  # from here to the same port on the host's loopback. Bound as root so a port below 1024
+  # works; each connection runs as appuser. Quiet: whatever socat prints lands in claude's
+  # TUI, and claude reports a hook that fails.
+  if [ -n "$CLAUDE_SANDBOX_LOOPBACK_PORTS" ]; then
+    IFS=',' read -ra _ports <<<"$CLAUDE_SANDBOX_LOOPBACK_PORTS"
+    for _port in "${_ports[@]}"; do
+      socat "TCP4-LISTEN:${_port},bind=127.0.0.1,reuseaddr,fork,su=appuser" \
+        "TCP4:host.containers.internal:${_port}" 2>/dev/null &
+    done
+  fi
   # Re-exec self as the host user so the agent bridges below run as that user.
   exec runuser -u appuser -- "$0" "$@"
 fi

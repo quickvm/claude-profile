@@ -4357,50 +4357,64 @@ def test_launch_exits_on_a_broken_shared_settings_file(
     assert exc_info.value.code == 1
 
 
-def test_sandbox_repoints_loopback_hooks_at_the_host(profiles_base: Path) -> None:
+def test_sandbox_keeps_loopback_hooks_on_the_vm_loopback(profiles_base: Path) -> None:
+    # claude refuses HTTP hooks aimed at SANDBOX_HOST_LOOPBACK (link-local), so the hook
+    # stays on 127.0.0.1 and the entrypoint forwards its port to the host's loopback.
     _write_shared(profiles_base, SHARED)
-    args, host_loopback = claude_profile._shared_settings_args(
-        "personal", [], sandbox=True
-    )
+    args, ports = claude_profile._shared_settings_args("personal", [], sandbox=True)
     hooks = json.loads(args[1])["hooks"]
-    loopback = claude_profile.SANDBOX_HOST_LOOPBACK
     assert hooks["Stop"][0]["hooks"][0]["url"] == (
-        f"http://{loopback}:8080/hook?profile=personal"
+        "http://127.0.0.1:8080/hook?profile=personal"
     )
     assert (
         hooks["PreToolUse"][0]["hooks"][0]["url"] == "https://hooks.example.com/check"
     )
-    assert host_loopback is True
+    assert ports == (8080,)
 
 
 @pytest.mark.parametrize(
-    ("url", "expected"),
+    ("url", "expected", "ports"),
     [
-        ("http://user:pw@127.0.0.1:3000/x", "http://user:pw@{loopback}:3000/x"),
-        ("http://LOCALHOST/x", "http://{loopback}/x"),
+        ("http://user:pw@127.0.0.1:3000/x", "http://user:pw@127.0.0.1:3000/x", (3000,)),
+        # The forwarder listens on 127.0.0.1 alone, and localhost may resolve to ::1.
+        ("http://LOCALHOST/x", "http://127.0.0.1:80/x", (80,)),
+        ("https://localhost/x", "https://127.0.0.1:443/x", (443,)),
         # A malformed port crashed every sandbox launch; claude reports it instead.
-        ("http://localhost:abc/x", "http://{loopback}:abc/x"),
+        ("http://localhost:abc/x", "http://localhost:abc/x", ()),
+        ("http://localhost:0/x", "http://localhost:0/x", ()),
+        ("http://hooks.example.com:3000/x", "http://hooks.example.com:3000/x", ()),
     ],
 )
-def test_sandbox_loopback_rewrite_changes_only_the_host(
-    url: str, expected: str
+def test_sandbox_loopback_hooks_land_on_127_0_0_1(
+    url: str, expected: str, ports: tuple[int, ...]
 ) -> None:
     data = {"hooks": {"Stop": [{"hooks": [{"type": "http", "url": url}]}]}}
-    assert claude_profile._rewrite_loopback_hooks(data) is True
-    loopback = claude_profile.SANDBOX_HOST_LOOPBACK
-    assert data["hooks"]["Stop"][0]["hooks"][0]["url"] == expected.format(
-        loopback=loopback
-    )
+    assert claude_profile._rewrite_loopback_hooks(data) == ports
+    assert data["hooks"]["Stop"][0]["hooks"][0]["url"] == expected
+
+
+def test_sandbox_forwards_each_loopback_hook_port_once() -> None:
+    def group(url: str) -> dict[str, Any]:
+        return {"hooks": [{"type": "http", "url": url}]}
+
+    data = {
+        "hooks": {
+            "Stop": [
+                group("http://127.0.0.1:9000/a"),
+                group("http://localhost:3325/b"),
+            ],
+            "Notification": [group("http://127.0.0.1:3325/c")],
+        }
+    }
+    assert claude_profile._rewrite_loopback_hooks(data) == (3325, 9000)
 
 
 def test_host_launch_keeps_loopback_hooks(profiles_base: Path) -> None:
     _write_shared(profiles_base, SHARED)
-    args, host_loopback = claude_profile._shared_settings_args(
-        "work", [], sandbox=False
-    )
+    args, ports = claude_profile._shared_settings_args("work", [], sandbox=False)
     url = json.loads(args[1])["hooks"]["Stop"][0]["hooks"][0]["url"]
     assert url == "http://127.0.0.1:8080/hook?profile=work"
-    assert host_loopback is False
+    assert ports == ()
 
 
 def test_sandbox_needs_no_loopback_mapping_without_loopback_hooks(
@@ -4409,13 +4423,11 @@ def test_sandbox_needs_no_loopback_mapping_without_loopback_hooks(
     _write_shared(
         profiles_base, {"hooks": {"PreToolUse": SHARED["hooks"]["PreToolUse"]}}
     )
-    _args, host_loopback = claude_profile._shared_settings_args(
-        "work", [], sandbox=True
-    )
-    assert host_loopback is False
+    _args, ports = claude_profile._shared_settings_args("work", [], sandbox=True)
+    assert ports == ()
 
 
-def test_argv_maps_host_loopback_for_shared_hooks(
+def test_argv_forwards_loopback_hook_ports(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
@@ -4423,12 +4435,19 @@ def test_argv_maps_host_loopback_for_shared_hooks(
     profile.mkdir()
     cwd = tmp_path / "work"
     cwd.mkdir()
-    argv = _build_sandbox_argv(profile, cwd, [], {}, host_loopback=True)
+    argv = _build_sandbox_argv(profile, cwd, [], {}, loopback_ports=(3325, 8080))
     loopback = claude_profile.SANDBOX_HOST_LOOPBACK
     assert f"--network=pasta:--map-host-loopback,{loopback}" in argv
+    ports = f"{claude_profile.SANDBOX_LOOPBACK_PORTS_ENV}=3325,8080"
+    assert argv[argv.index(ports) - 1] == "-e"
+    plain = _build_sandbox_argv(profile, cwd, [], {})
+    assert not any(arg.startswith("--network=") for arg in plain)
+    assert not any(
+        arg.startswith(claude_profile.SANDBOX_LOOPBACK_PORTS_ENV) for arg in plain
+    )
 
 
-def test_sandbox_launch_with_loopback_hooks_maps_host_loopback(
+def _sandbox_with_shared_hooks(
     profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     profile = profiles_base / "personal"
@@ -4437,16 +4456,37 @@ def test_sandbox_launch_with_loopback_hooks_maps_host_loopback(
     _write_shared(profiles_base, SHARED)
     monkeypatch.setattr(claude_profile, "_sandbox_image_exists", lambda: True)
     monkeypatch.setattr(claude_profile, "_git_common_dir", lambda c: None)
+    monkeypatch.chdir(_project(tmp_path))
+
+
+def test_sandbox_launch_forwards_loopback_hook_ports(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _sandbox_with_shared_hooks(profiles_base, monkeypatch, tmp_path)
     monkeypatch.setattr(
         claude_profile, "_build_forwarding", lambda: claude_profile._Forwarding([])
     )
-    monkeypatch.chdir(_project(tmp_path))
     with patch("os.execvpe") as mock_exec:
         _launch_profile("personal", [])
     _bin, argv, _env = mock_exec.call_args[0]
     assert any(arg.startswith("--network=pasta:--map-host-loopback") for arg in argv)
+    assert f"{claude_profile.SANDBOX_LOOPBACK_PORTS_ENV}=8080" in argv
     url = _settings_arg(argv)["hooks"]["Stop"][0]["hooks"][0]["url"]
-    assert url.startswith(f"http://{claude_profile.SANDBOX_HOST_LOOPBACK}:8080/")
+    assert url == "http://127.0.0.1:8080/hook?profile=personal"
+
+
+def test_supervised_sandbox_launch_forwards_loopback_hook_ports(
+    profiles_base: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _sandbox_with_shared_hooks(profiles_base, monkeypatch, tmp_path)
+    sock = Path("/run/x.sock")
+    fwd = claude_profile._Forwarding([(sock, sock, "ssh-0")], ssh_auth_sock=sock)
+    monkeypatch.setattr(claude_profile, "_build_forwarding", lambda: fwd)
+    with patch("subprocess.Popen") as popen, pytest.raises(SystemExit):
+        popen.return_value.wait.return_value = 0
+        _launch_profile("personal", [])
+    argv = popen.call_args[0][0]
+    assert f"{claude_profile.SANDBOX_LOOPBACK_PORTS_ENV}=8080" in argv
 
 
 # ---------------------------------------------------------------------------
