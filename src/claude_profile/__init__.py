@@ -22,7 +22,7 @@ from dataclasses import KW_ONLY, dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import typer
 from pydantic import Field
@@ -135,6 +135,10 @@ SANDBOX_STRIP_DENY_PREFIXES: tuple[str, ...] = (
 # podman's default host.containers.internal address under pasta; mapping it to the
 # host loopback lets the agent bridge bind to 127.0.0.1 instead of all interfaces.
 SANDBOX_HOST_LOOPBACK = "169.254.1.2"
+# claude refuses HTTP hooks aimed at a link-local address such as SANDBOX_HOST_LOOPBACK, so
+# hooks aimed at the host's loopback stay on the VM's 127.0.0.1, and entrypoint.sh forwards
+# the ports listed here from there to the host's loopback.
+SANDBOX_LOOPBACK_PORTS_ENV = "CLAUDE_SANDBOX_LOOPBACK_PORTS"
 # Infisical Agent Vault (see _route_agent_vault). A profile opts in with these keys in its
 # .env, which the VM can't change; claude-profile reads them and claude never sees them.
 AGENT_VAULT_PREFIX = "CLAUDE_PROFILE_AGENT_VAULT_"
@@ -226,6 +230,7 @@ SANDBOX_GIT_IDENTITY = "/home/appuser/.gitconfig-identity"
 SHARED_SETTINGS = "shared-settings.json"
 PROFILE_PLACEHOLDER = "{profile}"
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
+URL_DEFAULT_PORTS = {"http": 80, "https": 443}
 # Names `env --set` accepts, and names a profile can have (see _check_profile_name).
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -1213,23 +1218,24 @@ def _has_option(args: list[str], name: str) -> bool:
 
 def _shared_settings_args(
     name: str, claude_args: list[str], *, sandbox: bool
-) -> tuple[list[str], bool]:
-    """``--settings`` args for the shared settings file, and whether the VM needs host loopback.
+) -> tuple[list[str], tuple[int, ...]]:
+    """``--settings`` args for the shared settings file, and the hook ports the VM forwards.
 
     ``shared-settings.json`` in the profiles base holds settings every profile gets, such
     as hooks. claude merges ``--settings`` over the profile's own settings.json, and hook
     entries from both run. ``{profile}`` in any string becomes the profile name. In the
-    sandbox, HTTP hooks aimed at the host's loopback are re-pointed so they still reach it,
-    and host-oriented denies are dropped as from the profile's settings.json.
+    sandbox, HTTP hooks aimed at the host's loopback keep reaching it through the VM's
+    loopback (see _rewrite_loopback_hooks), and host-oriented denies are dropped as from
+    the profile's settings.json.
     """
     path = settings.profiles_base / SHARED_SETTINGS
     if not path.exists():
-        return [], False
+        return [], ()
     if _has_option(claude_args, "--settings"):
         err_console.print(
             f"[yellow]--settings was given, so {path} is not applied.[/yellow]"
         )
-        return [], False
+        return [], ()
     try:
         data = _fill_profile(json.loads(path.read_text()), name)
     except (OSError, json.JSONDecodeError) as err:
@@ -1238,10 +1244,10 @@ def _shared_settings_args(
     if not isinstance(data, dict):
         err_console.print(f"[red]{path} must hold a JSON object.[/red]")
         sys.exit(1)
-    host_loopback = sandbox and _rewrite_loopback_hooks(data)
+    loopback_ports = _rewrite_loopback_hooks(data) if sandbox else ()
     if sandbox:
         _strip_sandbox_denies(data)
-    return ["--settings", json.dumps(data)], host_loopback
+    return ["--settings", json.dumps(data)], loopback_ports
 
 
 def _fill_profile(value: Any, name: str) -> Any:
@@ -1255,29 +1261,40 @@ def _fill_profile(value: Any, name: str) -> Any:
     return value
 
 
-def _rewrite_loopback_hooks(data: dict[str, Any]) -> bool:
-    """Point HTTP hooks aimed at the host's loopback at the VM's route to it.
+def _rewrite_loopback_hooks(data: dict[str, Any]) -> tuple[int, ...]:
+    """Keep HTTP hooks aimed at the host's loopback on the VM's 127.0.0.1; return their ports.
 
-    Inside the microVM 127.0.0.1 is the VM itself; under --map-host-loopback the host's
-    loopback answers at SANDBOX_HOST_LOOPBACK instead. Returns whether any hook moved, so
-    the caller knows the VM needs that mapping even without an agent bridge.
+    Inside the microVM 127.0.0.1 is the VM itself, and claude refuses HTTP hooks aimed at
+    SANDBOX_HOST_LOOPBACK, the VM's route to the host's loopback, because it is link-local.
+    So these hooks stay on the VM's loopback, and the entrypoint forwards each returned port
+    from there to the same port on the host's. localhost becomes 127.0.0.1, the address
+    the forwarder listens on. A hook whose port can't be read is left as written, for
+    claude to report.
     """
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
-        return False
-    rewrote = False
+        return ()
+    ports: set[int] = set()
     for groups in hooks.values():
         for handler in _http_hook_handlers(groups):
             url = urlsplit(handler["url"])
-            # Swap only the host, keeping any user:password@ and the port as written
-            # (url.port would raise on a malformed port and abort the launch).
-            userinfo, at, hostport = url.netloc.rpartition("@")
-            host, colon, port = hostport.partition(":")
-            if host.lower() in LOOPBACK_HOSTS:
-                netloc = f"{userinfo}{at}{SANDBOX_HOST_LOOPBACK}{colon}{port}"
-                handler["url"] = urlunsplit(url._replace(netloc=netloc))
-                rewrote = True
-    return rewrote
+            port = _url_port(url)
+            if url.hostname not in LOOPBACK_HOSTS or not port:
+                continue
+            userinfo, at, _hostport = url.netloc.rpartition("@")
+            netloc = f"{userinfo}{at}127.0.0.1:{port}"
+            handler["url"] = urlunsplit(url._replace(netloc=netloc))
+            ports.add(port)
+    return tuple(sorted(ports))
+
+
+def _url_port(url: SplitResult) -> int | None:
+    """The port url connects to, or None for a malformed port or a scheme with no default."""
+    try:
+        port = url.port
+    except ValueError:
+        return None
+    return URL_DEFAULT_PORTS.get(url.scheme) if port is None else port
 
 
 def _http_hook_handlers(groups: Any) -> list[dict[str, Any]]:
@@ -1798,7 +1815,7 @@ def _build_sandbox_argv(
     extra_env: dict[str, str],
     forwarding: _Forwarding | None = None,
     *,
-    host_loopback: bool = False,
+    loopback_ports: tuple[int, ...] = (),
     bridge: tuple[int, str] | None = None,
     vault_ca: Path | None = None,
 ) -> list[str]:
@@ -1837,12 +1854,15 @@ def _build_sandbox_argv(
         "--device",
         "/dev/kvm",
     ]
-    if host_loopback or (forwarding and forwarding.active()):
+    if loopback_ports or (forwarding and forwarding.active()):
         # pasta gives the VM a route to the host (TSI cannot); --map-host-loopback
         # makes host.containers.internal reach the host's loopback, so the agent
-        # bridge can bind to 127.0.0.1 rather than every host interface. Shared HTTP
-        # hooks aimed at the host's loopback (host_loopback) need the same route.
+        # bridge can bind to 127.0.0.1 rather than every host interface. The
+        # entrypoint's forwarders for hooks aimed at the host's loopback need it too.
         argv.append(f"--network=pasta:--map-host-loopback,{SANDBOX_HOST_LOOPBACK}")
+    if loopback_ports:
+        ports = ",".join(str(port) for port in loopback_ports)
+        argv += ["-e", f"{SANDBOX_LOOPBACK_PORTS_ENV}={ports}"]
     argv += [
         "-e",
         f"HOST_UID={os.getuid()}",
@@ -2867,7 +2887,8 @@ def _with_agent_vault(
 
     The proxy URLs carry the session token, so they travel in the secret env file with
     the rest of extra_env; the CLI's copy for OpenClaw stays out. The VM's NO_PROXY adds
-    the host's loopback, where bridged services and loopback hooks listen.
+    the host's loopback, where bridged services listen. The session's own NO_PROXY already
+    has localhost and 127.0.0.1, where loopback hooks go.
     """
     if vault_run is None:
         return extra_env, None
@@ -2924,7 +2945,7 @@ def _launch_sandbox(
     extra_env = _with_pulumi_token(extra_env)
     extra_env = _with_forwarded_env(extra_env)
     extra_env, vault_ca = _with_agent_vault(extra_env, vault_run)
-    shared, host_loopback = _shared_settings_args(
+    shared, loopback_ports = _shared_settings_args(
         profile_dir.name, claude_args, sandbox=True
     )
     claude_args = [*shared, *claude_args]
@@ -2932,7 +2953,13 @@ def _launch_sandbox(
     forwarding = _build_forwarding()
     if forwarding.active():
         _run_sandbox_supervised(
-            profile_dir, cwd, claude_args, extra_env, forwarding, vault_ca=vault_ca
+            profile_dir,
+            cwd,
+            claude_args,
+            extra_env,
+            forwarding,
+            loopback_ports=loopback_ports,
+            vault_ca=vault_ca,
         )
         return
     argv = _build_sandbox_argv(
@@ -2940,7 +2967,7 @@ def _launch_sandbox(
         cwd,
         claude_args,
         extra_env,
-        host_loopback=host_loopback,
+        loopback_ports=loopback_ports,
         vault_ca=vault_ca,
     )
     os.execvpe(settings.podman_bin, argv, os.environ.copy())
@@ -2981,6 +3008,7 @@ def _run_sandbox_supervised(
     extra_env: dict[str, str],
     forwarding: _Forwarding,
     *,
+    loopback_ports: tuple[int, ...] = (),
     vault_ca: Path | None = None,
 ) -> None:
     """Run the VM as a child while this process serves its bridges.
@@ -3003,6 +3031,7 @@ def _run_sandbox_supervised(
             claude_args,
             extra_env,
             forwarding,
+            loopback_ports=loopback_ports,
             bridge=(server.port, server.token),
             vault_ca=vault_ca,
         )
@@ -3196,7 +3225,7 @@ def _launch_profile(name: str, claude_args: list[str]) -> None:
         _launch_sandbox(d, claude_args, extra_env, vault_run=vault_run)
         return
     _check_statusline_link(d)
-    shared, _host_loopback = _shared_settings_args(name, claude_args, sandbox=False)
+    shared, _loopback_ports = _shared_settings_args(name, claude_args, sandbox=False)
     if _atuin_mcp_enabled():
         shared = [_atuin_mcp_config("atuin", "mcp"), *shared]
     env = os.environ.copy()

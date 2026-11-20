@@ -222,11 +222,18 @@ hand.
   the profile's own settings, and hook entries from both run. A user-supplied `--settings`
   wins (the shared file is skipped with a warning), and an unreadable or non-object file fails
   the launch. In the sandbox, `_strip_sandbox_denies` drops the same host-oriented denies from it
-  as from the settings.json copy, and `_rewrite_loopback_hooks` re-points HTTP hooks aimed at
-  `127.0.0.1`/`localhost` at `SANDBOX_HOST_LOOPBACK`, and `_build_sandbox_argv(host_loopback=…)`
-  adds `--map-host-loopback` even when no agent bridge is active — inside the VM, 127.0.0.1 is
-  the VM itself, so without both a local hook receiver would silently never
-  hear from sandboxed sessions.
+  as from the settings.json copy. HTTP hooks aimed at `127.0.0.1`/`localhost` mean the host's
+  loopback, but inside the VM 127.0.0.1 is the VM itself, and claude refuses HTTP hooks aimed at
+  a link-local or private address (only public addresses and `127.0.0.1`/`::1` pass, and it
+  checks what a hostname resolves to, so `host.containers.internal` fails too; claude 2.1.327 to
+  2.1.329), which rules out `SANDBOX_HOST_LOOPBACK`. So `_rewrite_loopback_hooks` leaves those
+  hooks on `127.0.0.1` (`localhost` becomes `127.0.0.1`, with the scheme's port spelled out) and
+  returns their ports. `_build_sandbox_argv(loopback_ports=…)`, on both the exec and the
+  supervised path, passes them as `CLAUDE_SANDBOX_LOOPBACK_PORTS` and adds `--map-host-loopback`
+  even when no agent bridge is active, and `entrypoint.sh` runs a socat per port from the VM's
+  `127.0.0.1` to the same port on `host.containers.internal`. It binds as root, so a port below
+  1024 works, runs each connection as appuser (`su=appuser`), and drops socat's stderr, which
+  would land in claude's TUI; claude reports a failed hook itself.
 - **Bridge server (`bridges.py`):** everything the VM reaches on the host — agent sockets and the
   clipboard — goes through one `bridges.BridgeServer` that `_run_sandbox_supervised` runs inside
   the launcher: a TCP listener on `127.0.0.1` (ephemeral port), a daemon thread per connection,
